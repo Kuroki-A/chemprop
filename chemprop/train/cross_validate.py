@@ -73,13 +73,13 @@ def cross_validate(args: TrainArgs,
     elif args.reaction_solvent:
         set_reaction(True, args.reaction_mode)
 
+    # Get data
+    '''
     features_names = 'MoleculeDataset'
     if args.features_generator is not None:
         for name in args.features_generator:
             features_names += '_' + str(name)
     
-    #Get data
-    '''
     is_file = os.path.isfile(f'{features_names}.pt')
     if not is_file:
         debug('Loading data')
