@@ -10,6 +10,8 @@ import subprocess
 import numpy as np
 import pandas as pd
 
+import torch
+
 from .run_training import run_training
 from chemprop.args import TrainArgs
 from chemprop.constants import TEST_SCORES_FILE_NAME, TRAIN_LOGGER_NAME
@@ -77,6 +79,7 @@ def cross_validate(args: TrainArgs,
             features_names += '_' + str(name)
     
     #Get data
+    '''
     is_file = os.path.isfile(f'{features_names}.pt')
     if not is_file:
         debug('Loading data')
@@ -92,6 +95,15 @@ def cross_validate(args: TrainArgs,
     else:
         debug('Loading previously created data')
         data = torch.load(f'{features_names}.pt')
+    '''
+    debug('Loading data')
+    data = get_data(
+        path=args.data_path,
+        args=args,
+        logger=logger,
+        skip_none_targets=True,
+        data_weights_path=args.data_weights_path
+    )
     
     validate_dataset_type(data, dataset_type=args.dataset_type)
     args.features_size = data.features_size()
@@ -218,10 +230,10 @@ def cross_validate(args: TrainArgs,
                 writer.writerow(row)
     
     # Determine mean and std score of main metric
-    if args.optimize == 'validation':
+    if args.data_type == 'validation':
         avg_scores = multitask_mean(all_valid_scores[args.metric], metric=args.metric, axis=1)
         mean_score, std_score = np.mean(avg_scores), np.std(avg_scores)
-    elif args.optimize == 'test':
+    elif args.data_type == 'test':
         avg_scores = multitask_mean(all_test_scores[args.metric], metric=args.metric, axis=1)
         mean_score, std_score = np.mean(avg_scores), np.std(avg_scores)
     else:
