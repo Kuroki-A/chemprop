@@ -293,6 +293,7 @@ def run_training(args: TrainArgs,
         # Run training
         best_score = float('inf') if args.minimize_score else -float('inf')
         best_epoch, n_iter = 0, 0
+        early_stopping_count = 0
         for epoch in trange(args.epochs):
             debug(f'Epoch {epoch}')
             n_iter = train(
@@ -339,6 +340,12 @@ def run_training(args: TrainArgs,
                 best_score, best_epoch = mean_val_score, epoch
                 save_checkpoint(os.path.join(save_dir, MODEL_FILE_NAME), model, scaler, features_scaler,
                                 atom_descriptor_scaler, bond_descriptor_scaler, atom_bond_scaler, args)
+                early_stopping_count = 0
+            else:
+                early_stopping_count += 1
+                if early_stopping_count == args.early_stopping:
+                    debug(f'Early sopping at epoch {epoch}')
+                    break
 
         best_valid_scores[args.metric].append(best_score)
 

@@ -81,6 +81,8 @@ class CommonArgs(Tap):
     """Turn off cuda (i.e., use CPU instead of GPU)."""
     gpu: int = None
     """Which GPU to use."""
+    early_stopping: int = 5
+    """Number of early stopping counts"""
     data_type: Literal['validation', 'test'] = 'test'
     """Output scores of cross_validate.py."""
     features_generator: List[str] = None
