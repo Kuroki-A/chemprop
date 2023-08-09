@@ -344,7 +344,7 @@ def run_training(args: TrainArgs,
             else:
                 early_stopping_count += 1
                 if early_stopping_count == args.early_stopping:
-                    debug(f'Early sopping at epoch {epoch}')
+                    debug(f'Early stopped at epoch {epoch}')
                     break
 
         best_valid_scores[args.metric].append(best_score)
