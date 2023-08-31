@@ -140,16 +140,16 @@ Note: The name you use to register the features generator is the name
 you will specify on the command line when using the --features_generator <name> flag.
 Ex. python train.py ... --features_generator custom ...
 
-@register_features_generator('custom')
+import torch as th
+from unimol_tools import UniMolRepr
+
+@register_features_generator('unimol')
 def custom_features_generator(mol: Molecule) -> np.ndarray:
-    # If you want to use the SMILES string
-    smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
+    clf = UniMolRepr(data_type='molecule')
+    smiles = [Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol]
 
-    # If you want to use the RDKit molecule
-    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
-
-    # Replace this with code which generates features from the molecule
-    features = np.array([0, 0, 1])
+    reprs = clf.get_repr(smiles)
+    features = np.array(reprs["cls_repr"][0])
 
     return features
 """
