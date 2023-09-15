@@ -6,6 +6,8 @@ from rdkit import Chem
 import torch
 import torch.nn as nn
 
+from torch_geometric.nn import aggr
+
 from chemprop.args import TrainArgs
 from chemprop.features import BatchMolGraph, get_atom_fdim, get_bond_fdim, mol2graph
 from chemprop.nn_utils import index_select_ND, get_activation_function
@@ -173,7 +175,7 @@ class MPNEncoder(nn.Module):
         # Readout
         if self.is_atom_bond_targets:
             return atom_hiddens, a_scope, bond_hiddens, b_scope, b2br  # num_atoms x hidden, remove the first one which is zero padding
-
+        
         mol_vecs = []
         for i, (a_start, a_size) in enumerate(a_scope):
             if a_size == 0:
@@ -181,14 +183,44 @@ class MPNEncoder(nn.Module):
             else:
                 cur_hiddens = atom_hiddens.narrow(0, a_start, a_size)
                 mol_vec = cur_hiddens  # (num_atoms, hidden_size)
-                if self.aggregation == 'mean':
-                    mol_vec = mol_vec.sum(dim=0) / a_size
-                elif self.aggregation == 'sum':
-                    mol_vec = mol_vec.sum(dim=0)
-                elif self.aggregation == 'norm':
-                    mol_vec = mol_vec.sum(dim=0) / self.aggregation_norm
-                mol_vecs.append(mol_vec)
-
+                if self.aggregation == 'sum':
+                    agg = aggr.SumAggregation()
+                    mol_vec = agg(mol_vec)
+                if self.aggregation == 'norm':
+                    agg = aggr.SumAggregation()
+                    mol_vec = agg(mol_vec) / self.aggregation_norm
+                elif self.aggregation == 'mean':
+                    agg = aggr.MeanAggregation()
+                    mol_vec = agg(mol_vec)
+                elif self.aggregation == 'max':
+                    agg = aggr.MaxAggregation()
+                    mol_vec = agg(mol_vec)
+                elif self.aggregation == 'lstm':
+                    agg = aggr.LSTMAggregation(in_channels=self.hidden_size, out_channels=self.hidden_size)
+                    agg = agg.to(self.device)
+                    mol_vec = agg(mol_vec)
+                elif self.aggregation == 'gru':
+                    agg = aggr.GRUAggregation(in_channels=self.hidden_size, out_channels=self.hidden_size)
+                    agg = agg.to(self.device)
+                    mol_vec = agg(mol_vec)
+                elif self.aggregation == 'gm':
+                    agg = aggr.GraphMultisetTransformer(channels=self.hidden_size, k=self.hidden_size)
+                    agg = agg.to(self.device)
+                    mol_vec = agg(mol_vec)
+                elif self.aggregation == 'eq':
+                    agg = aggr.EquilibriumAggregation(in_channels=self.hidden_size, out_channels=self.hidden_size, num_layers=[2])
+                    agg = agg.to(self.device)
+                    mol_vec = agg(mol_vec)
+                elif self.aggregation == 'ds':
+                    agg = aggr.DeepSetsAggregation()
+                    agg = agg.to(self.device)
+                    mol_vec = agg(mol_vec)
+                elif self.aggregation == 'attn':
+                    agg = aggr.SetTransformerAggregation(channels=self.hidden_size)
+                    agg = agg.to(self.device)
+                    mol_vec = agg(mol_vec)
+                mol_vecs.append(mol_vec[0])       
+        
         mol_vecs = torch.stack(mol_vecs, dim=0)  # (num_molecules, hidden_size)
 
         return mol_vecs  # num_molecules x hidden

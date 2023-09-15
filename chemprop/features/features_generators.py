@@ -140,7 +140,6 @@ Note: The name you use to register the features generator is the name
 you will specify on the command line when using the --features_generator <name> flag.
 Ex. python train.py ... --features_generator custom ...
 
-import torch as th
 from unimol_tools import UniMolRepr
 
 @register_features_generator('unimol')
