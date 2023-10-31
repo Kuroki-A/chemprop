@@ -85,6 +85,8 @@ class CommonArgs(Tap):
     """Number of early stopping counts"""
     data_type: Literal['validation', 'test'] = 'test'
     """Output scores of cross_validate.py."""
+    use_cache: : bool = False
+    """Whether to use cache or not before training."""
     features_generator: List[str] = None
     """Method(s) of generating additional features."""
     features_path: List[str] = None
