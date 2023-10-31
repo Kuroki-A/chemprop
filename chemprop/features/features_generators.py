@@ -1,9 +1,14 @@
 from typing import Callable, List, Union
 
 import numpy as np
+
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
+from rdkit.Avalon import pyAvalonTools
+from rdkit.Avalon.pyAvalonTools import GetAvalonCountFP, GetAvalonFP
 
+from unimol_tools import UniMolRepr
+from mordred import Calculator, descriptors
 
 Molecule = Union[str, Chem.Mol]
 FeaturesGenerator = Callable[[Molecule], np.ndarray]
@@ -133,14 +138,80 @@ except ImportError:
                           '(https://github.com/bp-kelley/descriptastorus) to use RDKit 2D normalized features.')
 
 
-"""
-Custom features generator template.
+@register_features_generator('rdkit_2d_208')
+def custom_features_generator(mol: Molecule) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+    
+    desc_names = [x[0] for x in Descriptors._descList if x[0]]
+    calc = MoleculeDescriptors.MolecularDescriptorCalculator(desc_names)
 
-Note: The name you use to register the features generator is the name
-you will specify on the command line when using the --features_generator <name> flag.
-Ex. python train.py ... --features_generator custom ...
+    features = []
+    for d in calc.CalcDescriptors(mol):
+        features.append(d)
 
-from unimol_tools import UniMolRepr
+    return np.array(features)
+
+
+@register_features_generator('rdkit_2d_400')
+def custom_features_generator(mol: Molecule) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+
+    features = []
+    for desc_name in inspect.getmembers(Descriptors, inspect.isfunction):
+        desc_name = desc_name[0]
+        if desc_name.startswith("_"):
+            continue
+        if desc_name == "setupAUTOCorrDescriptors":
+            continue
+        features.append(getattr(Descriptors, desc_name)(mol))
+
+    return features
+
+
+@register_features_generator('maccs')
+def custom_features_generator(mol: Molecule) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+
+    return np.array(AllChem.GetMACCSKeysFingerprint(mol), int)
+
+
+@register_features_generator('rdkit')
+def custom_features_generator(mol: Molecule) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+
+    return np.array(Chem.RDKFingerprint(mol), int)
+
+
+@register_features_generator('avalon')
+def custom_features_generator(mol: Molecule) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+
+    return np.array(pyAvalonTools.GetAvalonFP(mol), int)
+
+
+@register_features_generator('atompair')
+def custom_features_generator(mol: Molecule) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+
+    return np.array(AllChem.GetHashedAtomPairFingerprintAsBitVect(mol), int)
+
+
+@register_features_generator('erg')
+def custom_features_generator(mol: Molecule) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+
+    return np.array(AllChem.GetErGFingerprint(mol), int)
+
+
+@register_features_generator('mordred')
+def custom_features_generator(mol: Molecule) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+    
+    calc = Calculator(descriptors, ignore_3D=True)
+    features = calc(mol)
+
+    return np.array([feature for feature in features])
+
 
 @register_features_generator('unimol')
 def custom_features_generator(mol: Molecule) -> np.ndarray:
@@ -149,6 +220,27 @@ def custom_features_generator(mol: Molecule) -> np.ndarray:
 
     reprs = clf.get_repr(smiles)
     features = np.array(reprs["cls_repr"][0])
+
+    return features
+
+
+"""
+Custom features generator template.
+
+Note: The name you use to register the features generator is the name
+you will specify on the command line when using the --features_generator <name> flag.
+Ex. python train.py ... --features_generator custom ...
+
+@register_features_generator('custom')
+def custom_features_generator(mol: Molecule) -> np.ndarray:
+    # If you want to use the SMILES string
+    smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
+
+    # If you want to use the RDKit molecule
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+
+    # Replace this with code which generates features from the molecule
+    features = np.array([0, 0, 1])
 
     return features
 """
