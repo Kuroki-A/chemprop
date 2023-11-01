@@ -1,15 +1,18 @@
+import inspect
 from typing import Callable, List, Union
 
 import numpy as np
+import pandas as pd
 
 from rdkit import Chem, DataStructs
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, Descriptors
 from rdkit.Avalon import pyAvalonTools
 from rdkit.Avalon.pyAvalonTools import GetAvalonCountFP, GetAvalonFP
+from rdkit.ML.Descriptors import MoleculeDescriptors
 
 from padelpy import from_smiles
 from unimol_tools import UniMolRepr
-from mordred import Calculator, descriptors, DetourMatrix, EState, Lipinski, MolecularDistanceEdge
+from mordred import Calculator, descriptors, DetourMatrix, EState, Lipinski, MolecularDistanceEdge, VdwVolumeABC
 
 remove_descs = [DetourMatrix, EState, Lipinski, MolecularDistanceEdge]
 remove_columns = []
@@ -225,7 +228,6 @@ def custom_features_generator(mol: Molecule) -> np.ndarray:
     
     calc = Calculator(descriptors, ignore_3D=True)
     df = calc.pandas(mol_list)
-    
     df_ = df.loc[:, new_columns]
 
     return df_.values[0]
@@ -236,7 +238,7 @@ def custom_features_generator(mol: Molecule) -> np.ndarray:
     smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
     descriptors = from_smiles(smiles)
 
-    return pd.DataFrame.from_dict(descriptors, orient='index').T.values[0].astype('float')
+    return pd.DataFrame.from_dict(descriptors, orient='index').T.iloc[:, :1444].values[0].astype('float')
 
 
 @register_features_generator('unimol')
