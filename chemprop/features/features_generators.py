@@ -7,8 +7,22 @@ from rdkit.Chem import AllChem
 from rdkit.Avalon import pyAvalonTools
 from rdkit.Avalon.pyAvalonTools import GetAvalonCountFP, GetAvalonFP
 
+from padelpy import from_smiles
 from unimol_tools import UniMolRepr
-from mordred import Calculator, descriptors
+from mordred import Calculator, descriptors, DetourMatrix, EState, Lipinski, MolecularDistanceEdge
+
+remove_descs = [DetourMatrix, EState, Lipinski, MolecularDistanceEdge]
+remove_columns = []
+mols = [Chem.MolFromSmiles("c1ccccc1")]
+
+for i in remove_descs:
+    calc = Calculator([i], ignore_3D=True)
+    df = calc.pandas(mols)
+    remove_columns.extend(list(df.columns))
+    
+calc = Calculator(descriptors, ignore_3D=True)
+df = calc.pandas(mols)
+new_columns = set(df.columns)^set(remove_columns)
 
 Molecule = Union[str, Chem.Mol]
 FeaturesGenerator = Callable[[Molecule], np.ndarray]
@@ -206,11 +220,23 @@ def custom_features_generator(mol: Molecule) -> np.ndarray:
 @register_features_generator('mordred')
 def custom_features_generator(mol: Molecule) -> np.ndarray:
     mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+    mol_list = []
+    mol_list.append(mol)
     
     calc = Calculator(descriptors, ignore_3D=True)
-    features = calc(mol)
+    df = calc.pandas(mol_list)
+    
+    df_ = df.loc[:, new_columns]
 
-    return np.array([feature for feature in features])
+    return df_.values[0]
+
+
+@register_features_generator('padelpy')
+def custom_features_generator(mol: Molecule) -> np.ndarray:
+    smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
+    descriptors = from_smiles(smiles)
+
+    return pd.DataFrame.from_dict(descriptors, orient='index').T.values[0].astype('float')
 
 
 @register_features_generator('unimol')
