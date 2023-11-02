@@ -12,9 +12,9 @@ from rdkit.ML.Descriptors import MoleculeDescriptors
 
 from padelpy import from_smiles
 from unimol_tools import UniMolRepr
-from mordred import Calculator, descriptors, DetourMatrix, EState, Lipinski, MolecularDistanceEdge, VdwVolumeABC
+from mordred import Calculator, descriptors, Autocorrelation, Chi, DetourMatrix, EState, Lipinski, MolecularDistanceEdge, VdwVolumeABC
 
-remove_descs = [DetourMatrix, EState, Lipinski, MolecularDistanceEdge]
+remove_descs = [Autocorrelation, Chi, DetourMatrix, EState, Lipinski, MolecularDistanceEdge, VdwVolumeABC]
 remove_columns = []
 mols = [Chem.MolFromSmiles("c1ccccc1")]
 
