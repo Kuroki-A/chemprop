@@ -10,10 +10,12 @@ from rdkit.Avalon import pyAvalonTools
 from rdkit.Avalon.pyAvalonTools import GetAvalonCountFP, GetAvalonFP
 from rdkit.ML.Descriptors import MoleculeDescriptors
 
+from descriptastorus.descriptors import rdNormalizedDescriptors
 from padelpy import from_smiles
 from unimol_tools import UniMolRepr
 from mordred import Calculator, descriptors, Autocorrelation, Chi, DetourMatrix, EState, Lipinski, MolecularDistanceEdge, VdwVolumeABC
 
+#Generate columns for Mordred
 remove_descs = [Autocorrelation, Chi, DetourMatrix, EState, Lipinski, MolecularDistanceEdge, VdwVolumeABC]
 remove_columns = []
 mols = [Chem.MolFromSmiles("c1ccccc1")]
@@ -26,6 +28,14 @@ for i in remove_descs:
 calc = Calculator(descriptors, ignore_3D=True)
 df = calc.pandas(mols)
 new_columns = set(df.columns)^set(remove_columns)
+
+#Generate columns for rdkit_2d w/o fragments
+generator = rdNormalizedDescriptors.RDKit2DNormalized()
+generator_columns = [list(i)[:1][0] for i in generator.columns]
+c = pd.DataFrame(generator_columns)
+c_ = c[~c[0].str.contains("fr")]
+wo_fr = [column[0] for column in c_.values]
+
 
 Molecule = Union[str, Chem.Mol]
 FeaturesGenerator = Callable[[Molecule], np.ndarray]
@@ -153,6 +163,32 @@ except ImportError:
         """Mock implementation raising an ImportError if descriptastorus cannot be imported."""
         raise ImportError('Failed to import descriptastorus. Please install descriptastorus '
                           '(https://github.com/bp-kelley/descriptastorus) to use RDKit 2D normalized features.')
+
+        
+@register_features_generator('rdkit_2d_wo_fr')
+def rdkit_2d_features_generator(mol: Molecule) -> np.ndarray:
+    smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
+    generator = rdDescriptors.RDKit2D()
+    features = generator.process(smiles)[1:]
+
+    d = pd.DataFrame(features).T
+    d.columns = generator_columns
+    d_ = d.loc[:, wo_fr]
+
+    return d_.values[0]
+
+
+@register_features_generator('rdkit_2d_normalized_wo_fr')
+def rdkit_2d_normalized_features_generator(mol: Molecule) -> np.ndarray:
+    smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
+    generator = rdNormalizedDescriptors.RDKit2DNormalized()
+    features = generator.process(smiles)[1:]
+
+    d = pd.DataFrame(features).T
+    d.columns = generator_columns
+    d_ = d.loc[:, wo_fr]
+
+    return d_.values[0]
 
 
 @register_features_generator('rdkit_2d_208')
