@@ -27,7 +27,7 @@ for i in remove_descs:
     
 calc = Calculator(descriptors, ignore_3D=True)
 df = calc.pandas(mols)
-new_columns = set(df.columns)^set(remove_columns)
+new_columns = list(set(df.columns)^set(remove_columns))
 
 #Generate columns for rdkit_2d w/o fragments
 generator = rdNormalizedDescriptors.RDKit2DNormalized()
@@ -216,6 +216,8 @@ def custom_features_generator(mol: Molecule) -> np.ndarray:
             continue
         if desc_name == "setupAUTOCorrDescriptors":
             continue
+        if desc_name == "CalcMolDescriptors":
+            continue
         features.append(getattr(Descriptors, desc_name)(mol))
 
     return features
@@ -272,9 +274,12 @@ def custom_features_generator(mol: Molecule) -> np.ndarray:
 @register_features_generator('padelpy')
 def custom_features_generator(mol: Molecule) -> np.ndarray:
     smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
-    descriptors = from_smiles(smiles)
-
-    return pd.DataFrame.from_dict(descriptors, orient='index').T.iloc[:, :1444].values[0].astype('float')
+    try:
+        descriptors = from_smiles(smiles)
+        return pd.DataFrame.from_dict(descriptors, orient='index').T.iloc[:, :1444].values[0].astype('float')
+    except:
+        print('PaDEL-Descriptor maybe timed out')
+        return np.zeros(1444)
 
 
 @register_features_generator('unimol')
