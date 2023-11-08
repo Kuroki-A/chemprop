@@ -13,10 +13,10 @@ from rdkit.ML.Descriptors import MoleculeDescriptors
 from descriptastorus.descriptors import rdNormalizedDescriptors
 from padelpy import from_smiles
 from unimol_tools import UniMolRepr
-from mordred import Calculator, descriptors, Autocorrelation, Chi, DetourMatrix, EState, Lipinski, MolecularDistanceEdge, VdwVolumeABC
+from mordred import Calculator, descriptors, ABCIndex, Autocorrelation, Chi, DetourMatrix, EState, Lipinski, MolecularDistanceEdge, VdwVolumeABC
 
 #Generate columns for Mordred
-remove_descs = [Autocorrelation, Chi, DetourMatrix, EState, Lipinski, MolecularDistanceEdge, VdwVolumeABC]
+remove_descs = [ABCIndex, Autocorrelation, Chi, DetourMatrix, EState, Lipinski, MolecularDistanceEdge, VdwVolumeABC]
 remove_columns = []
 mols = [Chem.MolFromSmiles("c1ccccc1")]
 
@@ -278,7 +278,7 @@ def custom_features_generator(mol: Molecule) -> np.ndarray:
         descriptors = from_smiles(smiles)
         return pd.DataFrame.from_dict(descriptors, orient='index').T.iloc[:, :1444].values[0].astype('float')
     except:
-        print('PaDEL-Descriptor maybe timed out')
+        print('Timeout may be occurred.')
         return np.zeros(1444)
 
 
