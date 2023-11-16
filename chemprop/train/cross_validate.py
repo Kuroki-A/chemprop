@@ -13,6 +13,8 @@ import pandas as pd
 import torch
 
 from .run_training import run_training
+from .run_training_lgbm import run_training_lgbm
+
 from chemprop.args import TrainArgs
 from chemprop.constants import TEST_SCORES_FILE_NAME, TRAIN_LOGGER_NAME
 from chemprop.data import get_data, get_task_names, MoleculeDataset, validate_dataset_type
@@ -253,4 +255,9 @@ def chemprop_train() -> None:
 
     This is the entry point for the command line command :code:`chemprop_train`.
     """
-    cross_validate(args=TrainArgs().parse_args(), train_func=run_training)
+    args=TrainArgs().parse_args()
+    
+    if args.model_type == 'FFN':
+        cross_validate(args=TrainArgs().parse_args(), train_func=run_training)
+    elif args.model_type == 'lgbm':
+        cross_validate(args=TrainArgs().parse_args(), train_func=run_training_lgbm)
