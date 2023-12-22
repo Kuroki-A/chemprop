@@ -412,8 +412,12 @@ def get_data(path: str,
 
     # Load features
     if features_path is not None:
+        #if args.selected_features_path is not None:
+        #    selected_features_df = pd.read_csv(args.selected_features_path)
+
         features_data = []
         for feat_path in features_path:
+            #print()
             features_data.append(load_features(feat_path))  # each is num_data x num_features
         features_data = np.concatenate(features_data, axis=1)
     else:
@@ -580,6 +584,7 @@ def get_data(path: str,
                 gt_targets=all_gt[i] if gt_targets is not None else None,
                 lt_targets=all_lt[i] if lt_targets is not None else None,
                 features_generator=features_generator,
+                selected_features_path=args.selected_features_path,
                 features=all_features[i] if features_data is not None else None,
                 phase_features=all_phase_features[i] if phase_features is not None else None,
                 atom_features=atom_features[i] if atom_features is not None else None,

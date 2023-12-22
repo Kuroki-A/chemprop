@@ -4,6 +4,8 @@ from random import Random
 from typing import Dict, Iterator, List, Optional, Union, Tuple
 
 import numpy as np
+import pandas as pd
+
 from torch.utils.data import DataLoader, Dataset, Sampler
 from rdkit import Chem
 
@@ -65,6 +67,7 @@ class MoleculeDatapoint:
                  lt_targets: List[List[bool]] = None,
                  features: np.ndarray = None,
                  features_generator: List[str] = None,
+                 selected_features_path: str = None,
                  phase_features: List[float] = None,
                  atom_features: np.ndarray = None,
                  atom_descriptors: np.ndarray = None,
@@ -101,6 +104,7 @@ class MoleculeDatapoint:
         self.row = row
         self.features = features
         self.features_generator = features_generator
+        self.selected_features_path = selected_features_path
         self.phase_features = phase_features
         self.atom_descriptors = atom_descriptors
         self.bond_descriptors = bond_descriptors
@@ -131,15 +135,22 @@ class MoleculeDatapoint:
                 self.features = list(self.features)
 
             for fg in self.features_generator:
+                selected_feature_columns = None
+                if self.selected_features_path is not None:
+                    selected_features_df = pd.read_csv(self.selected_features_path)
+                    if fg in selected_features_df.columns:
+                        selected_feature_columns = selected_features_df[fg].values
+                        selected_feature_columns = [x for x in selected_feature_columns if not pd.isnull(x) == True]
+
                 features_generator = get_features_generator(fg)
                 for m, reaction in zip(self.mol, self.is_reaction_list):
                     if not reaction:
                         if m is not None and m.GetNumHeavyAtoms() > 0:
-                            self.features.extend(features_generator(m))
+                            self.features.extend(features_generator(m, selected_feature_columns))
                         # for H2
                         elif m is not None and m.GetNumHeavyAtoms() == 0:
                             # not all features are equally long, so use methane as dummy molecule to determine length
-                            self.features.extend(np.zeros(len(features_generator(Chem.MolFromSmiles('C')))))
+                            self.features.extend(np.zeros(len(features_generator(Chem.MolFromSmiles('C'), selected_feature_columns))))
                     else:
                         if m[0] is not None and m[1] is not None and m[0].GetNumHeavyAtoms() > 0:
                             self.features.extend(features_generator(m[0]))

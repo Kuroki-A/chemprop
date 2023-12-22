@@ -77,6 +77,8 @@ class CommonArgs(Tap):
     """Path to model checkpoint (:code:`.pt` file)."""
     checkpoint_paths: List[str] = None
     """List of paths to model checkpoints (:code:`.pt` files)."""
+    selected_features_path: str = None
+    """Path to selected features csv (:code:`.csv` file)."""    
     no_cuda: bool = False
     """Turn off cuda (i.e., use CPU instead of GPU)."""
     gpu: int = None

@@ -84,7 +84,8 @@ MORGAN_NUM_BITS = 2048
 @register_features_generator('morgan')
 def morgan_binary_features_generator(mol: Molecule,
                                      radius: int = MORGAN_RADIUS,
-                                     num_bits: int = MORGAN_NUM_BITS) -> np.ndarray:
+                                     num_bits: int = MORGAN_NUM_BITS,
+                                     selected_feature_columns: list = None) -> np.ndarray:
     """
     Generates a binary Morgan fingerprint for a molecule.
 
@@ -104,7 +105,8 @@ def morgan_binary_features_generator(mol: Molecule,
 @register_features_generator('morgan_count')
 def morgan_counts_features_generator(mol: Molecule,
                                      radius: int = MORGAN_RADIUS,
-                                     num_bits: int = MORGAN_NUM_BITS) -> np.ndarray:
+                                     num_bits: int = MORGAN_NUM_BITS,
+                                     selected_feature_columns: list = None) -> np.ndarray:
     """
     Generates a counts-based Morgan fingerprint for a molecule.
 
@@ -125,7 +127,8 @@ try:
     from descriptastorus.descriptors import rdDescriptors, rdNormalizedDescriptors
 
     @register_features_generator('rdkit_2d')
-    def rdkit_2d_features_generator(mol: Molecule) -> np.ndarray:
+    def rdkit_2d_features_generator(mol: Molecule,
+                                    selected_feature_columns: list = None) -> np.ndarray:
         """
         Generates RDKit 2D features for a molecule.
 
@@ -135,11 +138,18 @@ try:
         smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
         generator = rdDescriptors.RDKit2D()
         features = generator.process(smiles)[1:]
+        
+        features = pd.DataFrame(features).T
+        features.columns = generator_columns
+        
+        if selected_feature_columns is not None:
+            features = features.loc[:, selected_feature_columns]
 
-        return features
+        return features.to_numpy()[0]
 
     @register_features_generator('rdkit_2d_normalized')
-    def rdkit_2d_normalized_features_generator(mol: Molecule) -> np.ndarray:
+    def rdkit_2d_normalized_features_generator(mol: Molecule,
+                                               selected_feature_columns: list = None) -> np.ndarray:
         """
         Generates RDKit 2D normalized features for a molecule.
 
@@ -149,50 +159,68 @@ try:
         smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
         generator = rdNormalizedDescriptors.RDKit2DNormalized()
         features = generator.process(smiles)[1:]
+        
+        features = pd.DataFrame(features).T
+        features.columns = generator_columns
+        
+        if selected_feature_columns is not None:
+            features = features.loc[:, selected_feature_columns]
 
-        return features
+        return features.to_numpy()[0]
+
 except ImportError:
     @register_features_generator('rdkit_2d')
-    def rdkit_2d_features_generator(mol: Molecule) -> np.ndarray:
+    def rdkit_2d_features_generator(mol: Molecule,
+                                    selected_feature_columns: list = None) -> np.ndarray:
         """Mock implementation raising an ImportError if descriptastorus cannot be imported."""
         raise ImportError('Failed to import descriptastorus. Please install descriptastorus '
                           '(https://github.com/bp-kelley/descriptastorus) to use RDKit 2D features.')
 
     @register_features_generator('rdkit_2d_normalized')
-    def rdkit_2d_normalized_features_generator(mol: Molecule) -> np.ndarray:
+    def rdkit_2d_normalized_features_generator(mol: Molecule,
+                                               selected_feature_columns: list = None) -> np.ndarray:
         """Mock implementation raising an ImportError if descriptastorus cannot be imported."""
         raise ImportError('Failed to import descriptastorus. Please install descriptastorus '
                           '(https://github.com/bp-kelley/descriptastorus) to use RDKit 2D normalized features.')
 
         
 @register_features_generator('rdkit_2d_wo_fr')
-def rdkit_2d_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
     generator = rdDescriptors.RDKit2D()
     features = generator.process(smiles)[1:]
+    
+    features = pd.DataFrame(features).T
+    features.columns = generator_columns
+    features = features.loc[:, wo_fr]
+    
+    if selected_feature_columns is not None:
+        features = features.loc[:, selected_feature_columns]
 
-    d = pd.DataFrame(features).T
-    d.columns = generator_columns
-    d_ = d.loc[:, wo_fr]
-
-    return d_.values[0]
+    return features.to_numpy()[0]
 
 
 @register_features_generator('rdkit_2d_normalized_wo_fr')
-def rdkit_2d_normalized_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
     generator = rdNormalizedDescriptors.RDKit2DNormalized()
     features = generator.process(smiles)[1:]
 
-    d = pd.DataFrame(features).T
-    d.columns = generator_columns
-    d_ = d.loc[:, wo_fr]
+    features = pd.DataFrame(features).T
+    features.columns = generator_columns
+    features = features.loc[:, wo_fr]
+    
+    if selected_feature_columns is not None:
+        features = features.loc[:, selected_feature_columns]
 
-    return d_.values[0]
+    return features.to_numpy()[0]
 
 
 @register_features_generator('rdkit_2d_208')
-def custom_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
     
     desc_names = [x[0] for x in Descriptors._descList if x[0]]
@@ -201,15 +229,23 @@ def custom_features_generator(mol: Molecule) -> np.ndarray:
     features = []
     for d in calc.CalcDescriptors(mol):
         features.append(d)
+        
+    features = pd.DataFrame(features).T
+    features.columns = desc_names
+    
+    if selected_feature_columns is not None:
+        features = features.loc[:, selected_feature_columns]
 
-    return np.array(features)
+    return features.to_numpy()[0]
 
 
 @register_features_generator('rdkit_2d_400')
-def custom_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
 
     features = []
+    desc_names = []
     for desc_name in inspect.getmembers(Descriptors, inspect.isfunction):
         desc_name = desc_name[0]
         if desc_name.startswith("_"):
@@ -218,48 +254,61 @@ def custom_features_generator(mol: Molecule) -> np.ndarray:
             continue
         if desc_name == "CalcMolDescriptors":
             continue
+        desc_names.append(desc_name)
         features.append(getattr(Descriptors, desc_name)(mol))
+        
+    features = pd.DataFrame(features).T
+    features.columns = desc_names
 
-    return features
+    if selected_feature_columns is not None:
+        features = features.loc[:, selected_feature_columns]
+
+    return features.to_numpy()[0]
 
 
 @register_features_generator('maccs')
-def custom_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
 
     return np.array(AllChem.GetMACCSKeysFingerprint(mol), int)
 
 
 @register_features_generator('rdkit')
-def custom_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
 
     return np.array(Chem.RDKFingerprint(mol), int)
 
 
 @register_features_generator('avalon')
-def custom_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
 
     return np.array(pyAvalonTools.GetAvalonFP(mol), int)
 
 
 @register_features_generator('atompair')
-def custom_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
 
     return np.array(AllChem.GetHashedAtomPairFingerprintAsBitVect(mol), int)
 
 
 @register_features_generator('erg')
-def custom_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
 
     return np.array(AllChem.GetErGFingerprint(mol), int)
 
 
 @register_features_generator('mordred')
-def custom_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
     mol_list = []
     mol_list.append(mol)
@@ -267,23 +316,39 @@ def custom_features_generator(mol: Molecule) -> np.ndarray:
     calc = Calculator(descriptors, ignore_3D=True)
     df = calc.pandas(mol_list)
     df_ = df.loc[:, new_columns]
+    
+    if selected_feature_columns is not None:
+        df_ = df_.loc[:, selected_feature_columns]
 
-    return df_.values[0]
+    return df_.values[0].astype('float')
 
 
 @register_features_generator('padelpy')
-def custom_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     smiles = Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol
     try:
         descriptors = from_smiles(smiles)
-        return pd.DataFrame.from_dict(descriptors, orient='index').T.iloc[:, :1444].values[0].astype('float')
+        features = pd.DataFrame.from_dict(descriptors, orient='index').T.iloc[:, :1444]
+        
+        if selected_feature_columns is not None:
+            features = features.loc[:, selected_feature_columns]
+        
+        return features.to_numpy()[0].astype('float')
     except:
         print('Timeout may be occurred.')
-        return np.zeros(1444)
+        descriptors = from_smiles('c1ccccc1')
+        features = pd.DataFrame.from_dict(descriptors, orient='index').T.iloc[:, :1444]
+        
+        if selected_feature_columns is not None:
+            features = features.loc[:, selected_feature_columns]
+        
+        return np.zeros(len(features.columns))
 
 
 @register_features_generator('unimol')
-def custom_features_generator(mol: Molecule) -> np.ndarray:
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
     clf = UniMolRepr(data_type='molecule')
     smiles = [Chem.MolToSmiles(mol, isomericSmiles=True) if type(mol) != str else mol]
 
