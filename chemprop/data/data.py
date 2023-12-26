@@ -146,11 +146,11 @@ class MoleculeDatapoint:
                 for m, reaction in zip(self.mol, self.is_reaction_list):
                     if not reaction:
                         if m is not None and m.GetNumHeavyAtoms() > 0:
-                            self.features.extend(features_generator(m, selected_feature_columns))
+                            self.features.extend(features_generator(m, selected_feature_columns=selected_feature_columns))
                         # for H2
                         elif m is not None and m.GetNumHeavyAtoms() == 0:
                             # not all features are equally long, so use methane as dummy molecule to determine length
-                            self.features.extend(np.zeros(len(features_generator(Chem.MolFromSmiles('C'), selected_feature_columns))))
+                            self.features.extend(np.zeros(len(features_generator(Chem.MolFromSmiles('C'), selected_feature_columns=selected_feature_columns))))
                     else:
                         if m[0] is not None and m[1] is not None and m[0].GetNumHeavyAtoms() > 0:
                             self.features.extend(features_generator(m[0]))
