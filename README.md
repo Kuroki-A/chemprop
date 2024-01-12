@@ -90,7 +90,7 @@ Then proceed to either option below to complete the installation. If installing 
 
 ### Option 2: Installing from source
 
-1. `git clone https://github.com/Kuroki-A/chemprop.git`
+1. `git clone -b share https://github.com/Kuroki-A/chemprop.git`
 2. `cd chemprop`
 3. `conda create -y -n chemprop python=3.8`
 4. `conda activate chemprop`

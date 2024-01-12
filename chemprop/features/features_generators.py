@@ -12,7 +12,7 @@ from rdkit.ML.Descriptors import MoleculeDescriptors
 
 from descriptastorus.descriptors import rdNormalizedDescriptors
 from padelpy import from_smiles
-from unimol_tools import UniMolRepr
+#from unimol_tools import UniMolRepr
 from mordred import Calculator, AcidBase, AdjacencyMatrix, Aromatic, AtomCount, BalabanJ, BaryszMatrix, BertzCT, BondCount, CarbonTypes, Constitutional, DistanceMatrix, EccentricConnectivityIndex, FragmentComplexity, Framework, HydrogenBond, InformationContent, KappaShapeIndex, LogS, McGowanVolume, MoeType, MolecularId, PathCount, Polarizability, RingCount, RotatableBond, SLogP, TopoPSA, TopologicalCharge, TopologicalIndex, VertexAdjacencyInformation, WalkCount, Weight, WienerIndex, ZagrebIndex
 
 desc_list = [AcidBase, AdjacencyMatrix, Aromatic, AtomCount, BalabanJ, BaryszMatrix, BertzCT, BondCount, CarbonTypes, Constitutional, DistanceMatrix, EccentricConnectivityIndex, FragmentComplexity, Framework, HydrogenBond, InformationContent, KappaShapeIndex, LogS, McGowanVolume, MoeType, MolecularId, PathCount, Polarizability, RingCount, RotatableBond, SLogP, TopoPSA, TopologicalCharge, TopologicalIndex, VertexAdjacencyInformation, WalkCount, Weight, WienerIndex, ZagrebIndex]
@@ -335,7 +335,7 @@ def custom_features_generator(mol: Molecule,
         
         return np.zeros(len(features.columns))
 
-
+"""
 @register_features_generator('unimol')
 def custom_features_generator(mol: Molecule,
                               selected_feature_columns: list = None) -> np.ndarray:
@@ -346,7 +346,7 @@ def custom_features_generator(mol: Molecule,
     features = np.array(reprs["cls_repr"][0])
 
     return features
-
+"""
 
 """
 Custom features generator template.
