@@ -96,34 +96,14 @@ Then proceed to either option below to complete the installation. If installing 
 4. `conda activate chemprop`
 5. `pip install -e .`
 
- #### Install unimol_tools (https://github.com/dptech-corp/Uni-Mol/tree/main/unimol_tools)
- 6. `cd ~`
- 7. `git clone https://github.com/dptech-corp/Uni-Mol.git`
- 8. `cd Uni-Mol/unimol_tools`
- 9. `pip install -r requirements.txt`
- 10. `cd unimol_tools`
- 11. `wget https://github.com/dptech-corp/Uni-Mol/releases/download/v0.1/mol_pre_all_h_220816.pt`
- 12. `wget https://github.com/dptech-corp/Uni-Mol/releases/download/v0.1/mol_pre_no_h_220816.pt`
- 13. `wget https://github.com/dptech-corp/Uni-Mol/releases/download/v0.1/pocket_pre_220816.pt`
- 14. `wget https://github.com/dptech-corp/Uni-Mol/releases/download/v0.1/mof_pre_no_h_CORE_MAP_20230505.pt`
- 15. `wget https://github.com/dptech-corp/Uni-Mol/releases/download/v0.1/mp_all_h_230313.pt`
- 16. `wget https://github.com/dptech-corp/Uni-Mol/releases/download/v0.1/oled_pre_no_h_230101.pt`
- 17. `mkdir -p weights`
- 18. `mv *.pt weights/`
- 19. `cd ..`
- 20. `python setup.py install`
- 21. `git clone https://github.com/dptech-corp/Uni-Core.git`
- 22. `cd ~/Uni-Core/`
- 23. `pip install .`
-
  #### Check whether 'torch' can recognize 'gpu' or not
- 24. `cd ~`
- 25. `python`
- 26. `import torch`
- 27. `torch.tensor([0.1, 0.2]).cuda()`
+ 6. `cd ~`
+ 7. `python`
+ 8. `import torch`
+ 9. `torch.tensor([0.1, 0.2]).cuda()`
    If an error occurs, install the appropriate version of torch (https://download.pytorch.org/whl/torch/).
    (If 'CUDA' version is 11.5, `pip install torch-1.11.0+cu115-cp38-cp38-linux_x86_64.whl`)
- 28. `quit()`
+ 10. `quit()`
 
 ### Docker
 
