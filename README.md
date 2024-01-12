@@ -92,10 +92,10 @@ Then proceed to either option below to complete the installation. If installing 
 
 1. `git clone https://github.com/Kuroki-A/chemprop.git`
 2. `cd chemprop`
-~~3. `conda env create -f environment.yml`~~
 3. `conda create -y -n chemprop python=3.8`
 4. `conda activate chemprop`
 5. `pip install -e .`
+
  #### Install unimol_tools (https://github.com/dptech-corp/Uni-Mol/tree/main/unimol_tools)
  6. `cd ~`
  7. `git clone https://github.com/dptech-corp/Uni-Mol.git`
@@ -113,16 +113,17 @@ Then proceed to either option below to complete the installation. If installing 
  19. `cd ..`
  20. `python setup.py install`
  21. `git clone https://github.com/dptech-corp/Uni-Core.git`
- 22. `cd ~/Uni-Core/
+ 22. `cd ~/Uni-Core/`
  23. `pip install .`
+
  #### Check whether 'torch' can recognize 'gpu' or not
- 21. `cd ~`
- 22. `python`
- 23. `import torch`
- 24. `torch.tensor([0.1, 0.2]).cuda()`
+ 24. `cd ~`
+ 25. `python`
+ 26. `import torch`
+ 27. `torch.tensor([0.1, 0.2]).cuda()`
    If an error occurs, install the appropriate version of torch (https://download.pytorch.org/whl/torch/).
    (If 'CUDA' version is 11.5, `pip install torch-1.11.0+cu115-cp38-cp38-linux_x86_64.whl`)
- 25. `quit()`
+ 28. `quit()`
 
 ### Docker
 

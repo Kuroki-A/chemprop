@@ -13,27 +13,15 @@ from rdkit.ML.Descriptors import MoleculeDescriptors
 from descriptastorus.descriptors import rdNormalizedDescriptors
 from padelpy import from_smiles
 from unimol_tools import UniMolRepr
-from mordred import Calculator, descriptors, ABCIndex, Autocorrelation, BCUT, Chi, CPSA, DetourMatrix, EState, ExtendedTopochemicalAtom, Lipinski, MolecularDistanceEdge, VdwVolumeABC
+from mordred import Calculator, AcidBase, AdjacencyMatrix, Aromatic, AtomCount, BalabanJ, BaryszMatrix, BertzCT, BondCount, CarbonTypes, Constitutional, DistanceMatrix, EccentricConnectivityIndex, FragmentComplexity, Framework, HydrogenBond, InformationContent, KappaShapeIndex, LogS, McGowanVolume, MoeType, MolecularId, PathCount, Polarizability, RingCount, RotatableBond, SLogP, TopoPSA, TopologicalCharge, TopologicalIndex, VertexAdjacencyInformation, WalkCount, Weight, WienerIndex, ZagrebIndex
 
-#Generate columns for Mordred
-remove_descs = [ABCIndex, Autocorrelation, BCUT, Chi, CPSA, DetourMatrix, EState, ExtendedTopochemicalAtom, Lipinski, MolecularDistanceEdge, VdwVolumeABC]
-remove_columns = []
-mols = [Chem.MolFromSmiles("c1ccccc1")]
-
-for i in remove_descs:
-    calc = Calculator([i], ignore_3D=True)
-    df = calc.pandas(mols)
-    remove_columns.extend(list(df.columns))
-    
-calc = Calculator(descriptors, ignore_3D=True)
-df = calc.pandas(mols)
-new_columns = list(set(df.columns)^set(remove_columns))
+desc_list = [AcidBase, AdjacencyMatrix, Aromatic, AtomCount, BalabanJ, BaryszMatrix, BertzCT, BondCount, CarbonTypes, Constitutional, DistanceMatrix, EccentricConnectivityIndex, FragmentComplexity, Framework, HydrogenBond, InformationContent, KappaShapeIndex, LogS, McGowanVolume, MoeType, MolecularId, PathCount, Polarizability, RingCount, RotatableBond, SLogP, TopoPSA, TopologicalCharge, TopologicalIndex, VertexAdjacencyInformation, WalkCount, Weight, WienerIndex, ZagrebIndex]
 
 #Generate columns for rdkit_2d w/o fragments
 generator = rdNormalizedDescriptors.RDKit2DNormalized()
 generator_columns = [list(i)[:1][0] for i in generator.columns]
 c = pd.DataFrame(generator_columns)
-c_ = c[~c[0].str.contains("fr")]
+c_ = c[~c[0].str.contains("fr_")]
 wo_fr = [column[0] for column in c_.values]
 
 
@@ -313,14 +301,16 @@ def custom_features_generator(mol: Molecule,
     mol_list = []
     mol_list.append(mol)
     
-    calc = Calculator(descriptors, ignore_3D=True)
+    calc = Calculator()
+    for desc in desc_list:
+        calc.register(desc)
+        
     df = calc.pandas(mol_list)
-    df_ = df.loc[:, new_columns]
     
     if selected_feature_columns is not None:
-        df_ = df_.loc[:, selected_feature_columns]
+        df = df.loc[:, selected_feature_columns]
 
-    return df_.values[0].astype('float')
+    return df.values[0].astype('float')
 
 
 @register_features_generator('padelpy')
