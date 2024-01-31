@@ -218,11 +218,19 @@ class CommonArgs(Tap):
 
     def process_args(self) -> None:
         # Load checkpoint paths
-        self.checkpoint_paths = get_checkpoint_paths(
-            checkpoint_path=self.checkpoint_path,
-            checkpoint_paths=self.checkpoint_paths,
-            checkpoint_dir=self.checkpoint_dir,
-        )
+        if self.model_type == 'lgbm':
+            self.checkpoint_paths = get_checkpoint_paths(
+                checkpoint_path=self.checkpoint_path,
+                checkpoint_paths=self.checkpoint_paths,
+                checkpoint_dir=self.checkpoint_dir,
+                ext = '.pkl'
+            )
+        else:
+            self.checkpoint_paths = get_checkpoint_paths(
+                checkpoint_path=self.checkpoint_path,
+                checkpoint_paths=self.checkpoint_paths,
+                checkpoint_dir=self.checkpoint_dir,
+            )
 
         # Validate features
         if self.features_generator is not None and 'rdkit_2d_normalized' in self.features_generator and self.features_scaling:
@@ -881,6 +889,8 @@ class PredictArgs(CommonArgs):
     """Path to CSV file containing testing data for which predictions will be made."""
     preds_path: str
     """Path to CSV or PICKLE file where predictions will be saved."""
+    model_type: Literal['FFN', 'lgbm'] = 'FFN'
+    """Type of the prediction model."""
     drop_extra_columns: bool = False
     """Whether to drop all columns from the test data file besides the SMILES columns and the new prediction columns."""
     ensemble_variance: bool = False

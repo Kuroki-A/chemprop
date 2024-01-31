@@ -221,6 +221,9 @@ def run_training_lgbm(args: TrainArgs,
     else:
         set_cache_graph(False)
         num_workers = args.num_workers
+        
+    encoder = MoleculeModelEncoder(args)
+    encoder = encoder.to(args.device)
 
     # Create data loaders
     train_data_loader = MoleculeDataLoader(
@@ -236,26 +239,25 @@ def run_training_lgbm(args: TrainArgs,
         batch_size=len(val_data),
         num_workers=num_workers
     )
-    test_data_loader = MoleculeDataLoader(
-        dataset=test_data,
-        batch_size=len(test_data),
-        num_workers=num_workers
-    )
+    
+    if empty_test_set:
+        info(f'Model provided with no test set, no metric evaluation will be performed.')
+    else:
+        test_data_loader = MoleculeDataLoader(
+            dataset=test_data,
+            batch_size=len(test_data),
+            num_workers=num_workers
+        )
+        
+        for batch in tqdm(test_data_loader, total=len(test_data_loader), leave=False):
+            test_mol_batch, test_features_batch, test_target_batch = batch.batch_graph(), batch.features(), batch.targets()
+    
+        test_features = encoder(test_mol_batch, test_features_batch)
+        test_features = test_features.to('cpu').detach().numpy().copy()
+        test_target_batch = [x for row in test_target_batch for x in row]
 
     if args.class_balance:
         debug(f'With class_balance, effective train size = {train_data_loader.iter_size:,}')
-        
-    encoder = MoleculeModelEncoder(args)
-    encoder = encoder.to(args.device)
-    
-    for batch in tqdm(test_data_loader, total=len(test_data_loader), leave=False):
-            test_mol_batch, test_features_batch, test_target_batch = batch.batch_graph(), batch.features(), batch.targets()
-    
-    test_features = encoder(test_mol_batch, test_features_batch)
-    test_features = test_features.to('cpu').detach().numpy().copy()
-    test_target_batch = [x for row in test_target_batch for x in row]
-    #print(f'test_features is {test_features}')
-    #print(f'test_target_batch is {test_target_batch}')
 
     best_valid_scores = defaultdict(list)
     test_preds = []
@@ -287,12 +289,6 @@ def run_training_lgbm(args: TrainArgs,
         train_target_batch = [x for row in train_target_batch for x in row]
         val_target_batch = [x for row in val_target_batch for x in row]
         
-        #print(f'train_features is {train_features}')
-        #print(f'train_target_batch is {train_target_batch}')
-        
-        #print(f'val_features is {val_features}')
-        #print(f'val_target_batch is {val_target_batch}')
-        
         lgb_train = lgb.Dataset(train_features, train_target_batch, weight=None)
         lgb_eval = lgb.Dataset(val_features, val_target_batch, weight=None)
 
@@ -305,8 +301,9 @@ def run_training_lgbm(args: TrainArgs,
 
         val_pred = model.predict(val_features).reshape(-1, 1)
         
-        test_pred = model.predict(test_features).reshape(-1, 1)
-        test_preds.append(test_pred)
+        if not empty_test_set:
+            test_pred = model.predict(test_features).reshape(-1, 1)
+            test_preds.append(test_pred)
         
         if args.metric == 'auc':
             fpr, tpr, thresholds = roc_curve(val_target_batch, val_pred, pos_label=1)
@@ -319,17 +316,24 @@ def run_training_lgbm(args: TrainArgs,
 
         info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f}')
         
-        file = f'./{args.save_dir}/lgbm_{model_idx}.pkl'
-        pickle.dump(model, open(file, 'wb'))
+        model_file = f'./{args.save_dir}/lgbm_{model_idx}.pkl'
+        pickle.dump(model, open(model_file, 'wb'))
+        
+        args.save(f'./{args.save_dir}/args_{model_idx}.json')
 
-    test_preds_mean = sum(test_preds) / len(test_preds)
+    if empty_test_set:
+        ensemble_test_scores = {
+            metric: [np.nan for task in args.task_names] for metric in args.metrics
+        }
+    else:
+        test_preds_mean = sum(test_preds) / len(test_preds)
     
-    ensemble_test_scores = {}
-    if args.metric == 'auc':
-        fpr, tpr, thresholds = roc_curve(test_target_batch, test_preds_mean, pos_label=1)
-        ensemble_test_scores[args.metrics[0]] = [auc(fpr, tpr)]
+        ensemble_test_scores = {}
+        if args.metric == 'auc':
+            fpr, tpr, thresholds = roc_curve(test_target_batch, test_preds_mean, pos_label=1)
+            ensemble_test_scores[args.metrics[0]] = [auc(fpr, tpr)]
 
-    elif args.metric == 'rmse':
-        ensemble_test_scores[args.metrics] = [mean_squared_error(test_target_batch, test_preds_mean, squared=False)]
+        elif args.metric == 'rmse':
+            ensemble_test_scores[args.metrics] = [mean_squared_error(test_target_batch, test_preds_mean, squared=False)]
 
     return dict(best_valid_scores), ensemble_test_scores

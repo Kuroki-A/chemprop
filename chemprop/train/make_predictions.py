@@ -2,13 +2,15 @@ from collections import OrderedDict
 import csv
 from typing import List, Optional, Union, Tuple
 
+import pickle
 import numpy as np
+from tqdm import tqdm
 
 from chemprop.args import PredictArgs, TrainArgs
 from chemprop.data import get_data, get_data_from_smiles, MoleculeDataLoader, MoleculeDataset, StandardScaler, AtomBondScaler
-from chemprop.utils import load_args, load_checkpoint, load_scalers, makedirs, timeit, update_prediction_args
+from chemprop.utils import load_args, load_args_lgbm, load_checkpoint, load_scalers, makedirs, timeit, update_prediction_args
 from chemprop.features import set_extra_atom_fdim, set_extra_bond_fdim, set_reaction, set_explicit_h, set_adding_hs, set_keeping_atom_map, reset_featurization_parameters
-from chemprop.models import MoleculeModel
+from chemprop.models import MoleculeModel, MoleculeModelEncoder
 from chemprop.uncertainty import UncertaintyCalibrator, build_uncertainty_calibrator, UncertaintyEstimator, build_uncertainty_evaluator
 from chemprop.multitask_utils import reshape_values
 
@@ -43,6 +45,22 @@ def load_model(args: PredictArgs, generator: bool = False):
         scalers = list(scalers)
 
     return args, train_args, models, scalers, num_tasks, task_names
+
+def load_model_lgbm(args: PredictArgs, generator: bool = False):
+    print('Loading training args')
+    train_args = load_args_lgbm(args.checkpoint_paths[0])
+    num_tasks, task_names = train_args.num_tasks, train_args.task_names
+
+    update_prediction_args(predict_args=args, train_args=train_args)
+    args: Union[PredictArgs, TrainArgs]
+
+    # Load model and scalers
+    models = []
+    for model_name in args.checkpoint_paths:
+        model = pickle.load(open(f'{model_name}', 'rb'))
+        models.append(model)
+
+    return args, train_args, models, num_tasks, task_names
 
 
 def load_data(args: PredictArgs, smiles: List[List[str]]):
@@ -336,6 +354,126 @@ def predict_and_save(
         return full_preds, full_unc
     else:
         return preds, unc
+    
+
+def predict_and_save_lgbm(
+    args: PredictArgs,
+    train_args: TrainArgs,
+    test_data: MoleculeDataset,
+    task_names: List[str],
+    num_tasks: int,
+    test_data_loader: MoleculeDataLoader,
+    full_data: MoleculeDataset,
+    full_to_valid_indices: dict,
+    models: List[MoleculeModel],
+    num_models: int,
+    calibrator: UncertaintyCalibrator = None,
+    return_invalid_smiles: bool = False,
+    save_results: bool = True,
+):
+
+    train_args = load_args_lgbm(args.checkpoint_paths[0])
+    encoder = MoleculeModelEncoder(train_args)
+    encoder = encoder.to(args.device)
+    
+    num_workers = 8
+    
+    test_data_loader = MoleculeDataLoader(
+            dataset=test_data,
+            batch_size=len(test_data),
+            num_workers=num_workers
+        )
+        
+    for batch in tqdm(test_data_loader, total=len(test_data_loader), leave=False):
+        test_mol_batch, test_features_batch, test_target_batch = batch.batch_graph(), batch.features(), batch.targets()
+
+    test_features = encoder(test_mol_batch, test_features_batch)
+    test_features = test_features.to('cpu').detach().numpy().copy()
+    test_target_batch = [x for row in test_target_batch for x in row]
+    
+    test_preds = []
+    for model in models:
+        test_pred = model.predict(test_features).reshape(-1, 1)
+        test_preds.append(test_pred)
+    
+    preds = sum(test_preds) / len(test_preds)
+    
+    # Save results
+    if save_results:
+        print(f"Saving predictions to {args.preds_path}")
+        assert len(test_data) == len(preds)
+
+        makedirs(args.preds_path, isfile=True)
+
+        # Set multiclass column names, update num_tasks definitions
+        if args.dataset_type == "multiclass":
+            original_task_names = task_names
+            task_names = [
+                f"{name}_class_{i}"
+                for name in task_names
+                for i in range(args.multiclass_num_classes)
+            ]
+            num_tasks = num_tasks * args.multiclass_num_classes
+
+        # Copy predictions over to full_data
+        for full_index, datapoint in enumerate(full_data):
+            valid_index = full_to_valid_indices.get(full_index, None)
+            if valid_index is not None:
+                d_preds = preds[valid_index]
+                if args.individual_ensemble_predictions:
+                    ind_preds = individual_preds[valid_index]
+            else:
+                d_preds = ["Invalid SMILES"] * num_tasks
+                if args.individual_ensemble_predictions:
+                    ind_preds = [["Invalid SMILES"] * len(args.checkpoint_paths)] * num_tasks
+            # Reshape multiclass to merge task and class dimension, with updated num_tasks
+            if args.dataset_type == "multiclass":
+                d_preds = np.array(d_preds).reshape((num_tasks))
+                if args.individual_ensemble_predictions:
+                    ind_preds = ind_preds.reshape(
+                        (num_tasks, len(args.checkpoint_paths))
+                    )
+
+            # If extra columns have been dropped, add back in SMILES columns
+            if args.drop_extra_columns:
+                datapoint.row = OrderedDict()
+
+                smiles_columns = args.smiles_columns
+
+                for column, smiles in zip(smiles_columns, datapoint.smiles):
+                    datapoint.row[column] = smiles
+
+            # Add predictions columns
+            for pred_name, pred in zip(
+                task_names,  d_preds
+            ):
+                datapoint.row[pred_name] = pred
+                
+            if args.individual_ensemble_predictions:
+                for pred_name, model_preds in zip(task_names, ind_preds):
+                    for idx, pred in enumerate(model_preds):
+                        datapoint.row[pred_name + f"_model_{idx}"] = pred
+
+        # Save
+        with open(args.preds_path, 'w', newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=full_data[0].row.keys())
+            writer.writeheader()
+
+            for datapoint in full_data:
+                writer.writerow(datapoint.row)
+
+    if return_invalid_smiles:
+        full_preds = []
+        for full_index in range(len(full_data)):
+            valid_index = full_to_valid_indices.get(full_index, None)
+            if valid_index is not None:
+                pred = preds[valid_index]
+            else:
+                pred = ["Invalid SMILES"] * num_tasks
+            full_preds.append(pred)
+        return full_preds
+    else:
+        return preds
 
 
 @timeit()
@@ -499,6 +637,74 @@ def make_predictions(
             return preds, unc
         else:
             return preds
+        
+        
+@timeit()
+def make_predictions_lgbm(
+    args: PredictArgs,
+    smiles: List[List[str]] = None,
+    model_objects: Tuple[
+        PredictArgs,
+        TrainArgs,
+        List[MoleculeModel],
+        List[Union[StandardScaler, AtomBondScaler]],
+        int,
+        List[str],
+    ] = None,
+    calibrator: UncertaintyCalibrator = None,
+    return_invalid_smiles: bool = True,
+    return_index_dict: bool = False,
+    return_uncertainty: bool = False,
+) -> List[List[Optional[float]]]:
+    
+    if model_objects:
+        (
+            args,
+            train_args,
+            models,
+            scalers,
+            num_tasks,
+            task_names,
+        ) = model_objects
+    else:
+        (
+            args,
+            train_args,
+            models,
+            num_tasks,
+            task_names,
+        ) = load_model_lgbm(args, generator=True)
+
+    num_models = len(models)
+
+    set_features(args, train_args)
+
+    # Note: to get the invalid SMILES for your data, use the get_invalid_smiles_from_file or get_invalid_smiles_from_list functions from data/utils.py
+    full_data, test_data, test_data_loader, full_to_valid_indices = load_data(
+        args, smiles
+    )
+
+    # Edge case if empty list of smiles is provided
+    if len(test_data) == 0:
+        preds = [None] * len(full_data)
+        unc = [None] * len(full_data)
+    else:
+        preds = predict_and_save_lgbm(
+            args=args,
+            train_args=train_args,
+            test_data=test_data,
+            task_names=task_names,
+            num_tasks=num_tasks,
+            test_data_loader=test_data_loader,
+            full_data=full_data,
+            full_to_valid_indices=full_to_valid_indices,
+            models=models,
+            num_models=num_models,
+            calibrator=calibrator,
+            return_invalid_smiles=return_invalid_smiles,
+        )
+        
+    return preds
 
 
 def chemprop_predict() -> None:
@@ -506,4 +712,9 @@ def chemprop_predict() -> None:
 
     This is the entry point for the command line command :code:`chemprop_predict`.
     """
-    make_predictions(args=PredictArgs().parse_args())
+    args=PredictArgs().parse_args()
+    
+    if args.model_type == 'FFN':
+        make_predictions(args=PredictArgs().parse_args())
+    elif args.model_type == 'lgbm':
+        make_predictions_lgbm(args=PredictArgs().parse_args())

@@ -477,6 +477,23 @@ def load_args(path: str) -> TrainArgs:
     return args
 
 
+def load_args_lgbm(path: str) -> TrainArgs:
+    """
+    Loads the arguments a model was trained with.
+
+    :param path: Path where model checkpoint is saved.
+    :return: The :class:`~chemprop.args.TrainArgs` object that the model was trained with.
+    """
+    args = TrainArgs()
+    path = path.replace('lgbm', 'args')
+    path = path.replace('pkl', 'json')
+    
+    args.load(f'{path}', skip_unsettable = True)
+    print(args)
+
+    return args
+
+
 def load_task_names(path: str) -> List[str]:
     """
     Loads the task names a model was trained with.
