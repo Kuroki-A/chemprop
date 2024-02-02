@@ -90,6 +90,43 @@ def save_checkpoint(
         "atom_bond_scaler": atom_bond_scaler,
     }
     torch.save(state, path)
+    
+
+def save_checkpoint_lgbm(
+    path: str,
+    scaler: StandardScaler = None,
+    features_scaler: StandardScaler = None,
+    atom_descriptor_scaler: StandardScaler = None,
+    bond_descriptor_scaler: StandardScaler = None,
+    atom_bond_scaler: AtomBondScaler = None,
+    args: TrainArgs = None,
+) -> None:
+    # Convert args to namespace for backwards compatibility
+    if args is not None:
+        args = Namespace(**args.as_dict())
+
+    data_scaler = {"means": scaler.means, "stds": scaler.stds} if scaler is not None else None
+    if atom_bond_scaler is not None:
+        atom_bond_scaler = {"means": atom_bond_scaler.means, "stds": atom_bond_scaler.stds}
+    if features_scaler is not None:
+        features_scaler = {"means": features_scaler.means, "stds": features_scaler.stds}
+    if atom_descriptor_scaler is not None:
+        atom_descriptor_scaler = {
+            "means": atom_descriptor_scaler.means,
+            "stds": atom_descriptor_scaler.stds,
+        }
+    if bond_descriptor_scaler is not None:
+        bond_descriptor_scaler = {"means": bond_descriptor_scaler.means, "stds": bond_descriptor_scaler.stds}
+
+    state = {
+        "args": args,
+        "data_scaler": data_scaler,
+        "features_scaler": features_scaler,
+        "atom_descriptor_scaler": atom_descriptor_scaler,
+        "bond_descriptor_scaler": bond_descriptor_scaler,
+        "atom_bond_scaler": atom_bond_scaler,
+    }
+    torch.save(state, path)
 
 
 def load_checkpoint(
@@ -473,23 +510,6 @@ def load_args(path: str) -> TrainArgs:
         vars(torch.load(path, map_location=lambda storage, loc: storage)["args"]),
         skip_unsettable=True,
     )
-
-    return args
-
-
-def load_args_lgbm(path: str) -> TrainArgs:
-    """
-    Loads the arguments a model was trained with.
-
-    :param path: Path where model checkpoint is saved.
-    :return: The :class:`~chemprop.args.TrainArgs` object that the model was trained with.
-    """
-    args = TrainArgs()
-    path = path.replace('lgbm', 'args')
-    path = path.replace('pkl', 'json')
-    
-    args.load(f'{path}', skip_unsettable = True)
-    print(args)
 
     return args
 

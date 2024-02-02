@@ -225,6 +225,11 @@ class CommonArgs(Tap):
                 checkpoint_dir=self.checkpoint_dir,
                 ext = '.pkl'
             )
+            self.checkpoint_paths_scaler = get_checkpoint_paths(
+                checkpoint_path=self.checkpoint_path,
+                checkpoint_paths=None, #self.checkpoint_paths,
+                checkpoint_dir=self.checkpoint_dir,
+            )
         else:
             self.checkpoint_paths = get_checkpoint_paths(
                 checkpoint_path=self.checkpoint_path,

@@ -24,15 +24,17 @@ from chemprop.data import get_class_sizes, get_data, MoleculeDataLoader, Molecul
 from chemprop.models import MoleculeModel, MoleculeModelEncoder
 from chemprop.nn_utils import param_count, param_count_all
 from chemprop.utils import build_optimizer, build_lr_scheduler, load_checkpoint, makedirs, \
-    save_checkpoint, save_smiles_splits, load_frzn_model, multitask_mean
+    save_checkpoint, save_checkpoint_lgbm, save_smiles_splits, load_frzn_model, multitask_mean
 
 import pickle
 from sklearn.metrics import roc_curve, auc, mean_squared_error
 import lightgbm as lgb
 
 def run_training_lgbm(args: TrainArgs,
-                 data: MoleculeDataset,
-                 logger: Logger = None) -> Dict[str, List[float]]:
+                      data: MoleculeDataset,
+                      fold_num: int,
+                      logger: Logger = None,
+                      ) -> Dict[str, List[float]]:
     """
     Loads data, trains a Chemprop model, and returns test scores for the model checkpoint with the highest validation score.
 
@@ -264,15 +266,15 @@ def run_training_lgbm(args: TrainArgs,
     
     if args.metric == 'auc':
         params = {"objective": "binary",
-                  "metric": "auc",
-                  "seed": 46}
+                  "metric": "auc"}
     elif args.metric == 'rmse':
         params = {"objective": "regression",
-                  "metric": "rmse",
-                  "seed": 46}
+                  "metric": "rmse"}
 
     # Train ensemble of models
     for model_idx in range(args.ensemble_size):
+        save_dir = os.path.join(args.save_dir, f'model_{model_idx}')
+        makedirs(save_dir)
         
         for batch in tqdm(train_data_loader, total=len(train_data_loader), leave=False):
             train_mol_batch, train_features_batch, train_target_batch = batch.batch_graph(), batch.features(), batch.targets()
@@ -291,6 +293,8 @@ def run_training_lgbm(args: TrainArgs,
         
         lgb_train = lgb.Dataset(train_features, train_target_batch, weight=None)
         lgb_eval = lgb.Dataset(val_features, val_target_batch, weight=None)
+        
+        params["seed"] = model_idx
 
         model = lgb.train(params=params,
                       train_set=lgb_train,
@@ -319,7 +323,8 @@ def run_training_lgbm(args: TrainArgs,
         model_file = f'./{args.save_dir}/lgbm_{model_idx}.pkl'
         pickle.dump(model, open(model_file, 'wb'))
         
-        args.save(f'./{args.save_dir}/args_{model_idx}.json')
+        save_checkpoint_lgbm(os.path.join(save_dir, MODEL_FILE_NAME), scaler, features_scaler,
+                                atom_descriptor_scaler, bond_descriptor_scaler, atom_bond_scaler, args)
 
     if empty_test_set:
         ensemble_test_scores = {
@@ -327,6 +332,7 @@ def run_training_lgbm(args: TrainArgs,
         }
     else:
         test_preds_mean = sum(test_preds) / len(test_preds)
+        #pd.DataFrame(test_preds_mean).to_csv(f'{fold_num}.csv', index=False)
     
         ensemble_test_scores = {}
         if args.metric == 'auc':

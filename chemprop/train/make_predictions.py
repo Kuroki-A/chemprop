@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from chemprop.args import PredictArgs, TrainArgs
 from chemprop.data import get_data, get_data_from_smiles, MoleculeDataLoader, MoleculeDataset, StandardScaler, AtomBondScaler
-from chemprop.utils import load_args, load_args_lgbm, load_checkpoint, load_scalers, makedirs, timeit, update_prediction_args
+from chemprop.utils import load_args, load_checkpoint, load_scalers, makedirs, timeit, update_prediction_args
 from chemprop.features import set_extra_atom_fdim, set_extra_bond_fdim, set_reaction, set_explicit_h, set_adding_hs, set_keeping_atom_map, reset_featurization_parameters
 from chemprop.models import MoleculeModel, MoleculeModelEncoder
 from chemprop.uncertainty import UncertaintyCalibrator, build_uncertainty_calibrator, UncertaintyEstimator, build_uncertainty_evaluator
@@ -48,7 +48,11 @@ def load_model(args: PredictArgs, generator: bool = False):
 
 def load_model_lgbm(args: PredictArgs, generator: bool = False):
     print('Loading training args')
-    train_args = load_args_lgbm(args.checkpoint_paths[0])
+    scalers = (
+        load_scalers(checkpoint_path) for checkpoint_path in sorted(args.checkpoint_paths_scaler)
+    )
+    
+    train_args = load_args(args.checkpoint_paths_scaler[0])
     num_tasks, task_names = train_args.num_tasks, train_args.task_names
 
     update_prediction_args(predict_args=args, train_args=train_args)
@@ -56,11 +60,15 @@ def load_model_lgbm(args: PredictArgs, generator: bool = False):
 
     # Load model and scalers
     models = []
-    for model_name in args.checkpoint_paths:
+    for model_name in sorted(args.checkpoint_paths):
         model = pickle.load(open(f'{model_name}', 'rb'))
         models.append(model)
+    
+    if not generator:
+        models = list(models)
+        scalers = list(scalers)
 
-    return args, train_args, models, num_tasks, task_names
+    return args, train_args, models, scalers, num_tasks, task_names
 
 
 def load_data(args: PredictArgs, smiles: List[List[str]]):
@@ -356,28 +364,23 @@ def predict_and_save(
         return preds, unc
     
 
-def predict_and_save_lgbm(
-    args: PredictArgs,
-    train_args: TrainArgs,
-    test_data: MoleculeDataset,
-    task_names: List[str],
-    num_tasks: int,
-    test_data_loader: MoleculeDataLoader,
-    full_data: MoleculeDataset,
-    full_to_valid_indices: dict,
-    models: List[MoleculeModel],
-    num_models: int,
-    calibrator: UncertaintyCalibrator = None,
-    return_invalid_smiles: bool = False,
-    save_results: bool = True,
+def predict_lgbm(
+    args,
+    model,
+    scaler,
+    test_data,
 ):
-
-    train_args = load_args_lgbm(args.checkpoint_paths[0])
+    
+    train_args = load_args(args.checkpoint_paths_scaler[0])
     encoder = MoleculeModelEncoder(train_args)
     encoder = encoder.to(args.device)
     
     num_workers = 8
     
+    if scaler[1] != None:
+        features_scaler = scaler[1]
+        test_data.normalize_features(features_scaler)
+            
     test_data_loader = MoleculeDataLoader(
             dataset=test_data,
             batch_size=len(test_data),
@@ -391,9 +394,35 @@ def predict_and_save_lgbm(
     test_features = test_features.to('cpu').detach().numpy().copy()
     test_target_batch = [x for row in test_target_batch for x in row]
     
+    test_pred = model.predict(test_features).reshape(-1, 1)
+    
+    if scaler[0] != None:
+        test_pred = scaler[0].inverse_transform(test_pred)
+            
+    return test_pred
+
+    
+def predict_and_save_lgbm(
+    args: PredictArgs,
+    train_args: TrainArgs,
+    test_data: MoleculeDataset,
+    task_names: List[str],
+    num_tasks: int,
+    test_data_loader: MoleculeDataLoader,
+    full_data: MoleculeDataset,
+    full_to_valid_indices: dict,
+    models: List[MoleculeModel],
+    scalers: List[Union[StandardScaler, AtomBondScaler]],
+    num_models: int,
+    calibrator: UncertaintyCalibrator = None,
+    return_invalid_smiles: bool = False,
+    save_results: bool = True,
+):
+
     test_preds = []
-    for model in models:
-        test_pred = model.predict(test_features).reshape(-1, 1)
+
+    for model, scaler in zip(models, scalers):
+        test_pred = predict_lgbm(args, model, scaler, test_data)         
         test_preds.append(test_pred)
     
     preds = sum(test_preds) / len(test_preds)
@@ -671,6 +700,7 @@ def make_predictions_lgbm(
             args,
             train_args,
             models,
+            scalers,
             num_tasks,
             task_names,
         ) = load_model_lgbm(args, generator=True)
@@ -699,6 +729,7 @@ def make_predictions_lgbm(
             full_data=full_data,
             full_to_valid_indices=full_to_valid_indices,
             models=models,
+            scalers=scalers,
             num_models=num_models,
             calibrator=calibrator,
             return_invalid_smiles=return_invalid_smiles,

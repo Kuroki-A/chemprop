@@ -144,7 +144,7 @@ def cross_validate(args: TrainArgs,
                 model_test_scores = json.load(f)
         # Otherwise, train the models
         else:
-            model_valid_scores, model_test_scores = train_func(args, data, logger)
+            model_valid_scores, model_test_scores = train_func(args, data, fold_num, logger)
 
         for metric, scores in model_valid_scores.items():
             all_valid_scores[metric].append(scores)

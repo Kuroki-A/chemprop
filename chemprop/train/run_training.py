@@ -29,6 +29,7 @@ from chemprop.utils import build_optimizer, build_lr_scheduler, load_checkpoint,
 
 def run_training(args: TrainArgs,
                  data: MoleculeDataset,
+                 fold_num: int,
                  logger: Logger = None) -> Dict[str, List[float]]:
     """
     Loads data, trains a Chemprop model, and returns test scores for the model checkpoint with the highest validation score.
