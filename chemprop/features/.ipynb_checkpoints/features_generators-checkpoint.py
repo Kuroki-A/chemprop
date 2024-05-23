@@ -93,7 +93,6 @@ def morgan_binary_features_generator(mol: Molecule,
     features_vec = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=num_bits)
     features = np.zeros((1,))
     DataStructs.ConvertToNumpyArray(features_vec, features)
-    print(features)
 
     return features
 
@@ -356,9 +355,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedHFTransformer(kind='Roberta-Zinc480M-102M', notation='smiles', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('GPT2-Zinc480M-87M')
 def custom_features_generator(mol: Molecule,
@@ -367,9 +365,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedHFTransformer(kind='GPT2-Zinc480M-87M', notation='smiles', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('MolT5')
 def custom_features_generator(mol: Molecule,
@@ -378,9 +375,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedHFTransformer(kind='MolT5', notation='smiles', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('ChemBERTa-77M-MTR')
 def custom_features_generator(mol: Molecule,
@@ -389,9 +385,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedHFTransformer(kind='ChemBERTa-77M-MTR', notation='smiles', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('ChemBERTa-77M-MLM')
 def custom_features_generator(mol: Molecule,
@@ -400,9 +395,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedHFTransformer(kind='ChemBERTa-77M-MLM', notation='smiles', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('ChemGPT-19M')
 def custom_features_generator(mol: Molecule,
@@ -411,9 +405,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedHFTransformer(kind='ChemGPT-19M', notation='selfies', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('ChemGPT-4.7M')
 def custom_features_generator(mol: Molecule,
@@ -422,9 +415,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedHFTransformer(kind='ChemGPT-4.7M', notation='selfies', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('gin_supervised_masking')
 def custom_features_generator(mol: Molecule,
@@ -433,9 +425,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedDGLTransformer(kind='gin_supervised_masking', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('gin_supervised_infomax')
 def custom_features_generator(mol: Molecule,
@@ -444,9 +435,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedDGLTransformer(kind='gin_supervised_infomax', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('gin_supervised_edgepred')
 def custom_features_generator(mol: Molecule,
@@ -455,9 +445,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedDGLTransformer(kind='gin_supervised_edgepred', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('jtvae_zinc_no_kl')
 def custom_features_generator(mol: Molecule,
@@ -466,9 +455,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedDGLTransformer(kind='jtvae_zinc_no_kl', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('gin_supervised_contextpred')
 def custom_features_generator(mol: Molecule,
@@ -477,9 +465,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = PretrainedDGLTransformer(kind='gin_supervised_contextpred', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 @register_features_generator('pcqm4mv2_graphormer_base')
 def custom_features_generator(mol: Molecule,
@@ -488,9 +475,8 @@ def custom_features_generator(mol: Molecule,
     
     transformer = GraphormerTransformer(kind='pcqm4mv2_graphormer_base', dtype=float)
     features = transformer(smiles)
-    print(np.array(features)[0])
         
-    return np.array(features)[0]
+    return features
 
 """
 @register_features_generator('unimol')

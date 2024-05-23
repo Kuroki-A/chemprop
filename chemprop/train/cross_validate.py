@@ -233,7 +233,8 @@ def cross_validate(args: TrainArgs,
             and still return an overall average for the remaining folds or tasks. The behavior now \
             is to include them in the average, converting overall average metrics to 'nan' as well.")
 
-    # Save scores
+    # Save scores 
+    '''
     with open(os.path.join(save_dir, TEST_SCORES_FILE_NAME), 'w') as f:
         writer = csv.writer(f)
 
@@ -266,6 +267,7 @@ def cross_validate(args: TrainArgs,
                     mean, std = np.mean(task_scores), np.std(task_scores)
                     row += [mean, std] + task_scores.tolist()
                 writer.writerow(row)
+    '''
     
     # Determine mean and std score of main metric
     if args.data_type == 'validation':
