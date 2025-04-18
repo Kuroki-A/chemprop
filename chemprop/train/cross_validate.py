@@ -21,6 +21,7 @@ from chemprop.data import get_data, get_task_names, MoleculeDataset, validate_da
 from chemprop.utils import create_logger, makedirs, timeit, multitask_mean
 from chemprop.features import set_extra_atom_fdim, set_extra_bond_fdim, set_explicit_h, set_adding_hs, set_keeping_atom_map, set_reaction, reset_featurization_parameters
 
+from distutils.version import LooseVersion
 
 @timeit(logger_name=TRAIN_LOGGER_NAME)
 def cross_validate(args: TrainArgs,
@@ -105,8 +106,10 @@ def cross_validate(args: TrainArgs,
             torch.save(data, f'{features_names}.pt')
         else:
             debug('Loading previously created data')
-            data = torch.load(f'{features_names}.pt')
-            #data = torch.load(f'{features_names}.pt', weights_only=False)
+            if LooseVersion(torch.__version__) >= LooseVersion("2.6"):
+                data = torch.load(f'{features_names}.pt', weights_only=False)
+            else:
+                data = torch.load(f'{features_names}.pt')
     else:
         debug('Loading data')
         data = get_data(
