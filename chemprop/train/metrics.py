@@ -5,9 +5,14 @@ import torch
 import numpy as np
 import torch.nn as nn
 
+import sklearn
 from sklearn.metrics import auc, mean_absolute_error, mean_squared_error, precision_recall_curve, r2_score, \
     roc_auc_score, accuracy_score, log_loss, f1_score, matthews_corrcoef, recall_score, precision_score, \
     balanced_accuracy_score
+
+version = sklearn.__version__
+if tuple(map(int, version.split("."))) >= (1, 6):
+    from sklearn.metrics import root_mean_squared_error
 
 
 def get_metric_func(metric: str) -> Callable[[Union[List[int], List[float]], List[float]], float]:
@@ -149,7 +154,10 @@ def rmse(targets: List[float], preds: List[float]) -> float:
     :param preds: A list of predictions.
     :return: The computed rmse.
     """
-    return mean_squared_error(targets, preds, squared=False)
+    if tuple(map(int, version.split("."))) >= (1, 6):
+        return root_mean_squared_error(targets, preds)
+    else:
+        return mean_squared_error(targets, preds, squared=False)
 
 
 def quantile(targets: List[float], preds: List[float], quantile: float):

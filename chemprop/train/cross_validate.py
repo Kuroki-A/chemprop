@@ -106,6 +106,7 @@ def cross_validate(args: TrainArgs,
         else:
             debug('Loading previously created data')
             data = torch.load(f'{features_names}.pt')
+            #data = torch.load(f'{features_names}.pt', weights_only=False)
     else:
         debug('Loading data')
         data = get_data(

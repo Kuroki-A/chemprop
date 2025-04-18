@@ -11,6 +11,8 @@ from rdkit.Avalon.pyAvalonTools import GetAvalonCountFP, GetAvalonFP
 from rdkit.ML.Descriptors import MoleculeDescriptors
 
 from descriptastorus.descriptors import rdNormalizedDescriptors
+from descriptastorus.descriptors.rdDescriptors import RDKIT_PROPS
+
 from padelpy import from_smiles
 #from unimol_tools import UniMolRepr
 from mordred import Calculator, AcidBase, AdjacencyMatrix, Aromatic, AtomCount, BalabanJ, BaryszMatrix, BertzCT, BondCount, CarbonTypes, Constitutional, DistanceMatrix, EccentricConnectivityIndex, FragmentComplexity, Framework, HydrogenBond, InformationContent, KappaShapeIndex, LogS, McGowanVolume, MoeType, MolecularId, PathCount, Polarizability, RingCount, RotatableBond, SLogP, TopoPSA, TopologicalCharge, TopologicalIndex, VertexAdjacencyInformation, WalkCount, Weight, WienerIndex, ZagrebIndex
@@ -234,6 +236,7 @@ def custom_features_generator(mol: Molecule,
         
     features = pd.DataFrame(features).T
     features.columns = desc_names
+    features = features.loc[:, (features.columns.str.contains('BCUT2D_')|(features.columns.isin(RDKIT_PROPS['1.0.0'])))]
     
     if selected_feature_columns is not None:
         features = features.loc[:, selected_feature_columns]
@@ -242,6 +245,90 @@ def custom_features_generator(mol: Molecule,
 
 
 @register_features_generator('rdkit_2d_400')
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+
+    features = []
+    desc_names = []
+    for desc_name in inspect.getmembers(Descriptors, inspect.isfunction):
+        desc_name = desc_name[0]
+        if desc_name.startswith("_"):
+            continue
+        if desc_name == "setupAUTOCorrDescriptors":
+            continue
+        if desc_name == "CalcMolDescriptors":
+            continue
+        desc_names.append(desc_name)
+        features.append(getattr(Descriptors, desc_name)(mol))
+        
+    features = pd.DataFrame(features).T
+    features.columns = desc_names
+    features = features.loc[:, (features.columns.str.contains('AUTOCORR2D_'))|(features.columns.str.contains('BCUT2D_')|(features.columns.isin(RDKIT_PROPS['1.0.0'])))]
+
+    if selected_feature_columns is not None:
+        features = features.loc[:, selected_feature_columns]
+
+    return features.to_numpy()[0]
+
+
+@register_features_generator('rdkit_2d_autocorr')
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+
+    features = []
+    desc_names = []
+    for desc_name in inspect.getmembers(Descriptors, inspect.isfunction):
+        desc_name = desc_name[0]
+        if desc_name.startswith("_"):
+            continue
+        if desc_name == "setupAUTOCorrDescriptors":
+            continue
+        if desc_name == "CalcMolDescriptors":
+            continue
+        desc_names.append(desc_name)
+        features.append(getattr(Descriptors, desc_name)(mol))
+        
+    features = pd.DataFrame(features).T
+    features.columns = desc_names
+    features = features.loc[:, (features.columns.str.contains('AUTOCORR2D_'))]
+
+    if selected_feature_columns is not None:
+        features = features.loc[:, selected_feature_columns]
+
+    return features.to_numpy()[0]
+
+
+@register_features_generator('rdkit_2d_bcut')
+def custom_features_generator(mol: Molecule,
+                              selected_feature_columns: list = None) -> np.ndarray:
+    mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol
+
+    features = []
+    desc_names = []
+    for desc_name in inspect.getmembers(Descriptors, inspect.isfunction):
+        desc_name = desc_name[0]
+        if desc_name.startswith("_"):
+            continue
+        if desc_name == "setupAUTOCorrDescriptors":
+            continue
+        if desc_name == "CalcMolDescriptors":
+            continue
+        desc_names.append(desc_name)
+        features.append(getattr(Descriptors, desc_name)(mol))
+        
+    features = pd.DataFrame(features).T
+    features.columns = desc_names
+    features = features.loc[:, (features.columns.str.contains('BCUT2D_'))]
+
+    if selected_feature_columns is not None:
+        features = features.loc[:, selected_feature_columns]
+
+    return features.to_numpy()[0]
+
+
+@register_features_generator('rdkit_2d_all')
 def custom_features_generator(mol: Molecule,
                               selected_feature_columns: list = None) -> np.ndarray:
     mol = Chem.MolFromSmiles(mol) if type(mol) == str else mol

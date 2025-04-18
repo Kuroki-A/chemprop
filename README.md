@@ -120,19 +120,20 @@ Then proceed to either option below to complete the installation. If installing 
 
 1. `git clone https://github.com/Kuroki-A/chemprop.git`
 2. `cd chemprop`
-3. `conda create -y -n chemprop python=3.8`
+3. `conda create -y -n chemprop python=3.10 pip=24.0`
 4. `conda activate chemprop`
 5. `pip install -e .`
 6. `pip install "molfeat[all]"`
-7. `pip install ~/torch-1.11.0+cu115-cp38-cp38-linux_x86_64.whl torchaudio torchdata dgl==1.1.0`
+7. Download the appropriate version of torch for your CUDA from [here](https://download.pytorch.org/whl/torch/)
+8. `pip install torch-2.6.0+cu124-cp310-cp310-linux_x86_64.whl torchdata==0.9.0 dgl==1.1.0`
 
  #### Check whether 'torch' can recognize 'gpu' or not
  8. `cd ~`
  9. `python`
  10. `import torch`
  11. `torch.tensor([0.1, 0.2]).cuda()`
-    If an error occurs, install the appropriate version of torch (https://download.pytorch.org/whl/torch/).
-    (If 'CUDA' version is 11.5, `pip install torch-1.11.0+cu115-cp38-cp38-linux_x86_64.whl`)
+    If an error occurs, install the appropriate version of torch from [here](https://download.pytorch.org/whl/torch/).
+    (If 'CUDA' version is 12.4, `pip install torch-2.6.0+cu124-cp310-cp310-linux_x86_64.whl`)
  12. `quit()`
 
 ### Docker
