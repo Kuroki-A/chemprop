@@ -101,6 +101,45 @@ def test_user_selection_never_redirects_to_an_external_referrer():
         assert response.headers['Location'] == '/train'
 
 
+def test_user_selection_rejects_an_unlisted_referrer_path():
+    with TemporaryDirectory() as root_dir:
+        app = build_app(root_folder=root_dir, init_db=True)
+        app.config.update(TESTING=False, LOCAL_ONLY=True)
+        with app.app_context():
+            user_id, _ = db.insert_user('alice')
+
+        with app.test_client() as client:
+            token = _csrf(client)
+            response = client.post(
+                '/select_user',
+                data={'user_id': user_id, '_csrf_token': token},
+                headers={'Referer': 'https://attacker.example/unlisted'},
+            )
+
+        assert response.status_code == 302
+        assert response.headers['Location'] == '/'
+
+
+@pytest.mark.parametrize('field_name', ['dataName', 'epochs', 'ensembleSize'])
+def test_web_training_rejects_non_integer_form_values(field_name):
+    with TemporaryDirectory() as root_dir:
+        app = build_app(root_folder=root_dir, init_db=True)
+        app.config.update(TESTING=False, LOCAL_ONLY=True)
+
+        with app.test_client() as client:
+            token = _csrf(client)
+            form = {
+                'dataName': '1',
+                'epochs': '1',
+                'ensembleSize': '1',
+                '_csrf_token': token,
+            }
+            form[field_name] = 'not-an-integer'
+            response = client.post('/train', data=form)
+
+        assert response.status_code == 400
+
+
 def test_upload_status_query_ignores_malformed_or_non_list_json():
     with TemporaryDirectory() as root_dir:
         app = build_app(root_folder=root_dir, init_db=True)

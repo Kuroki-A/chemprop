@@ -40,13 +40,10 @@ def _historical_reaction_graph(mol_reac, mol_prod, mode):
             for atom in mol_reac.GetAtoms()
         ] + [atom_features(mol_prod.GetAtomWithIdx(index)) for index in pio]
 
-    if mode in {
-        'reac_diff', 'prod_diff', 'reac_diff_balance', 'prod_diff_balance',
-    }:
-        f_atoms_diff = [
-            [product - reactant for product, reactant in zip(prod, reac)]
-            for prod, reac in zip(f_atoms_prod, f_atoms_reac)
-        ]
+    f_atoms_diff = [
+        [product - reactant for product, reactant in zip(prod, reac)]
+        for prod, reac in zip(f_atoms_prod, f_atoms_reac)
+    ]
     if mode in {'reac_prod', 'reac_prod_balance'}:
         f_atoms = [
             reac + prod[PARAMS.MAX_ATOMIC_NUM + 1:]

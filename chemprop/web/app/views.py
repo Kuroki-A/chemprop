@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from flask import abort, json, jsonify, redirect, render_template, request, send_file, send_from_directory, session, url_for
 import numpy as np
 from rdkit import Chem
+from werkzeug.exceptions import BadRequest
 from werkzeug.utils import secure_filename
 
 from chemprop.web.app import app, db
@@ -29,7 +30,14 @@ from chemprop.utils import create_logger, load_task_names, load_args
 TRAINING = 0
 PROGRESS = mp.Value('d', 0.0)
 SAFE_RETURN_PAGES = {'home', 'train', 'predict', 'data', 'checkpoints'}
-SAFE_REFERRER_PATHS = {'/', '/train', '/predict', '/data', '/checkpoints', '/create_user'}
+SAFE_REFERRER_ENDPOINTS = {
+    '/': 'home',
+    '/train': 'train',
+    '/predict': 'predict',
+    '/data': 'data',
+    '/checkpoints': 'checkpoints',
+    '/create_user': 'create_user',
+}
 MAX_RESOURCE_NAME_LENGTH = 255
 
 
@@ -77,6 +85,16 @@ def _validated_resource_name(field_name: str) -> str:
             ),
         )
     return value
+
+
+def _required_int_form_value(field_name: str) -> int:
+    """Parses a required integer form field or terminates with HTTP 400."""
+    try:
+        return int(request.form[field_name])
+    except (KeyError, TypeError, ValueError):
+        # Raising explicitly keeps the terminating control flow visible to
+        # static analysis as well as to Flask.
+        raise BadRequest(description=f'{field_name} must be an integer.') from None
 
 
 def _apply_gpu_selection(args, gpu: str) -> None:
@@ -346,7 +364,8 @@ def select_user():
         abort(404)
     session['current_user_id'] = user_id
     referrer_path = urlsplit(request.referrer or '').path
-    return redirect(referrer_path if referrer_path in SAFE_REFERRER_PATHS else url_for('home'))
+    return_endpoint = SAFE_REFERRER_ENDPOINTS.get(referrer_path, 'home')
+    return redirect(url_for(return_endpoint))
 
 
 @app.route('/create_user', methods=['GET', 'POST'])
@@ -390,12 +409,9 @@ def train():
         return render_train()
 
     # Get arguments
-    try:
-        data_name = int(request.form['dataName'])
-        epochs = int(request.form['epochs'])
-        ensemble_size = int(request.form['ensembleSize'])
-    except (KeyError, TypeError, ValueError):
-        abort(400)
+    data_name = _required_int_form_value('dataName')
+    epochs = _required_int_form_value('epochs')
+    ensemble_size = _required_int_form_value('ensembleSize')
     if epochs < 1 or ensemble_size < 1:
         abort(400, description='Epochs and ensemble size must be positive integers.')
     checkpoint_name = _validated_resource_name('checkpointName')

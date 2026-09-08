@@ -22,6 +22,9 @@ packaging, and CI audit of the Kuroki Chemprop v1 fork.
   and added documentation and source-distribution checks to CI. Push/PR CI now
   runs the full unit suite and a bounded real train/predict smoke test instead
   of an unbounded collection of multi-fold and Hyperopt integration studies.
+- Resolved all findings from the pull-request CodeQL quality gate, including
+  request-derived redirect data, explicit control-flow initialization, and
+  nested-loop variable shadowing.
 - Added packaging and lint tooling to the reproducible development environment.
 - Documented the 2026-10-04 Python 3.10 end-of-life boundary while retaining
   the agreed closed environment for reproducibility.

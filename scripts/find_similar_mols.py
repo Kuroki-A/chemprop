@@ -109,10 +109,14 @@ def find_similar_mols(test_smiles: List[str],
         test_vecs = np.array(model_fingerprint(model=model, data_loader=test_data_loader, fingerprint_type='last_FFN'))
         train_vecs = np.array(model_fingerprint(model=model, data_loader=train_data_loader, fingerprint_type='last_FFN'))
         metric = 'cosine'
+        print('Computing distances')
+        distances = cdist(test_vecs, train_vecs, metric=metric)
     elif distance_measure == 'morgan':
         test_vecs = np.array([morgan_binary_features_generator(smiles) for smiles in tqdm(test_smiles, total=len(test_smiles))])
         train_vecs = np.array([morgan_binary_features_generator(smiles) for smiles in tqdm(train_smiles, total=len(train_smiles))])
         metric = 'jaccard'
+        print('Computing distances')
+        distances = cdist(test_vecs, train_vecs, metric=metric)
     elif distance_measure == 'tanimoto':
         # Generate RDKit topological fingerprints
         test_fps = [Chem.RDKFingerprint(m.mol[0]) for m in tqdm(test_data)]
@@ -130,9 +134,6 @@ def find_similar_mols(test_smiles: List[str],
     else:
         raise ValueError(f'Distance measure "{distance_measure}" not supported.')
 
-    if distance_measure in ('embedding', 'morgan'):
-        print('Computing distances')
-        distances = cdist(test_vecs, train_vecs, metric=metric)
     if distances.shape != (len(test_smiles), len(train_smiles)):
         raise ValueError(
             f'Distance matrix has shape {distances.shape}; expected '

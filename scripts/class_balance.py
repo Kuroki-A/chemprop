@@ -40,8 +40,8 @@ def class_balance(args: Args):
         'test': []
     }
 
-    for i in range(args.num_folds):
-        print(f'Fold {i}')
+    for fold_index in range(args.num_folds):
+        print(f'Fold {fold_index}')
 
         # Update args
         data_name = os.path.splitext(os.path.basename(args.data_path))[0]
@@ -49,7 +49,7 @@ def class_balance(args: Args):
             args.splits_dir,
             data_name,
             requested_split_type,
-            f'fold_{i}',
+            f'fold_{fold_index}',
             '0',
             'split_indices.pckl',
         )
@@ -70,8 +70,8 @@ def class_balance(args: Args):
             class_sizes = get_class_sizes(data_split)
             print(f'Class sizes for {split_name}')
 
-            for i, task_class_sizes in enumerate(class_sizes):
-                print(f'{args.task_names[i]} '
+            for task_index, task_class_sizes in enumerate(class_sizes):
+                print(f'{args.task_names[task_index]} '
                       f'{", ".join(f"{cls}: {size * 100:.2f}%" for cls, size in enumerate(task_class_sizes))}')
 
             all_class_sizes[split_name].append(class_sizes)
@@ -88,8 +88,8 @@ def class_balance(args: Args):
 
         mean_class_sizes, std_class_sizes = np.mean(all_class_sizes[split_name], axis=0), np.std(all_class_sizes[split_name], axis=0)
 
-        for i, (mean_task_class_sizes, std_task_class_sizes) in enumerate(zip(mean_class_sizes, std_class_sizes)):
-            print(f'{args.task_names[i]} '
+        for task_index, (mean_task_class_sizes, std_task_class_sizes) in enumerate(zip(mean_class_sizes, std_class_sizes)):
+            print(f'{args.task_names[task_index]} '
                   f'{", ".join(f"{cls}: {mean_size * 100:.2f}% +/- {std_size * 100:.2f}%" for cls, (mean_size, std_size) in enumerate(zip(mean_task_class_sizes, std_task_class_sizes)))}')
 
 
