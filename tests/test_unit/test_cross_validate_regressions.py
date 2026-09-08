@@ -29,6 +29,14 @@ def test_dataset_cache_is_content_addressed_and_round_trips(tmp_path: Path, monk
     )
 
     manifest = cross_validate_module._dataset_cache_manifest(args)
+    assert {
+        "get_data",
+        "MoleculeDataset",
+        "make_mol",
+        "featurization",
+        "load_features",
+        "feature_generators",
+    } <= set(manifest["source_digests"])
     cache_path = cross_validate_module._dataset_cache_path(args, manifest)
     dataset = MoleculeDataset([MoleculeDatapoint(smiles=["CC"], targets=[2.0])])
     cross_validate_module._save_dataset_cache(cache_path, manifest, dataset)

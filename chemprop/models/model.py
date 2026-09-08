@@ -178,6 +178,16 @@ class MoleculeModel(nn.Module):
                     ]:  # Freeze weights and bias for given number of layers
                         param.requires_grad = False
 
+    def _positive_uncertainty_parameter(self, values: torch.Tensor) -> torch.Tensor:
+        """Maps logits to values safely separated from zero.
+
+        ``softplus`` can underflow to exactly zero for a sufficiently negative
+        logit. Variances and Normal-Inverse-Gamma parameters are later used in
+        logarithms and denominators, so retain a dtype-aware positive floor.
+        """
+        minimum = torch.finfo(values.dtype).eps
+        return torch.clamp(self.softplus(values), min=minimum)
+
     def fingerprint(
         self,
         batch: Union[
@@ -313,12 +323,12 @@ class MoleculeModel(nn.Module):
                 outputs = []
                 for x in output:
                     means, variances = torch.split(x, x.shape[1] // 2, dim=1)
-                    variances = self.softplus(variances)
+                    variances = self._positive_uncertainty_parameter(variances)
                     outputs.append(torch.cat([means, variances], axis=1))
                 return outputs
             else:
                 means, variances = torch.split(output, output.shape[1] // 2, dim=1)
-                variances = self.softplus(variances)
+                variances = self._positive_uncertainty_parameter(variances)
                 output = torch.cat([means, variances], axis=1)
         if self.loss_function == "evidential":
             if self.is_atom_bond_targets:
@@ -327,22 +337,22 @@ class MoleculeModel(nn.Module):
                     means, lambdas, alphas, betas = torch.split(
                         x, x.shape[1] // 4, dim=1
                     )
-                    lambdas = self.softplus(lambdas)  # + min_val
+                    lambdas = self._positive_uncertainty_parameter(lambdas)
                     alphas = (
-                        self.softplus(alphas) + 1
-                    )  # + min_val # add 1 for numerical contraints of Gamma function
-                    betas = self.softplus(betas)  # + min_val
+                        self._positive_uncertainty_parameter(alphas) + 1
+                    )  # add 1 for numerical constraints of the Gamma function
+                    betas = self._positive_uncertainty_parameter(betas)
                     outputs.append(torch.cat([means, lambdas, alphas, betas], dim=1))
                 return outputs
             else:
                 means, lambdas, alphas, betas = torch.split(
                     output, output.shape[1] // 4, dim=1
                 )
-                lambdas = self.softplus(lambdas)  # + min_val
+                lambdas = self._positive_uncertainty_parameter(lambdas)
                 alphas = (
-                    self.softplus(alphas) + 1
-                )  # + min_val # add 1 for numerical contraints of Gamma function
-                betas = self.softplus(betas)  # + min_val
+                    self._positive_uncertainty_parameter(alphas) + 1
+                )  # add 1 for numerical constraints of the Gamma function
+                betas = self._positive_uncertainty_parameter(betas)
                 output = torch.cat([means, lambdas, alphas, betas], dim=1)
         if self.loss_function == "dirichlet":
             if self.is_atom_bond_targets:

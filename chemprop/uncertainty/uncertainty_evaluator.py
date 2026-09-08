@@ -5,8 +5,31 @@ import numpy as np
 from scipy.stats import t, spearmanr
 from scipy.special import erfinv
 
+from chemprop.multitask_utils import (
+    flatten_atom_bond_value_sets,
+    flatten_atom_bond_values,
+    validate_task_masks,
+)
 from chemprop.uncertainty.uncertainty_calibrator import UncertaintyCalibrator
-from chemprop.train import evaluate_predictions
+
+
+def evaluate_predictions(*args, **kwargs):
+    """Imports the evaluator lazily to avoid ``train``/``uncertainty`` cycles."""
+    from chemprop.train.evaluate import evaluate_predictions as train_evaluate_predictions
+
+    return train_evaluate_predictions(*args, **kwargs)
+
+
+def _atom_bond_evaluation_arrays(mask, **row_major_values):
+    """Returns aligned task-major arrays for variable-size atom/bond rows."""
+    task_masks = validate_task_masks(mask)
+    lengths = [len(task_mask) for task_mask in task_masks]
+    task_values = flatten_atom_bond_value_sets(
+        row_major_values,
+        num_tasks=len(task_masks),
+        expected_lengths=lengths,
+    )
+    return task_masks, task_values
 
 
 class UncertaintyEvaluator(ABC):
@@ -91,12 +114,24 @@ class MetricEvaluator(UncertaintyEvaluator):
         uncertainties: List[List[float]],
         mask: List[List[bool]],
     ):
+        task_masks = validate_task_masks(mask)
+        if self.is_atom_bond_targets:
+            task_masks, task_values = _atom_bond_evaluation_arrays(
+                task_masks,
+                targets=targets,
+                uncertainties=uncertainties,
+            )
+            task_uncertainties = task_values['uncertainties']
+            metric_preds = [values.reshape(-1, 1) for values in task_uncertainties]
+        else:
+            metric_preds = uncertainties
         return evaluate_predictions(
-            preds=uncertainties,
+            preds=metric_preds,
             targets=targets,
-            num_tasks=np.array(targets).shape[1],
+            num_tasks=len(task_masks),
             metrics=[self.evaluation_method],
             dataset_type=self.dataset_type,
+            is_atom_bond_targets=self.is_atom_bond_targets,
         )[self.evaluation_method]
 
 
@@ -121,26 +156,45 @@ class NLLRegressionEvaluator(UncertaintyEvaluator):
         mask: List[List[bool]],
     ):
         if self.calibrator is None:  # uncalibrated regression uncertainties are variances
-            uncertainties = np.array(uncertainties)
-            preds = np.array(preds)
-            targets = np.array(targets)
-            mask = np.array(mask)
-            num_tasks = len(mask)
             if self.is_atom_bond_targets:
-                uncertainties = [np.concatenate(x) for x in zip(*uncertainties)]
-                preds = [np.concatenate(x) for x in zip(*preds)]
-                targets = [np.concatenate(x) for x in zip(*targets)]
+                mask, task_values = _atom_bond_evaluation_arrays(
+                    mask,
+                    uncertainties=uncertainties,
+                    preds=preds,
+                    targets=targets,
+                )
+                uncertainties = task_values['uncertainties']
+                preds = task_values['preds']
+                targets = task_values['targets']
             else:
+                uncertainties = np.asarray(uncertainties, dtype=float)
+                preds = np.asarray(preds, dtype=float)
+                targets = np.asarray(targets, dtype=float)
+                mask = np.asarray(mask, dtype=bool)
                 uncertainties = np.array(list(zip(*uncertainties)))
                 preds = np.array(list(zip(*preds)))
-                targets = targets.astype(float)
                 targets = np.array(list(zip(*targets)))
+            num_tasks = len(mask)
             nll = []
             for i in range(num_tasks):
                 task_mask = mask[i]
                 task_unc = uncertainties[i][task_mask]
                 task_preds = preds[i][task_mask]
                 task_targets = targets[i][task_mask]
+                if task_unc.size == 0:
+                    nll.append(float('nan'))
+                    continue
+                if (
+                    not np.all(np.isfinite(task_unc))
+                    or not np.all(np.isfinite(task_preds))
+                    or not np.all(np.isfinite(task_targets))
+                    or np.any(task_unc < 0)
+                ):
+                    raise ValueError(
+                        'Regression NLL expects finite predictions and targets '
+                        'and finite non-negative variances.'
+                    )
+                task_unc = np.maximum(task_unc, np.finfo(float).eps)
                 task_nll = np.log(2 * np.pi * task_unc) / 2 \
                     + (task_preds - task_targets) ** 2 / (2 * task_unc)
                 nll.append(task_nll.mean())
@@ -172,23 +226,41 @@ class NLLClassEvaluator(UncertaintyEvaluator):
         uncertainties: List[List[float]],
         mask: List[List[bool]],
     ):
-        targets = np.array(targets)
-        mask = np.array(mask)
-        num_tasks = len(mask)
-        uncertainties = np.array(uncertainties)
         if self.is_atom_bond_targets:
-            uncertainties = [np.concatenate(x) for x in zip(*uncertainties)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            mask, task_values = _atom_bond_evaluation_arrays(
+                mask,
+                uncertainties=uncertainties,
+                targets=targets,
+            )
+            uncertainties = task_values['uncertainties']
+            targets = task_values['targets']
         else:
+            targets = np.asarray(targets, dtype=float)
+            mask = np.asarray(mask, dtype=bool)
+            uncertainties = np.asarray(uncertainties, dtype=float)
             uncertainties = np.array(list(zip(*uncertainties)))
-            targets = targets.astype(float)
             targets = np.array(list(zip(*targets)))
+        num_tasks = len(mask)
         nll = []
         for i in range(num_tasks):
             task_mask = mask[i]
             task_unc = uncertainties[i][task_mask]
             task_targets = targets[i][task_mask]
+            if task_unc.size == 0:
+                nll.append(float('nan'))
+                continue
+            if (
+                not np.all(np.isfinite(task_unc))
+                or not np.all(np.isfinite(task_targets))
+                or np.any((task_unc < 0) | (task_unc > 1))
+                or np.any((task_targets != 0) & (task_targets != 1))
+            ):
+                raise ValueError(
+                    'Classification NLL expects finite binary targets and '
+                    'probabilities in [0, 1].'
+                )
             task_likelihood = task_unc * task_targets + (1 - task_unc) * (1 - task_targets)
+            task_likelihood = np.maximum(task_likelihood, np.finfo(float).eps)
             task_nll = -1 * np.log(task_likelihood)
             nll.append(task_nll.mean())
         return nll
@@ -214,18 +286,42 @@ class NLLMultiEvaluator(UncertaintyEvaluator):
         uncertainties: List[List[float]],
         mask: List[List[bool]],
     ):
-        targets = np.array(targets, dtype=int)  # shape(data, tasks)
-        mask = np.array(mask)
-        num_tasks = len(mask)
-        uncertainties = np.array(uncertainties)
+        targets = np.asarray(targets, dtype=float)  # shape(data, tasks)
+        mask = np.asarray(mask, dtype=bool)  # shape(tasks, data)
+        uncertainties = np.asarray(uncertainties, dtype=float)
+        if targets.ndim != 2 or uncertainties.ndim != 3:
+            raise ValueError(
+                'Multiclass NLL expects targets with shape (data, tasks) and '
+                'probabilities with shape (data, tasks, classes).'
+            )
+        if uncertainties.shape[:2] != targets.shape or mask.shape != targets.T.shape:
+            raise ValueError('Multiclass NLL target, probability, and mask shapes do not match.')
+        num_tasks = targets.shape[1]
         nll = []
         for i in range(num_tasks):
-            task_mask = mask[:, i]
+            task_mask = mask[i]
             task_preds = uncertainties[task_mask, i]
-            task_targets = targets[task_mask, i]  # shape(data)
+            task_target_values = targets[task_mask, i]
+            if task_target_values.size == 0:
+                nll.append(float('nan'))
+                continue
+            if (
+                not np.all(np.isfinite(task_target_values))
+                or np.any(task_target_values != np.floor(task_target_values))
+            ):
+                raise ValueError('Multiclass targets must be finite integer class indices.')
+            task_targets = task_target_values.astype(int)
+            if (
+                not np.all(np.isfinite(task_preds))
+                or np.any((task_preds < 0) | (task_preds > 1))
+            ):
+                raise ValueError('Multiclass probabilities must be finite and in [0, 1].')
+            if np.any(task_targets < 0) or np.any(task_targets >= task_preds.shape[1]):
+                raise ValueError('Multiclass targets must be valid class indices.')
             bin_targets = np.zeros_like(task_preds)  # shape(data, classes)
             bin_targets[np.arange(task_targets.shape[0]), task_targets] = 1
             task_likelihood = np.sum(bin_targets * task_preds, axis=1)
+            task_likelihood = np.maximum(task_likelihood, np.finfo(float).eps)
             task_nll = -1 * np.log(task_likelihood)
             nll.append(task_nll.mean())
         return nll
@@ -251,21 +347,25 @@ class CalibrationAreaEvaluator(UncertaintyEvaluator):
         uncertainties: List[List[float]],
         mask: List[List[bool]],
     ):
-        targets = np.array(targets)  # shape(data, tasks)
-        mask = np.array(mask)
-        num_tasks = len(mask)
-        uncertainties = np.array(uncertainties)
-        preds = np.array(preds)
-
         if self.is_atom_bond_targets:
-            uncertainties = [np.concatenate(x) for x in zip(*uncertainties)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
-            preds = [np.concatenate(x) for x in zip(*preds)]
+            mask, task_values = _atom_bond_evaluation_arrays(
+                mask,
+                uncertainties=uncertainties,
+                targets=targets,
+                preds=preds,
+            )
+            uncertainties = task_values['uncertainties']
+            targets = task_values['targets']
+            preds = task_values['preds']
         else:
+            targets = np.asarray(targets, dtype=float)
+            mask = np.asarray(mask, dtype=bool)
+            uncertainties = np.asarray(uncertainties, dtype=float)
+            preds = np.asarray(preds, dtype=float)
             uncertainties = np.array(list(zip(*uncertainties)))
-            targets = targets.astype(float)
             targets = np.array(list(zip(*targets)))
             preds = np.array(list(zip(*preds)))
+        num_tasks = len(mask)
         # using 101 bin edges, hardcoded
         fractions = np.zeros([num_tasks, 101])  # shape(tasks, 101)
         fractions[:, 100] = 1
@@ -277,28 +377,33 @@ class CalibrationAreaEvaluator(UncertaintyEvaluator):
 
             bin_scaling = [0]
 
-            for i in range(1, 100):
-                self.calibrator.regression_calibrator_metric = "interval"
-                self.calibrator.interval_percentile = i
-                self.calibrator.calibrate()
-                bin_scaling.append(self.calibrator.scaling)
-
-            for j in range(num_tasks):
-                task_mask = mask[j]
-                task_targets = targets[j][task_mask]
-                task_preds = preds[j][task_mask]
-                task_error = np.abs(task_preds - task_targets)
-                task_unc = uncertainties[j][task_mask]
-
+            try:
                 for i in range(1, 100):
-                    bin_unc = task_unc / original_scaling[j] * bin_scaling[i][j]
-                    bin_fraction = np.mean(bin_unc >= task_error)
-                    fractions[j, i] = bin_fraction
+                    self.calibrator.regression_calibrator_metric = "interval"
+                    self.calibrator.interval_percentile = i
+                    self.calibrator.calibrate()
+                    bin_scaling.append(self.calibrator.scaling)
 
-            # return calibration settings to original state
-            self.calibrator.regression_calibrator_metric = original_metric
-            self.calibrator.scaling = original_scaling
-            self.calibrator.interval_percentile = original_interval
+                for j in range(num_tasks):
+                    task_mask = mask[j]
+                    task_targets = targets[j][task_mask]
+                    task_preds = preds[j][task_mask]
+                    task_error = np.abs(task_preds - task_targets)
+                    task_unc = uncertainties[j][task_mask]
+                    if task_unc.size == 0:
+                        fractions[j] = np.nan
+                        continue
+
+                    for i in range(1, 100):
+                        bin_unc = task_unc / original_scaling[j] * bin_scaling[i][j]
+                        bin_fraction = np.mean(bin_unc >= task_error)
+                        fractions[j, i] = bin_fraction
+            finally:
+                # Evaluation must never leave the shared calibrator configured
+                # for the last temporary percentile if a calculation fails.
+                self.calibrator.regression_calibrator_metric = original_metric
+                self.calibrator.scaling = original_scaling
+                self.calibrator.interval_percentile = original_interval
 
         else:  # uncertainties are uncalibrated variances
             bin_scaling = [0]
@@ -310,6 +415,18 @@ class CalibrationAreaEvaluator(UncertaintyEvaluator):
                 task_preds = preds[j][task_mask]
                 task_error = np.abs(task_preds - task_targets)
                 task_unc = uncertainties[j][task_mask]
+                if task_unc.size == 0:
+                    fractions[j] = np.nan
+                    continue
+                if (
+                    not np.all(np.isfinite(task_unc))
+                    or not np.all(np.isfinite(task_error))
+                    or np.any(task_unc < 0)
+                ):
+                    raise ValueError(
+                        'Miscalibration area expects finite errors and '
+                        'finite non-negative variances.'
+                    )
                 for i in range(1, 100):
                     bin_unc = np.sqrt(task_unc) * bin_scaling[i]
                     bin_fraction = np.mean(bin_unc >= task_error)
@@ -344,20 +461,25 @@ class ExpectedNormalizedErrorEvaluator(UncertaintyEvaluator):
         uncertainties: List[List[float]],
         mask: List[List[bool]],
     ):
-        targets = np.array(targets)  # shape(data, tasks)
-        mask = np.array(mask)
-        num_tasks = len(mask)
-        uncertainties = np.array(uncertainties)
-        preds = np.array(preds)
         if self.is_atom_bond_targets:
-            uncertainties = [np.concatenate(x) for x in zip(*uncertainties)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
-            preds = [np.concatenate(x) for x in zip(*preds)]
+            mask, task_values = _atom_bond_evaluation_arrays(
+                mask,
+                uncertainties=uncertainties,
+                targets=targets,
+                preds=preds,
+            )
+            uncertainties = task_values['uncertainties']
+            targets = task_values['targets']
+            preds = task_values['preds']
         else:
+            targets = np.asarray(targets, dtype=float)
+            mask = np.asarray(mask, dtype=bool)
+            uncertainties = np.asarray(uncertainties, dtype=float)
+            preds = np.asarray(preds, dtype=float)
             uncertainties = np.array(list(zip(*uncertainties)))
-            targets = targets.astype(float)
             targets = np.array(list(zip(*targets)))
             preds = np.array(list(zip(*preds)))
+        num_tasks = len(mask)
         # get stdev scaling then revert if interval
         if self.calibrator is not None:
             original_metric = self.calibrator.regression_calibrator_metric
@@ -372,8 +494,7 @@ class ExpectedNormalizedErrorEvaluator(UncertaintyEvaluator):
                 self.calibrator.regression_calibrator_metric = original_metric
                 self.calibrator.scaling = original_scaling
 
-        root_mean_vars = np.zeros([num_tasks, 100])  # shape(tasks, 100)
-        rmses = np.zeros_like(root_mean_vars)
+        ence = []
 
         for i in range(num_tasks):
             task_mask = mask[i]  # shape(data)
@@ -382,32 +503,49 @@ class ExpectedNormalizedErrorEvaluator(UncertaintyEvaluator):
             task_error = np.abs(task_preds - task_targets)
             task_unc = uncertainties[i][task_mask]
 
+            if task_unc.size == 0:
+                ence.append(float('nan'))
+                continue
+            if not np.all(np.isfinite(task_unc)) or not np.all(np.isfinite(task_error)):
+                raise ValueError('ENCE inputs must contain only finite observed values.')
+            if np.any(task_unc < 0):
+                raise ValueError('ENCE uncertainties must be non-negative.')
+
             sort_idx = np.argsort(task_unc)
             task_unc = task_unc[sort_idx]
             task_error = task_error[sort_idx]
 
-            # 100 bins
-            split_unc = np.array_split(task_unc, 100)  # shape(list100, data/100)
-            split_error = np.array_split(task_error, 100)
+            # Use at most one bin per observation. The historical fixed 100
+            # bins produced 0/0 and NaN whenever a task had fewer than 100
+            # labelled rows because most bins were empty.
+            num_bins = min(100, task_unc.size)
+            split_unc = np.array_split(task_unc, num_bins)
+            split_error = np.array_split(task_error, num_bins)
+            root_mean_vars = np.empty(num_bins, dtype=float)
+            rmses = np.empty(num_bins, dtype=float)
 
-            for j in range(100):
+            for j in range(num_bins):
                 if self.calibrator is None:  # starts as a variance
-                    root_mean_vars[i, j] = np.sqrt(np.mean(split_unc[j]))
-                    rmses[i, j] = np.sqrt(np.mean(np.square(split_error[j])))
+                    root_mean_vars[j] = np.sqrt(np.mean(split_unc[j]))
+                    rmses[j] = np.sqrt(np.mean(np.square(split_error[j])))
                 elif self.calibration_method == "tscaling":  # convert back to sample stdev
                     bin_unc = split_unc[j] / original_scaling[i]
                     bin_var = t.var(df=self.calibrator.num_models - 1, scale=bin_unc)
-                    root_mean_vars[i, j] = np.sqrt(np.mean(bin_var))
-                    rmses[i, j] = np.sqrt(np.mean(np.square(split_error[j])))
+                    root_mean_vars[j] = np.sqrt(np.mean(bin_var))
+                    rmses[j] = np.sqrt(np.mean(np.square(split_error[j])))
                 else:
                     bin_unc = split_unc[j]
                     if self.calibrator.regression_calibrator_metric == "interval":
                         bin_unc = bin_unc / original_scaling[i] * stdev_scaling[i]  # convert from interval to stdev as needed
-                    root_mean_vars[i, j] = np.sqrt(np.mean(np.square(bin_unc)))
-                    rmses[i, j] = np.sqrt(np.mean(np.square(split_error[j])))
+                    root_mean_vars[j] = np.sqrt(np.mean(np.square(bin_unc)))
+                    rmses[j] = np.sqrt(np.mean(np.square(split_error[j])))
 
-        ence = np.mean(np.abs(root_mean_vars - rmses) / root_mean_vars, axis=1)
-        return ence.tolist()
+            if not np.all(np.isfinite(root_mean_vars)) or not np.all(np.isfinite(rmses)):
+                raise ValueError('ENCE calculation produced non-finite bin statistics.')
+            denominator = np.maximum(root_mean_vars, np.finfo(float).eps)
+            ence.append(float(np.mean(np.abs(root_mean_vars - rmses) / denominator)))
+
+        return ence
 
 
 class SpearmanEvaluator(UncertaintyEvaluator):
@@ -431,28 +569,38 @@ class SpearmanEvaluator(UncertaintyEvaluator):
         uncertainties: List[List[float]],
         mask: List[List[bool]],
     ):
-        targets = np.array(targets)  # shape(data, tasks)
-        uncertainties = np.array(uncertainties)
-        mask = np.array(mask)
-        num_tasks = len(mask)
-        preds = np.array(preds)
         spearman_coeffs = []
         if self.is_atom_bond_targets:
-            uncertainties = [np.concatenate(x) for x in zip(*uncertainties)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
-            preds = [np.concatenate(x) for x in zip(*preds)]
+            mask, task_values = _atom_bond_evaluation_arrays(
+                mask,
+                uncertainties=uncertainties,
+                targets=targets,
+                preds=preds,
+            )
+            uncertainties = task_values['uncertainties']
+            targets = task_values['targets']
+            preds = task_values['preds']
         else:
+            targets = np.asarray(targets, dtype=float)
+            uncertainties = np.asarray(uncertainties, dtype=float)
+            mask = np.asarray(mask, dtype=bool)
+            preds = np.asarray(preds, dtype=float)
             uncertainties = np.array(list(zip(*uncertainties)))
-            targets = targets.astype(float)
             targets = np.array(list(zip(*targets)))
             preds = np.array(list(zip(*preds)))
+        num_tasks = len(mask)
         for i in range(num_tasks):
             task_mask = mask[i]
             task_unc = uncertainties[i][task_mask]
             task_targets = targets[i][task_mask]
             task_preds = preds[i][task_mask]
             task_error = np.abs(task_preds - task_targets)
-            spmn = spearmanr(task_unc, task_error).correlation
+            if task_unc.size < 2 or np.ptp(task_unc) == 0 or np.ptp(task_error) == 0:
+                spmn = float('nan')
+            elif not np.all(np.isfinite(task_unc)) or not np.all(np.isfinite(task_error)):
+                raise ValueError('Spearman inputs must contain only finite observed values.')
+            else:
+                spmn = spearmanr(task_unc, task_error).correlation
             spearman_coeffs.append(spmn)
         return spearman_coeffs
 
@@ -486,20 +634,25 @@ class ConformalRegressionEvaluator(UncertaintyEvaluator):
         Returns:
             Conformal coverage for each task
         """
-        uncertainties = np.array(uncertainties)
-        targets = np.array(targets)
-        preds = np.array(preds)
-        mask = np.array(mask)
-        num_tasks = uncertainties.shape[1]
         if self.is_atom_bond_targets:
-            uncertainties = [np.concatenate(x) for x in zip(*uncertainties)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
-            preds = [np.concatenate(x) for x in zip(*preds)]
+            mask, task_values = _atom_bond_evaluation_arrays(
+                mask,
+                uncertainties=uncertainties,
+                targets=targets,
+                preds=preds,
+            )
+            uncertainties = task_values['uncertainties']
+            targets = task_values['targets']
+            preds = task_values['preds']
         else:
+            uncertainties = np.asarray(uncertainties, dtype=float)
+            targets = np.asarray(targets, dtype=float)
+            preds = np.asarray(preds, dtype=float)
+            mask = np.asarray(mask, dtype=bool)
             uncertainties = np.array(list(zip(*uncertainties)))
-            targets = targets.astype(float)
             targets = np.array(list(zip(*targets)))
             preds = np.array(list(zip(*preds)))
+        num_tasks = len(mask)
 
         results = []
         for i in range(num_tasks):
@@ -510,7 +663,9 @@ class ConformalRegressionEvaluator(UncertaintyEvaluator):
             unc_task_lower = task_preds - task_unc
             unc_task_upper = task_preds + task_unc
             task_results = np.logical_and(unc_task_lower <= task_targets, task_targets <= unc_task_upper)
-            results.append(task_results.sum() / task_results.shape[0])
+            results.append(
+                float(np.mean(task_results)) if task_results.size else float('nan')
+            )
 
         return results
 
@@ -555,7 +710,9 @@ class ConformalMulticlassEvaluator(UncertaintyEvaluator):
             task_results = np.take_along_axis(
                 uncertainties[task_mask, i], targets[task_mask, i].reshape(-1, 1).astype(int), axis=1
             ).squeeze(1)
-            results.append(task_results.sum() / len(task_results))
+            results.append(
+                float(np.mean(task_results)) if task_results.size else float('nan')
+            )
 
         return results
 
@@ -589,16 +746,29 @@ class ConformalMultilabelEvaluator(UncertaintyEvaluator):
         Returns:
             Conformal coverage for each task
         """
-        targets = np.array(targets, dtype=float)
-        uncertainties = np.array(uncertainties)
-        mask = np.array(mask)
-        num_tasks = len(mask)
         if self.is_atom_bond_targets:
-            uncertainties = [np.concatenate(x) for x in zip(*uncertainties)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            task_masks = validate_task_masks(mask)
+            num_tasks = len(task_masks)
+            lengths = [len(task_mask) for task_mask in task_masks]
+            targets = flatten_atom_bond_values(
+                targets,
+                num_tasks=num_tasks,
+                label='targets',
+                expected_lengths=lengths,
+            )
+            uncertainties = flatten_atom_bond_values(
+                uncertainties,
+                num_tasks=2 * num_tasks,
+                label='uncertainties',
+                expected_lengths=lengths + lengths,
+            )
+            mask = task_masks
         else:
+            targets = np.asarray(targets, dtype=float)
+            uncertainties = np.asarray(uncertainties, dtype=float)
+            mask = np.asarray(mask, dtype=bool)
+            num_tasks = len(mask)
             uncertainties = np.array(list(zip(*uncertainties)))
-            targets = targets.astype(float)
             targets = np.array(list(zip(*targets)))
         results = []
         for i in range(num_tasks):
@@ -607,7 +777,9 @@ class ConformalMultilabelEvaluator(UncertaintyEvaluator):
             task_unc_in = uncertainties[i][task_mask]
             task_unc_out = uncertainties[i + num_tasks][task_mask]
             task_results = np.logical_and(task_unc_in <= task_targets, task_targets <= task_unc_out)
-            results.append(task_results.sum() / task_results.shape[0])
+            results.append(
+                float(np.mean(task_results)) if task_results.size else float('nan')
+            )
 
         return results
 
@@ -639,7 +811,7 @@ def build_uncertainty_evaluator(
             "regression": ConformalRegressionEvaluator,
             "multiclass": ConformalMulticlassEvaluator,
             "classification": ConformalMultilabelEvaluator,
-        }[dataset_type],
+        }.get(dataset_type),
     }
 
     classification_metrics = [

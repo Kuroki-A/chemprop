@@ -35,7 +35,7 @@
               <input type="radio" name="inputType" value="file" autocomplete="off"> Upload File
             </label>
             <label id="drawButton" class="btn btn-primary">
-              <input type="radio" name="inputType" value="file" autocomplete="off"> Draw Molecule
+              <input type="radio" name="inputType" value="draw" autocomplete="off"> Draw Molecule
             </label>
         </div>
 
@@ -63,35 +63,33 @@
         <!--SMILES input functionality-->
         <script>
             $(document).ready(function() {
-                $(document).ready(function() {
-                    $("#textButton").click(function() {
-                        $("#textInputForm").show();
-                        $("#textSmilesInput").prop('required', true);
-                        $("#fileInputForm").hide();
-                        $("#fileSmilesInput").prop('required', false);
-                        $("#drawInputForm").hide();
-                        $("#drawSmilesInput").prop('required', false);
-                        $("#drawSmilesInput").val('');
-                    });
-                    $("#fileButton").click(function() {
-                        $("#textInputForm").hide();
-                        $("#textSmilesInput").prop('required', false);
-                        $("#textSmilesInput").val('');
-                        $("#fileInputForm").show();
-                        $("#fileSmilesInput").prop('required', true);
-                        $("#drawInputForm").hide();
-                        $("#drawSmilesInput").prop('required', false);
-                        $("#drawSmilesInput").val('');
-                    });
-                    $("#drawButton").click(function() {
-                        $("#textInputForm").hide();
-                        $("#textSmilesInput").prop('required', false);
-                        $("#textSmilesInput").val('');
-                        $("#fileInputForm").hide();
-                        $("#fileSmilesInput").prop('required', false);
-                        $("#drawInputForm").show();
-                        $("#drawSmilesInput").prop('required', true);
-                    });
+                $("#textButton").click(function() {
+                    $("#textInputForm").show();
+                    $("#textSmilesInput").prop('required', true);
+                    $("#fileInputForm").hide();
+                    $("#fileSmilesInput").prop('required', false);
+                    $("#drawInputForm").hide();
+                    $("#drawSmilesInput").prop('required', false);
+                    $("#drawSmilesInput").val('');
+                });
+                $("#fileButton").click(function() {
+                    $("#textInputForm").hide();
+                    $("#textSmilesInput").prop('required', false);
+                    $("#textSmilesInput").val('');
+                    $("#fileInputForm").show();
+                    $("#fileSmilesInput").prop('required', true);
+                    $("#drawInputForm").hide();
+                    $("#drawSmilesInput").prop('required', false);
+                    $("#drawSmilesInput").val('');
+                });
+                $("#drawButton").click(function() {
+                    $("#textInputForm").hide();
+                    $("#textSmilesInput").prop('required', false);
+                    $("#textSmilesInput").val('');
+                    $("#fileInputForm").hide();
+                    $("#fileSmilesInput").prop('required', false);
+                    $("#drawInputForm").show();
+                    $("#drawSmilesInput").prop('required', true);
                 });
 
                 $("#convertToSmiles").click(function() {
@@ -133,7 +131,7 @@
     {% if predicted %}
         <hr>
 
-        <a href="{{ url_for('download_predictions') }}"><button class="btn btn-default btn-md">Download Predictions</button></a>
+        <a class="btn btn-default btn-md" href="{{ url_for('download_predictions') }}">Download Predictions</a>
 
         <br>
         <br>

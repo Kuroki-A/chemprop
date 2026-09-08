@@ -116,6 +116,45 @@ def _bit_vector_to_numpy(bit_vector, dtype: np.dtype) -> np.ndarray:
     return array
 
 
+@functools.lru_cache(maxsize=256)
+def _indexed_feature_selection(
+    prefix: str,
+    width: int,
+    selected: Tuple[str, ...],
+) -> Tuple[int, ...]:
+    """Validates ``prefix_N`` labels without constructing all dense labels."""
+    indices = []
+    missing = []
+    marker = f"{prefix}_"
+    for column in selected:
+        suffix = column[len(marker):] if column.startswith(marker) else ""
+        if not suffix.isdigit():
+            missing.append(column)
+            continue
+        index = int(suffix)
+        if index >= width or f"{marker}{index}" != column:
+            missing.append(column)
+            continue
+        indices.append(index)
+    if missing:
+        raise KeyError(f"Feature columns not found: {missing}")
+    return tuple(indices)
+
+
+def _select_indexed_features(
+    features: np.ndarray,
+    prefix: str,
+    selected_feature_columns: Optional[Sequence[str]],
+) -> np.ndarray:
+    """Selects ordered (and possibly repeated) columns from a dense vector."""
+    array = np.asarray(features)
+    selected = _selection_tuple(selected_feature_columns)
+    if selected is None:
+        return array
+    indices = _indexed_feature_selection(prefix, array.shape[-1], selected)
+    return array[..., list(indices)]
+
+
 @register_features_generator("morgan")
 def morgan_binary_features_generator(
     mol: Molecule, radius: int = MORGAN_RADIUS, num_bits: int = MORGAN_NUM_BITS,
@@ -123,7 +162,8 @@ def morgan_binary_features_generator(
 ) -> np.ndarray:
     """Generates a binary Morgan fingerprint (legacy float64 output)."""
     generator = _get_rdkit_fp_generator("morgan", radius=radius, fpSize=num_bits)
-    return generator.GetFingerprintAsNumPy(_as_mol(mol)).astype(float, copy=False)
+    features = generator.GetFingerprintAsNumPy(_as_mol(mol)).astype(float, copy=False)
+    return _select_indexed_features(features, "bit", selected_feature_columns)
 
 
 @register_features_generator("morgan_count")
@@ -133,41 +173,52 @@ def morgan_counts_features_generator(
 ) -> np.ndarray:
     """Generates a count Morgan fingerprint (legacy float64 output)."""
     generator = _get_rdkit_fp_generator("morgan", radius=radius, fpSize=num_bits)
-    return generator.GetCountFingerprintAsNumPy(_as_mol(mol)).astype(float, copy=False)
+    features = generator.GetCountFingerprintAsNumPy(_as_mol(mol)).astype(float, copy=False)
+    return _select_indexed_features(features, "count", selected_feature_columns)
 
 
 @register_features_generator("maccs")
 def maccs_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _bit_vector_to_numpy(AllChem.GetMACCSKeysFingerprint(_as_mol(mol)), np.int64)
+    features = _bit_vector_to_numpy(
+        AllChem.GetMACCSKeysFingerprint(_as_mol(mol)), np.int64,
+    )
+    return _select_indexed_features(features, "bit", selected_feature_columns)
 
 
 @register_features_generator("rdkit")
 def rdkit_fingerprint_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
     generator = _get_rdkit_fp_generator("rdkit", fpSize=2048)
-    return generator.GetFingerprintAsNumPy(_as_mol(mol)).astype(int, copy=False)
+    features = generator.GetFingerprintAsNumPy(_as_mol(mol)).astype(int, copy=False)
+    return _select_indexed_features(features, "bit", selected_feature_columns)
 
 
 @register_features_generator("avalon")
 def avalon_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _bit_vector_to_numpy(pyAvalonTools.GetAvalonFP(_as_mol(mol)), np.int64)
+    features = _bit_vector_to_numpy(
+        pyAvalonTools.GetAvalonFP(_as_mol(mol)), np.int64,
+    )
+    return _select_indexed_features(features, "bit", selected_feature_columns)
 
 
 @register_features_generator("atompair")
 def atom_pair_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
     generator = _get_rdkit_fp_generator("atompair", fpSize=2048)
-    return generator.GetFingerprintAsNumPy(_as_mol(mol)).astype(int, copy=False)
+    features = generator.GetFingerprintAsNumPy(_as_mol(mol)).astype(int, copy=False)
+    return _select_indexed_features(features, "bit", selected_feature_columns)
 
 
 @register_features_generator("erg")
 def erg_legacy_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
     """Historical integer-cast ErG vector; retained for checkpoint compatibility."""
-    return np.asarray(AllChem.GetErGFingerprint(_as_mol(mol)), dtype=int)
+    features = np.asarray(AllChem.GetErGFingerprint(_as_mol(mol)), dtype=int)
+    return _select_indexed_features(features, "erg", selected_feature_columns)
 
 
 @register_features_generator("erg_float")
 def erg_float_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
     """Full-precision 315-dimensional ErG fingerprint for new models."""
-    return np.asarray(AllChem.GetErGFingerprint(_as_mol(mol)), dtype=float)
+    features = np.asarray(AllChem.GetErGFingerprint(_as_mol(mol)), dtype=float)
+    return _select_indexed_features(features, "erg", selected_feature_columns)
 
 
 # Descriptastorus RDKit descriptors -----------------------------------------
@@ -367,6 +418,7 @@ def _get_molecular_descriptor_calculator(columns: Tuple[str, ...]):
     return calculator
 
 
+@functools.lru_cache(maxsize=1)
 def _rdkit_208_columns() -> Tuple[str, ...]:
     props = set(_get_rdkit_props())
     return tuple(
@@ -384,6 +436,7 @@ def rdkit_2d_208_features_generator(mol: Molecule, selected_feature_columns: lis
     return np.asarray(_get_molecular_descriptor_calculator(columns).CalcDescriptors(_as_mol(mol)), dtype=float)
 
 
+@functools.lru_cache(maxsize=4)
 def _native_descriptor_columns(kind: str) -> Tuple[Tuple[str, Callable], ...]:
     if kind == "all":
         return _ALL_DESCRIPTOR_FUNCTIONS
@@ -518,14 +571,15 @@ def _padel_row_to_array(row: Dict[str, str], selected_feature_columns: list = No
     return np.asarray([row[column] for column in columns], dtype=float)
 
 
-def _padel_failure_zeros(selected_feature_columns: list, smiles: str, exc: Exception) -> np.ndarray:
-    if _PADEL_COLUMNS is None:
-        raise RuntimeError(f"PaDEL failed for {smiles!r} before its output schema was known: {exc}") from exc
-    columns = _validate_columns(_selection_tuple(selected_feature_columns), _PADEL_COLUMNS)
-    warnings.warn(
-        f"PaDEL failed for {smiles!r}; returning {len(columns)} zeros. Cause: {exc}", RuntimeWarning,
-    )
-    return np.zeros(len(columns), dtype=float)
+def _raise_padel_failure(smiles: str, exc: Exception, batch_row: int = None) -> None:
+    """Raises instead of silently substituting an invalid descriptor vector."""
+    row_context = "" if batch_row is None else f" at batch row {batch_row}"
+    # Keep diagnostics useful without allowing an unexpectedly large input to
+    # dominate logs produced by long-running feature jobs.
+    displayed_smiles = smiles if len(smiles) <= 160 else f"{smiles[:157]}..."
+    raise RuntimeError(
+        f"PaDEL failed{row_context} for SMILES {displayed_smiles!r}: {exc}"
+    ) from exc
 
 
 @register_features_generator("padelpy")
@@ -536,7 +590,7 @@ def padelpy_features_generator(mol: Molecule, selected_feature_columns: list = N
     except ImportError:
         raise
     except Exception as exc:
-        return _padel_failure_zeros(selected_feature_columns, smiles, exc)
+        _raise_padel_failure(smiles, exc)
 
 
 def padelpy_batch_features_generator(
@@ -556,10 +610,17 @@ def padelpy_batch_features_generator(
         warnings.warn(
             f"PaDEL batch failed; retrying {len(smiles)} molecules individually. Cause: {exc}", RuntimeWarning,
         )
-        return [
-            padelpy_features_generator(value, selected_feature_columns)
-            for value in smiles
-        ]
+        output = []
+        for row_index, value in enumerate(smiles):
+            try:
+                output.append(
+                    padelpy_features_generator(value, selected_feature_columns)
+                )
+            except ImportError:
+                raise
+            except Exception as individual_exc:
+                _raise_padel_failure(value, individual_exc, batch_row=row_index)
+        return output
 
 
 padelpy_features_generator.batch_transform = padelpy_batch_features_generator
@@ -641,13 +702,13 @@ class _LegacyMap4CalculatorAdapter:
         # MHFPEncoder's default seed (42) is part of the v1.0 definition.  It
         # does not affect folded output, but retaining it avoids a subtle API
         # difference if MHFP changes implementation details in the future.
-        self.encoder = MHFPEncoder(dimensions)
+        self.encoder = MHFPEncoder(dimensions, seed=42)
 
     def calculate(self, mol: Chem.Mol) -> np.ndarray:
         canonical_mol = _canonical_map4_mol(mol)
         pairs = self._all_pairs(canonical_mol, self._get_atom_envs(canonical_mol))
         return self.encoder.fold(
-            self.encoder.hash(set(pairs)), self.dimensions,
+            self.encoder.hash(pairs), self.dimensions,
         )
 
     def calculate_many(
@@ -693,8 +754,10 @@ class _LegacyMap4CalculatorAdapter:
 
     def _all_pairs(
         self, mol: Chem.Mol, atom_envs: Dict[int, List[str]],
-    ) -> List[bytes]:
-        atom_pairs: List[bytes] = []
+    ) -> set:
+        # MAP4 consumes unique shingles. Building the set directly avoids a
+        # second full-size collection for the O(atoms^2 * radius) pair list.
+        atom_pairs = set()
         shingle_counts: Dict[str, int] = defaultdict(int)
         distance_matrix = Chem.GetDistanceMatrix(mol)
         for first, second in itertools.combinations(range(mol.GetNumAtoms()), 2):
@@ -709,8 +772,8 @@ class _LegacyMap4CalculatorAdapter:
                 if self.is_counted:
                     shingle_counts[shingle] += 1
                     shingle += f"|{shingle_counts[shingle]}"
-                atom_pairs.append(shingle.encode("utf-8"))
-        return list(set(atom_pairs))
+                atom_pairs.add(shingle.encode("utf-8"))
+        return atom_pairs
 
 
 def _get_map4_calculator(
@@ -745,6 +808,7 @@ def _get_map4_calculator(
                     dimensions=dimensions,
                     radius=radius,
                     include_duplicated_shingles=include_duplicated_shingles,
+                    seed=75434278,
                 )
             _MAP4_CALCULATOR_CACHE[key] = calculator
     return calculator
@@ -755,13 +819,7 @@ def _select_map4_features(
     selected_feature_columns: Optional[Sequence[str]] = None,
 ) -> np.ndarray:
     features = np.asarray(features, dtype=float)
-    selected = _selection_tuple(selected_feature_columns)
-    if selected is None:
-        return features
-    available = tuple(f"fp_{index}" for index in range(features.shape[-1]))
-    columns = _validate_columns(selected, available)
-    indices = {column: index for index, column in enumerate(available)}
-    return features[..., [indices[column] for column in columns]]
+    return _select_indexed_features(features, "fp", selected_feature_columns)
 
 
 def _prepare_molfeat_optional_dependency_compatibility() -> None:
@@ -816,7 +874,16 @@ def _get_molfeat_transformer(kind: str, length: int, **params):
 
 def _molfeat_output_columns(transformer, width: int) -> Tuple[str, ...]:
     columns = getattr(getattr(transformer, "featurizer", None), "columns", None)
-    return tuple(str(c) for c in columns) if columns is not None else tuple(f"fp_{i}" for i in range(width))
+    output = (
+        tuple(str(column) for column in columns)
+        if columns is not None
+        else tuple(f"fp_{index}" for index in range(width))
+    )
+    if len(output) != width:
+        raise RuntimeError(
+            f"Molfeat reported {len(output)} feature names for an output width of {width}."
+        )
+    return output
 
 
 def _molfeat_features(
@@ -824,11 +891,17 @@ def _molfeat_features(
 ) -> np.ndarray:
     transformer = _get_molfeat_transformer(kind, length, **params)
     try:
-        features = np.asarray(transformer([_as_smiles(mol)]), dtype=float)[0]
+        transformed = np.asarray(transformer([_as_smiles(mol)]), dtype=float)
     except ImportError as exc:
         raise ImportError(
             f"The {kind} generator is unavailable: {exc}. Install `molfeat[all]` and its optional dependency."
         ) from exc
+    if transformed.ndim != 2 or transformed.shape[0] != 1:
+        raise RuntimeError(
+            f"The {kind} Molfeat transformer returned shape {transformed.shape}; "
+            "expected one 2-D output row."
+        )
+    features = transformed[0]
     selected = _selection_tuple(selected_feature_columns)
     if selected is None:
         return features
@@ -851,6 +924,11 @@ def _molfeat_batch_features(
         raise ImportError(
             f"The {kind} generator is unavailable: {exc}. Install `molfeat[all]` and its optional dependency."
         ) from exc
+    if features.ndim != 2 or features.shape[0] != len(mols):
+        raise RuntimeError(
+            f"The {kind} Molfeat transformer returned shape {features.shape}; "
+            f"expected ({len(mols)}, feature_dimension)."
+        )
     selected = _selection_tuple(selected_feature_columns)
     if selected is None:
         return features
@@ -1015,6 +1093,14 @@ for _generator, _kind, _length, _batch_size in (
 _PRETRAINED_TRANSFORMER_CACHE: Dict[Tuple[object, Tuple[Tuple[str, object], ...]], object] = {}
 _PRETRAINED_TRANSFORMER_CACHE_LOCK = Lock()
 
+_PRETRAINED_GENERATOR_NAMES = {
+    "Roberta-Zinc480M-102M", "GPT2-Zinc480M-87M", "MolT5",
+    "ChemBERTa-77M-MTR", "ChemBERTa-77M-MLM", "ChemGPT-19M",
+    "ChemGPT-4.7M", "gin_supervised_masking", "gin_supervised_infomax",
+    "gin_supervised_edgepred", "jtvae_zinc_no_kl",
+    "gin_supervised_contextpred", "pcqm4mv2_graphormer_base",
+}
+
 
 def _load_pretrained_transformer_class(transformer_type: str):
     # Importing any ``molfeat.trans`` submodule eagerly imports its fingerprint
@@ -1054,23 +1140,42 @@ def _get_cached_pretrained_transformer(transformer_type: str, **init_kwargs):
 
 
 def _pretrained_transformer_features(
-    mol: Molecule, transformer_type: str, kind: str, **init_kwargs,
+    mol: Molecule, transformer_type: str, kind: str,
+    selected_feature_columns: Optional[Sequence[str]] = None, **init_kwargs,
 ) -> np.ndarray:
     transformer = _get_cached_pretrained_transformer(
         transformer_type, kind=kind, dtype=float, **init_kwargs
     )
-    return np.asarray(transformer(_as_smiles(mol)))[0]
+    transformed = np.asarray(transformer(_as_smiles(mol)))
+    if transformed.ndim != 2 or transformed.shape[0] != 1:
+        raise RuntimeError(
+            f"The {kind} pretrained transformer returned shape {transformed.shape}; "
+            "expected one 2-D output row."
+        )
+    features = transformed[0]
+    return _select_indexed_features(
+        features, "embedding", selected_feature_columns,
+    )
 
 
 def _pretrained_transformer_batch_features(
-    mols: Sequence[Molecule], transformer_type: str, kind: str, **init_kwargs,
+    mols: Sequence[Molecule], transformer_type: str, kind: str,
+    selected_feature_columns: Optional[Sequence[str]] = None, **init_kwargs,
 ) -> Sequence[np.ndarray]:
     if not mols:
         return []
     transformer = _get_cached_pretrained_transformer(
         transformer_type, kind=kind, dtype=float, **init_kwargs
     )
-    return np.asarray(transformer([_as_smiles(mol) for mol in mols]))
+    features = np.asarray(transformer([_as_smiles(mol) for mol in mols]))
+    if features.ndim != 2 or features.shape[0] != len(mols):
+        raise RuntimeError(
+            f"The {kind} pretrained transformer returned shape {features.shape}; "
+            f"expected ({len(mols)}, feature_dimension)."
+        )
+    return _select_indexed_features(
+        features, "embedding", selected_feature_columns,
+    )
 
 
 def _configure_pretrained_batch(
@@ -1082,72 +1187,99 @@ def _configure_pretrained_batch(
         transformer_type=transformer_type, kind=kind, **init_kwargs,
     )
     generator.preferred_batch_size = batch_size
+    generator.batch_supports_selected_columns = True
     generator.parallel_safe = False
 
 
 @register_features_generator("Roberta-Zinc480M-102M")
 def roberta_zinc_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "hf", "Roberta-Zinc480M-102M", notation="smiles")
+    return _pretrained_transformer_features(
+        mol, "hf", "Roberta-Zinc480M-102M", selected_feature_columns, notation="smiles",
+    )
 
 
 @register_features_generator("GPT2-Zinc480M-87M")
 def gpt2_zinc_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "hf", "GPT2-Zinc480M-87M", notation="smiles")
+    return _pretrained_transformer_features(
+        mol, "hf", "GPT2-Zinc480M-87M", selected_feature_columns, notation="smiles",
+    )
 
 
 @register_features_generator("MolT5")
 def molt5_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "hf", "MolT5", notation="smiles")
+    return _pretrained_transformer_features(
+        mol, "hf", "MolT5", selected_feature_columns, notation="smiles",
+    )
 
 
 @register_features_generator("ChemBERTa-77M-MTR")
 def chemberta_mtr_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "hf", "ChemBERTa-77M-MTR", notation="smiles")
+    return _pretrained_transformer_features(
+        mol, "hf", "ChemBERTa-77M-MTR", selected_feature_columns, notation="smiles",
+    )
 
 
 @register_features_generator("ChemBERTa-77M-MLM")
 def chemberta_mlm_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "hf", "ChemBERTa-77M-MLM", notation="smiles")
+    return _pretrained_transformer_features(
+        mol, "hf", "ChemBERTa-77M-MLM", selected_feature_columns, notation="smiles",
+    )
 
 
 @register_features_generator("ChemGPT-19M")
 def chemgpt_19m_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "hf", "ChemGPT-19M", notation="selfies")
+    return _pretrained_transformer_features(
+        mol, "hf", "ChemGPT-19M", selected_feature_columns, notation="selfies",
+    )
 
 
 @register_features_generator("ChemGPT-4.7M")
 def chemgpt_47m_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "hf", "ChemGPT-4.7M", notation="selfies")
+    return _pretrained_transformer_features(
+        mol, "hf", "ChemGPT-4.7M", selected_feature_columns, notation="selfies",
+    )
 
 
 @register_features_generator("gin_supervised_masking")
 def gin_masking_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "dgl", "gin_supervised_masking")
+    return _pretrained_transformer_features(
+        mol, "dgl", "gin_supervised_masking", selected_feature_columns,
+    )
 
 
 @register_features_generator("gin_supervised_infomax")
 def gin_infomax_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "dgl", "gin_supervised_infomax")
+    return _pretrained_transformer_features(
+        mol, "dgl", "gin_supervised_infomax", selected_feature_columns,
+    )
 
 
 @register_features_generator("gin_supervised_edgepred")
 def gin_edgepred_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "dgl", "gin_supervised_edgepred")
+    return _pretrained_transformer_features(
+        mol, "dgl", "gin_supervised_edgepred", selected_feature_columns,
+    )
 
 
 @register_features_generator("jtvae_zinc_no_kl")
 def jtvae_zinc_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "dgl", "jtvae_zinc_no_kl")
+    return _pretrained_transformer_features(
+        mol, "dgl", "jtvae_zinc_no_kl", selected_feature_columns,
+    )
 
 
 @register_features_generator("gin_supervised_contextpred")
 def gin_contextpred_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "dgl", "gin_supervised_contextpred")
+    return _pretrained_transformer_features(
+        mol, "dgl", "gin_supervised_contextpred", selected_feature_columns,
+    )
 
 
 @register_features_generator("pcqm4mv2_graphormer_base")
 def graphormer_pcqm4mv2_features_generator(mol: Molecule, selected_feature_columns: list = None) -> np.ndarray:
-    return _pretrained_transformer_features(mol, "graphormer", "pcqm4mv2_graphormer_base")
+    return _pretrained_transformer_features(
+        mol, "graphormer", "pcqm4mv2_graphormer_base", selected_feature_columns,
+    )
 
 
 for _generator, _transformer_type, _kind, _batch_size, _kwargs in (
@@ -1179,12 +1311,15 @@ def clear_features_generator_caches() -> None:
     global _DESCRIPTASTORUS_COLUMNS, _RDKIT_PROPS, _PADEL_COLUMNS
     with _RDKIT_FP_GENERATOR_LOCK:
         _RDKIT_FP_GENERATOR_CACHE.clear()
+    _indexed_feature_selection.cache_clear()
     with _DESCRIPTASTORUS_GENERATOR_LOCK:
         _DESCRIPTASTORUS_GENERATOR_CACHE.clear()
         _DESCRIPTASTORUS_COLUMNS = None
     with _MOLECULAR_DESCRIPTOR_CALCULATOR_LOCK:
         _MOLECULAR_DESCRIPTOR_CALCULATOR_CACHE.clear()
         _RDKIT_PROPS = None
+    _rdkit_208_columns.cache_clear()
+    _native_descriptor_columns.cache_clear()
     with _MOLFEAT_TRANSFORMER_LOCK:
         _MOLFEAT_TRANSFORMER_CACHE.clear()
     with _MAP4_CALCULATOR_LOCK:
@@ -1332,6 +1467,7 @@ def get_features_generator_config(
             "dimensions": 2048,
             "radius": 2,
             "counted": False,
+            "seed": 42,
             "atom_environment_order": "lexicographic",
             "canonicalization": "canonical-nonisomeric-smiles",
             "fragment_policy": "retain-all",
@@ -1341,6 +1477,7 @@ def get_features_generator_config(
             "dimensions": 2048,
             "radius": 2,
             "counted": False,
+            "seed": 75434278,
             "atom_environment_order": "length",
             "canonicalization": "canonical-nonisomeric-smiles",
             "fragment_policy": "retain-all",
@@ -1566,15 +1703,7 @@ def get_features_generator_schema(
             if features_generator_name == "pharm2d"
             else tuple(f"{prefix}_{index}" for index in range(width))
         )
-        if features_generator_name in {
-            "morgan", "morgan_count", "maccs", "rdkit", "avalon",
-            "atompair", "erg", "erg_float",
-        }:
-            # These legacy generators accept the argument for API
-            # compatibility but historically do not select fingerprint bits.
-            names = available
-        else:
-            names = _validate_columns(selected, available)
+        names = _validate_columns(selected, available)
     elif features_generator_name in {
         "rdkit_2d", "rdkit_2d_normalized", "rdkit_2d_wo_fr",
         "rdkit_2d_normalized_wo_fr",
@@ -1613,22 +1742,29 @@ def get_features_generator_schema(
             # The static dimension remains useful in an environment that is
             # only inspecting a manifest produced elsewhere.
             names = tuple(f"feature_{index}" for index in range(length))
+    elif features_generator_name in _PRETRAINED_GENERATOR_NAMES and selected is not None:
+        invalid = [
+            column for column in selected
+            if not column.startswith("embedding_")
+            or not column[len("embedding_"):].isdigit()
+        ]
+        if invalid:
+            raise KeyError(f"Feature columns not found: {invalid}")
+        names = selected
 
     vector_array = None if feature_vector is None else np.asarray(feature_vector)
     if vector_array is not None:
         dimension = int(vector_array.size)
         dtype = str(vector_array.dtype)
     else:
-        dimension = len(names) if names else None
+        dimension = len(names) if names or selected is not None else None
 
     if not names and dimension is not None:
-        prefix = "embedding" if features_generator_name in {
-            "Roberta-Zinc480M-102M", "GPT2-Zinc480M-87M", "MolT5",
-            "ChemBERTa-77M-MTR", "ChemBERTa-77M-MLM", "ChemGPT-19M",
-            "ChemGPT-4.7M", "gin_supervised_masking", "gin_supervised_infomax",
-            "gin_supervised_edgepred", "jtvae_zinc_no_kl",
-            "gin_supervised_contextpred", "pcqm4mv2_graphormer_base",
-        } else "feature"
+        prefix = (
+            "embedding"
+            if features_generator_name in _PRETRAINED_GENERATOR_NAMES
+            else "feature"
+        )
         names = tuple(f"{prefix}_{index}" for index in range(dimension))
     if dimension is not None and len(names) != dimension:
         # This catches dependency-version schema drift before a misleading

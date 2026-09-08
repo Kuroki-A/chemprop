@@ -18,6 +18,7 @@ __all__ = [
     'evaluate_predictions',
     'chemprop_predict',
     'chemprop_fingerprint',
+    'model_fingerprint',
     'make_predictions',
     'load_model',
     'set_features',

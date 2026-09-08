@@ -16,9 +16,7 @@
             <tr>
                 <th style="vertical-align: middle;">{{dataset['dataset_name']}}</th>
                 <th>
-                    <a href="{{ url_for('download_data', dataset=dataset['id']) }}">
-                        <button class="btn btn-default btn-sm">Download</button>
-                    </a>
+                    <a class="btn btn-default btn-sm" href="{{ url_for('download_data', dataset=dataset['id']) }}">Download</a>
                     <form action="{{ url_for('delete_data', dataset=dataset['id']) }}" method="POST" style="display:inline">
                         <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-danger btn-sm">Delete</button>

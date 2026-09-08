@@ -14,4 +14,5 @@ set_root_folder(
     create_folders=False
 )
 
-from chemprop.web.app import views
+# Importing views registers the Flask routes on ``app``.
+from chemprop.web.app import views  # noqa: F401

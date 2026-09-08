@@ -45,10 +45,8 @@ def train(
     debug = logger.debug if logger is not None else print
 
     model.train()
-    if model.is_atom_bond_targets:
-        loss_sum, iter_count = [0]*(len(args.atom_targets) + len(args.bond_targets)), 0
-    else:
-        loss_sum = iter_count = 0
+    loss_sum = 0.0
+    iter_count = 0
 
     for batch in tqdm(data_loader, total=len(data_loader), leave=False):
         # Prepare batch
@@ -158,6 +156,13 @@ def train(
         if model.is_atom_bond_targets:
             loss_multi_task = []
             for target, pred, target_weight, data_weight, mask in zip(targets, preds, target_weights, data_weights, masks):
+                observed_count = mask.sum()
+                if observed_count.item() == 0:
+                    # A task can legitimately have no labels in a shuffled
+                    # mini-batch.  Dividing by zero would poison the whole
+                    # optimization step with NaNs.
+                    continue
+
                 if args.loss_function == "mcc" and args.dataset_type == "classification":
                     loss = loss_func(pred, target, data_weight, mask) * target_weight.squeeze(0)
                 elif args.loss_function == "bounded_mse":
@@ -173,23 +178,45 @@ def train(
                     loss = loss_func(pred, target, quantiles_tensor) * target_weight * data_weight * mask
                 else:
                     raise ValueError(f'Dataset type "{args.dataset_type}" is not supported.')
-                loss = loss.sum() / mask.sum()
+
+                # MCC already reduces over the observed examples.  Dividing
+                # it by the label count made its gradient depend inversely on
+                # batch size, unlike molecule-level MCC training.
+                if args.loss_function != "mcc":
+                    loss = loss.sum() / observed_count
                 loss_multi_task.append(loss)
 
-            loss_sum = [x + y for x, y in zip(loss_sum, loss_multi_task)]
-            iter_count += 1
+            if not loss_multi_task:
+                # Do not update the optimizer or LR schedule from an entirely
+                # unlabeled batch, but still record that its examples were
+                # consumed by this epoch.
+                n_iter += len(batch)
+                continue
 
-            sum(loss_multi_task).backward()
+            loss = sum(loss_multi_task)
+            loss_value = loss.item()
+            if not np.isfinite(loss_value):
+                raise FloatingPointError(
+                    'Training produced a non-finite atom/bond loss. Check '
+                    'targets, features, learning rates, and uncertainty-loss '
+                    'parameters before retrying.'
+                )
+            loss_sum += loss_value
+            iter_count += 1
+            loss.backward()
         else:
             if args.loss_function == "mcc" and args.dataset_type == "classification":
                 loss = loss_func(preds, targets, data_weights, masks) * target_weights.squeeze(0)
+                loss = loss[masks.any(dim=0)]
             elif args.loss_function == "mcc":  # multiclass dataset type
                 targets = targets.long()
                 target_losses = []
                 for target_index in range(preds.size(1)):
+                    if not masks[:, target_index].any():
+                        continue
                     target_loss = loss_func(preds[:, target_index, :], targets[:, target_index], data_weights, masks[:, target_index]).unsqueeze(0)
-                    target_losses.append(target_loss)
-                loss = torch.cat(target_losses) * target_weights.squeeze(0)
+                    target_losses.append(target_loss * target_weights[:, target_index])
+                loss = torch.cat(target_losses) if target_losses else preds.new_empty(0)
             elif args.dataset_type == "multiclass":
                 targets = targets.long()
                 if args.loss_function == "dirichlet":
@@ -213,14 +240,26 @@ def train(
                 loss = loss_func(preds, targets, quantiles_tensor) * target_weights * data_weights * masks
             else:
                 loss = loss_func(preds, targets) * target_weights * data_weights * masks
-
-
             if args.loss_function == "mcc":
+                if loss.numel() == 0:
+                    n_iter += len(batch)
+                    continue
                 loss = loss.mean()
             else:
-                loss = loss.sum() / masks.sum()
+                observed_count = masks.sum()
+                if observed_count.item() == 0:
+                    n_iter += len(batch)
+                    continue
+                loss = loss.sum() / observed_count
 
-            loss_sum += loss.item()
+            loss_value = loss.item()
+            if not np.isfinite(loss_value):
+                raise FloatingPointError(
+                    'Training produced a non-finite loss. Check targets, '
+                    'features, learning rates, and uncertainty-loss parameters '
+                    'before retrying.'
+                )
+            loss_sum += loss_value
             iter_count += 1
 
             loss.backward()
@@ -238,12 +277,9 @@ def train(
             lrs = scheduler.get_lr()
             pnorm = compute_pnorm(model)
             gnorm = compute_gnorm(model)
-            if model.is_atom_bond_targets:
-                loss_avg = sum(loss_sum) / iter_count
-                loss_sum, iter_count = [0]*(len(args.atom_targets) + len(args.bond_targets)), 0
-            else:
-                loss_avg = loss_sum / iter_count
-                loss_sum = iter_count = 0
+            loss_avg = loss_sum / iter_count
+            loss_sum = 0.0
+            iter_count = 0
 
             lrs_str = ", ".join(f"lr_{i} = {lr:.4e}" for i, lr in enumerate(lrs))
             debug(f"Loss = {loss_avg:.4e}, PNorm = {pnorm:.4f}, GNorm = {gnorm:.4f}, {lrs_str}")

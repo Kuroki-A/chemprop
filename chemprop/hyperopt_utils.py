@@ -1,6 +1,9 @@
 from chemprop.args import HyperoptArgs
+from copy import deepcopy
+import fcntl
 import os
 import pickle
+import tempfile
 from typing import List, Dict, Tuple
 import json
 import logging
@@ -37,13 +40,27 @@ def _load_manual_validation_scores(trial_dir: str, trial_args: Dict) -> Tuple[fl
             )
         fold_scores.append(scores[metric])
 
-    average_fold_scores = multitask_mean(
-        scores=np.asarray(fold_scores, dtype=float),
-        metric=metric,
-        axis=1,
-        ignore_nan_metrics=trial_args.get("ignore_nan_metrics", False),
-    )
-    return float(np.mean(average_fold_scores)), float(np.std(average_fold_scores))
+    score_array = np.asarray(fold_scores, dtype=float)
+    if np.any(np.isinf(score_array)):
+        raise ValueError(
+            f'Manual hyperopt trial {trial_dir} produced a non-finite '
+            f'validation {metric} score.'
+        )
+    with np.errstate(divide='ignore', invalid='ignore'):
+        average_fold_scores = multitask_mean(
+            scores=score_array,
+            metric=metric,
+            axis=1,
+            ignore_nan_metrics=trial_args.get("ignore_nan_metrics", False),
+        )
+        mean_score = float(np.mean(average_fold_scores))
+        std_score = float(np.std(average_fold_scores))
+    if not np.isfinite(mean_score) or not np.isfinite(std_score):
+        raise ValueError(
+            f'Manual hyperopt trial {trial_dir} produced a non-finite '
+            f'validation {metric} score.'
+        )
+    return mean_score, std_score
 
 
 def build_search_space(search_parameters: List[str], train_epochs: int = None) -> dict:
@@ -70,10 +87,28 @@ def build_search_space(search_parameters: List[str], train_epochs: int = None) -
         "init_lr_ratio": hp.loguniform("init_lr_ratio", low=np.log(1e-4), high=0.),
         "linked_hidden_size": hp.quniform("linked_hidden_size", low=300, high=2400, q=100),
         "max_lr": hp.loguniform("max_lr", low=np.log(1e-6), high=np.log(1e-2)),
-        "warmup_epochs": hp.quniform("warmup_epochs", low=1, high=train_epochs // 2, q=1)
     }
+    if "warmup_epochs" in search_parameters:
+        if (
+            not isinstance(train_epochs, int)
+            or isinstance(train_epochs, bool)
+            or train_epochs < 0
+        ):
+            raise ValueError(
+                'A non-negative integer train_epochs is required when '
+                'searching warmup_epochs.'
+            )
+        available_spaces["warmup_epochs"] = (
+            hp.choice("warmup_epochs", [0])
+            if train_epochs < 2
+            else hp.quniform(
+                "warmup_epochs", low=1, high=train_epochs // 2, q=1,
+            )
+        )
     space = {}
     for key in search_parameters:
+        if key not in available_spaces:
+            raise ValueError(f'Unsupported hyperparameter search key: {key!r}.')
         space[key] = available_spaces[key]
 
     return space
@@ -141,19 +176,25 @@ def load_trials(dir_path: str, previous_trials: Trials = None) -> Trials:
     """
 
     # List out all the pickle files in the hyperopt checkpoint directory
-    hyperopt_checkpoint_files = [
-        os.path.join(dir_path, path) for path in os.listdir(dir_path) if ".pkl" in path
-    ]
+    hyperopt_checkpoint_files = sorted(
+        os.path.join(dir_path, path)
+        for path in os.listdir(dir_path)
+        if path.endswith(".pkl")
+    )
 
     # Load hyperopt trials object from each file
     loaded_trials = Trials()
     if previous_trials is not None:
-        loaded_trials = merge_trials(loaded_trials, previous_trials.trials)
+        loaded_trials = merge_trials(
+            loaded_trials, deepcopy(previous_trials.trials),
+        )
 
     for path in hyperopt_checkpoint_files:
         with open(path, "rb") as f:
             trial = pickle.load(f)
-            loaded_trials = merge_trials(loaded_trials, trial.trials)
+            loaded_trials = merge_trials(
+                loaded_trials, deepcopy(trial.trials),
+            )
 
     return loaded_trials
 
@@ -173,15 +214,31 @@ def save_trials(
     else:
         info = logger.info
 
+    makedirs(dir_path)
     new_fname = f"{hyperopt_seed}.pkl"
-    existing_files = os.listdir(dir_path)
-    if new_fname in existing_files:
-        info(
-            f"When saving trial with unique seed {hyperopt_seed}, found that a trial with this seed already exists. "
-            "This trial was not saved."
-        )
-    else:
-        pickle.dump(trials, open(os.path.join(dir_path, new_fname), "wb"))
+    target_path = os.path.join(dir_path, new_fname)
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        dir=dir_path, prefix=f'.{hyperopt_seed}-', suffix='.pkl.tmp',
+    )
+    try:
+        with os.fdopen(file_descriptor, "wb") as trial_file:
+            pickle.dump(trials, trial_file)
+            trial_file.flush()
+            os.fsync(trial_file.fileno())
+        try:
+            # A hard link publishes the complete file atomically and, unlike
+            # os.replace, never overwrites a concurrent worker's same-seed
+            # result.
+            os.link(temporary_path, target_path)
+        except FileExistsError:
+            info(
+                f"When saving trial with unique seed {hyperopt_seed}, found "
+                "that a trial with this seed already exists. This trial was "
+                "not saved."
+            )
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 def get_hyperopt_seed(seed: int, dir_path: str) -> int:
@@ -195,24 +252,34 @@ def get_hyperopt_seed(seed: int, dir_path: str) -> int:
 
     seed_path = os.path.join(dir_path, HYPEROPT_SEED_FILE_NAME)
 
-    seeds = []
-    if os.path.exists(seed_path):
-        with open(seed_path, "r") as f:
-            seed_line = next(f)
-            seeds.extend(seed_line.split())
-    else:
-        makedirs(seed_path, isfile=True)
+    makedirs(seed_path, isfile=True)
+    with open(seed_path, "a+", encoding="utf-8") as seed_file:
+        # Hyperopt explicitly supports several processes sharing this
+        # directory. Serialize the read-modify-write operation so two workers
+        # can never reserve the same seed.
+        fcntl.flock(seed_file.fileno(), fcntl.LOCK_EX)
+        try:
+            seed_file.seek(0)
+            seed_tokens = seed_file.read().split()
+            try:
+                seeds = [int(token) for token in seed_tokens]
+            except ValueError as error:
+                raise ValueError(
+                    f'Hyperopt seed file {seed_path} contains a non-integer value.'
+                ) from error
 
-    seeds = [int(sd) for sd in seeds]
+            reserved = set(seeds)
+            while seed in reserved:
+                seed += 1
+            seeds.append(seed)
 
-    while seed in seeds:
-        seed += 1
-    seeds.append(seed)
-
-    write_line = " ".join(map(str, seeds)) + "\n"
-
-    with open(seed_path, "w") as f:
-        f.write(write_line)
+            seed_file.seek(0)
+            seed_file.truncate()
+            seed_file.write(" ".join(map(str, seeds)) + "\n")
+            seed_file.flush()
+            os.fsync(seed_file.fileno())
+        finally:
+            fcntl.flock(seed_file.fileno(), fcntl.LOCK_UN)
 
     return seed
 

@@ -32,13 +32,13 @@
         <li>On the remote server:</li>
         <ol>
             <li>Navigate to the <code>chemprop</code> directory.</li>
-            <li>Activate the conda environment with the <code>chemprop</code> requirements: <code>source activate &lt;environment_name&gt;</code></li>
-            <li>Start the website: <code>python web/run.py</code></li>
+            <li>Activate the maintained environment: <code>conda activate chemprop310-cu124</code></li>
+            <li>Start the website: <code>chemprop_web</code></li>
         </ol>
         <li>On your local machine:</li>
         <ol>
             <li>Set up port-forwarding: <code>ssh -N -L 5000:localhost:5000 &lt;remote_user&gt;@&lt;remote_host&gt;</code></li>
-            <li>Open a web browser and go to <a href="localhost:5000">localhost:5000</a></li>
+            <li>Open a web browser and go to <a href="http://localhost:5000">localhost:5000</a></li>
         </ol>
     </ol>
     {% endif %}

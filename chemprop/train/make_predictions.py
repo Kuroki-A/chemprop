@@ -89,6 +89,36 @@ _FFN_ENSEMBLE_COMPATIBILITY_FIELDS = tuple(dict.fromkeys(
 ))
 
 
+def _validate_prediction_values(
+    values, label: str, expected_rows: int, allow_nan: bool = False
+) -> None:
+    """Validates prediction row counts and rejects invalid numeric output."""
+    try:
+        actual_rows = len(values)
+    except TypeError as error:
+        raise ValueError(f'{label} output must contain one row per valid input.') from error
+    if actual_rows != expected_rows:
+        raise ValueError(
+            f'{label} output row count ({actual_rows}) does not match the '
+            f'number of valid inputs ({expected_rows}).'
+        )
+
+    pending = [values]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, np.ndarray):
+            pending.extend(value.flat)
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
+        else:
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f'{label} output must contain numeric values.') from error
+            if np.isinf(numeric_value) or (np.isnan(numeric_value) and not allow_nan):
+                raise ValueError(f'{label} output contains non-finite values.')
+
+
 def _lgbm_compatibility_signature(train_args: TrainArgs) -> dict:
     """Captures every setting that changes encoder inputs or architecture."""
     return {
@@ -268,6 +298,8 @@ def load_model_lgbm(args: PredictArgs, generator: bool = False):
 
     bundles = [load_checkpoint_lgbm(path, device=args.device) for path in checkpoint_paths]
     bundles.sort(key=lambda bundle: (bundle.model_index, bundle.checkpoint_path))
+    for bundle in bundles:
+        _require_safe_lgbm_representation(bundle)
     first_bundle = bundles[0]
     _validate_ensemble_train_args(
         [bundle.train_args for bundle in bundles],
@@ -453,7 +485,7 @@ def _save_no_valid_ffn_predictions(
         num_uncertainty_tasks = (
             num_prediction_tasks // args.multiclass_num_classes
         )
-    elif args.calibration_method in {"conformal_regression", "conformal"}:
+    elif args.calibration_method == "conformal" and args.dataset_type == "classification":
         num_uncertainty_tasks = 2 * num_prediction_tasks
     else:
         num_uncertainty_tasks = num_prediction_tasks
@@ -477,7 +509,7 @@ def _save_no_valid_ffn_predictions(
         ]
     elif (
         args.calibration_method == "conformal_regression"
-        and args.calibration_path is None
+        and calibrator is None
     ):
         uncertainty_names = []
     elif args.calibration_method == "conformal" and args.dataset_type == "classification":
@@ -605,6 +637,19 @@ def predict_and_save(
         calibrator=calibrator
     )  # preds and unc are lists of shape(data,tasks)
 
+    _validate_prediction_values(
+        preds,
+        label='Prediction',
+        expected_rows=len(test_data),
+        allow_nan=args.dataset_type == 'spectra',
+    )
+    if args.uncertainty_method is not None or calibrator is not None:
+        _validate_prediction_values(
+            unc,
+            label='Uncertainty',
+            expected_rows=len(test_data),
+        )
+
     if args.loss_function == "quantile_interval":
         task_names = task_names[:len(task_names) // 2]
 
@@ -668,8 +713,6 @@ def predict_and_save(
         num_unc_tasks = 1
     elif args.uncertainty_method == "dirichlet" and args.dataset_type == "multiclass":
         num_unc_tasks = num_tasks // args.multiclass_num_classes # dirichlet only returns an uncertainty for each task rather than each class
-    elif args.calibration_method == "conformal_regression":
-        num_unc_tasks = 2 * num_tasks
     elif args.calibration_method == "conformal" and args.dataset_type == "classification":
         num_unc_tasks = 2 * num_tasks
     else:
@@ -678,8 +721,6 @@ def predict_and_save(
     # Save results
     if save_results:
         print(f"Saving predictions to {args.preds_path}")
-        assert len(test_data) == len(preds)
-        assert len(test_data) == len(unc)
 
         makedirs(args.preds_path, isfile=True)
 
@@ -728,7 +769,7 @@ def predict_and_save(
                 unc_names = [estimator.label]
             elif args.uncertainty_method == "conformal_quantile_regression" and args.calibration_method is None:
                 unc_names = [f"{name}_{args.conformal_alpha}_half_interval" for name in task_names]
-            elif args.calibration_method == "conformal_regression" and args.calibration_path is None:
+            elif args.calibration_method == "conformal_regression" and calibrator is None:
                 unc_names = []
             elif args.calibration_method == "conformal" and args.dataset_type == "classification":
                 unc_names = [f"{name}_{estimator.label}_in_set" for name in task_names] + [
@@ -805,6 +846,7 @@ def predict_lgbm(
         raise TypeError(
             "LightGBM prediction requires a versioned Chemprop LightGBM bundle."
         )
+    _require_safe_lgbm_representation(model)
 
     if encoded_features is None:
         _apply_lgbm_feature_scalers(test_data, model.scalers)
@@ -819,6 +861,18 @@ def predict_lgbm(
     if data_scaler is not None:
         predictions = data_scaler.inverse_transform(predictions)
     return np.asarray(predictions, dtype=float)
+
+
+def _require_safe_lgbm_representation(model: LightGBMModelBundle) -> None:
+    """Rejects bundles fitted to an untrained random neural representation."""
+    if not getattr(model.train_args, "features_only", False):
+        raise ValueError(
+            f'LightGBM bundle "{model.checkpoint_path}" was trained without '
+            "--features_only and therefore uses an untrained random MPN "
+            "representation. Prediction is disabled because its model quality "
+            "is unreliable. Retrain with this Chemprop release using, for "
+            "example, --features_generator morgan --features_only."
+        )
 
 
 def _apply_lgbm_feature_scalers(test_data: MoleculeDataset, scalers) -> None:
@@ -878,6 +932,11 @@ def predict_and_save_lgbm(
         raise ValueError("At least one LightGBM bundle is required for prediction.")
     if len(models) != len(scalers):
         raise ValueError("LightGBM model and scaler counts do not match.")
+    if num_models != len(models):
+        raise ValueError(
+            f"num_models={num_models} does not match the {len(models)} "
+            "supplied LightGBM bundles."
+        )
 
     encoded_feature_cache = {}
     test_preds = []
@@ -902,11 +961,17 @@ def predict_and_save_lgbm(
         )
     individual_preds = np.stack(test_preds, axis=2)
     preds = np.mean(individual_preds, axis=2)
+    if preds.shape != (len(test_data), num_tasks):
+        raise ValueError(
+            f'LightGBM prediction shape {preds.shape} does not match expected '
+            f'shape {(len(test_data), num_tasks)}.'
+        )
+    if not np.all(np.isfinite(preds)):
+        raise ValueError('LightGBM prediction output contains non-finite values.')
     
     # Save results
     if save_results:
         print(f"Saving predictions to {args.preds_path}")
-        assert len(test_data) == len(preds)
 
         makedirs(args.preds_path, isfile=True)
 
@@ -1081,6 +1146,26 @@ def make_predictions(
             valid_data=calibration_data,
             input_label="Calibration",
         )
+
+        if len(calibration_data) == 0:
+            raise ValueError(
+                'Calibration data must contain at least one valid molecule.'
+            )
+        calibration_mask = calibration_data.mask()
+        if len(calibration_mask) != len(task_names):
+            raise ValueError(
+                'Calibration target shape does not match the checkpoint task count.'
+            )
+        missing_tasks = [
+            task_names[index] if index < len(task_names) else str(index)
+            for index, task_mask in enumerate(calibration_mask)
+            if not any(task_mask)
+        ]
+        if missing_tasks:
+            raise ValueError(
+                'Calibration data must contain at least one observed target for '
+                f'every task; missing: {", ".join(missing_tasks)}.'
+            )
 
         calibration_data_loader = MoleculeDataLoader(
             dataset=calibration_data,

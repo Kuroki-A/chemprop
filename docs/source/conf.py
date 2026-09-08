@@ -18,11 +18,11 @@ sys.path.insert(0, os.path.abspath('../..'))
 # -- Project information -----------------------------------------------------
 
 project = 'chemprop'
-copyright = '2024, The Chemprop Development Team'
+copyright = '2026, The Chemprop Development Team'
 author = 'The Chemprop Development Team'
 
 # The full version, including alpha/beta/rc tags
-release = '1.7.1+kuroki.1'
+release = '1.7.1+kuroki.2'
 
 
 # -- General configuration ---------------------------------------------------

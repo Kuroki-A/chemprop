@@ -56,34 +56,48 @@ class Args(Tap):
 def aggregate_results(ckpts_dirs: List[str], split_type: str):
     print('Name\tMean\tStd\tNum files')
 
-    ckpts_dirs.sort(key=lambda ckpts_dir: ORDER[os.path.basename(ckpts_dir)])
+    ckpts_dirs = sorted(
+        ckpts_dirs,
+        key=lambda path: (
+            ORDER.get(os.path.basename(os.path.normpath(path)), len(ORDER)),
+            os.path.basename(os.path.normpath(path)),
+        ),
+    )
 
     for ckpts_dir in ckpts_dirs:
-        name = os.path.basename(ckpts_dir)
+        name = os.path.basename(os.path.normpath(ckpts_dir))
 
         # Collect verbose.log files
         paths = []
         for root, _, files in os.walk(ckpts_dir):
-            if f'/{split_type}/' not in root:
+            if split_type not in os.path.normpath(root).split(os.sep):
                 continue
             paths += [os.path.join(root, fname) for fname in files if fname == 'verbose.log']
+        paths.sort()
 
         # Process verbose.log files
         results = []
         invalid = False
         for path in paths:
+            result = None
             with open(path) as rf:
                 for line in rf:
-                    last_line = line
-                # e.g. Overall test rmse = 0.939207 +/- 0.000000
-                try:
-                    last_line = last_line.strip().split('=')[1]
-                    last_line = last_line.split('+')[0]
-                    results.append(float(last_line.strip()))
-                except (IndexError, ValueError):
-                    invalid = True
+                    if 'Overall test ' not in line or '=' not in line:
+                        continue
+                    try:
+                        candidate = float(
+                            line.split('=', 1)[1].split('+/-', 1)[0].strip()
+                        )
+                    except ValueError:
+                        continue
+                    if np.isfinite(candidate):
+                        result = candidate
+            if result is None:
+                invalid = True
+            else:
+                results.append(result)
 
-        if invalid:
+        if invalid or not results:
             mean, std = 'N/A', 'N/A'
         else:
             mean, std = np.mean(results), np.std(results)

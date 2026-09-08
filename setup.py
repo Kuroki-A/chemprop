@@ -20,7 +20,7 @@ class ChempropBuildPy(build_py):
         return modules
 
 
-VERSION = "1.7.1+kuroki.1"
+VERSION = "1.7.1+kuroki.2"
 
 CORE_REQUIREMENTS = [
     "Flask>=3.1.3,<3.2",
@@ -128,7 +128,6 @@ setup(
     python_requires=">=3.10,<3.11",
     classifiers=[
         "Programming Language :: Python :: 3.10",
-        "License :: OSI Approved :: MIT License",
         "Operating System :: POSIX :: Linux",
     ],
     keywords=[

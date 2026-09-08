@@ -11,7 +11,13 @@ from typing_extensions import Literal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-from chemprop.data import get_smiles, MoleculeDatapoint, MoleculeDataset, split_data
+from chemprop.data import (
+    is_valid_datapoint,
+    MoleculeDatapoint,
+    MoleculeDataset,
+    preprocess_smiles_columns,
+    split_data,
+)
 from chemprop.utils import makedirs
 
 
@@ -26,22 +32,34 @@ class Args(Tap):
 
 def run_split_data(args: Args):
     # Load raw data
-    with open(args.data_path) as f:
+    with open(args.data_path, newline='', encoding='utf-8-sig') as f:
         reader = csv.reader(f)
-        header = next(reader)
+        try:
+            header = next(reader)
+        except StopIteration as exc:
+            raise ValueError('Input CSV is empty.') from exc
         lines = list(reader)
 
-    # Load SMILES
-    smiles = get_smiles(path=args.data_path, smiles_columns=args.smiles_columns)
-
-    # Make sure lines and smiles line up
-    assert len(lines) == len(smiles)
-    assert all(s in line for smile, line in zip(smiles, lines) for s in smile)
+    smiles_columns = preprocess_smiles_columns(
+        path=args.data_path,
+        smiles_columns=args.smiles_columns,
+        number_of_molecules=1,
+    )
+    smiles_indices = [header.index(column) for column in smiles_columns]
 
     # Create data
     data = []
-    for smile, line in tqdm(zip(smiles, lines), total=len(smiles)):
+    for row_number, line in enumerate(tqdm(lines), start=2):
+        if any(index >= len(line) for index in smiles_indices):
+            raise ValueError(
+                f'CSV row {row_number} has fewer columns than the header.'
+            )
+        smile = [line[index] for index in smiles_indices]
         datapoint = MoleculeDatapoint(smiles=smile)
+        if not is_valid_datapoint(datapoint):
+            raise ValueError(
+                f'CSV row {row_number} contains an empty or invalid SMILES.'
+            )
         datapoint.line = line
         data.append(datapoint)
     data = MoleculeDataset(data)
@@ -56,7 +74,7 @@ def run_split_data(args: Args):
     makedirs(args.save_dir)
 
     for name, dataset in [('train', train), ('val', val), ('test', test)]:
-        with open(os.path.join(args.save_dir, f'{name}.csv'), 'w') as f:
+        with open(os.path.join(args.save_dir, f'{name}.csv'), 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(header)
             for datapoint in dataset:

@@ -72,8 +72,22 @@ def load_preds_and_targets(preds_dir: str,
         if not (os.path.exists(preds_path) and os.path.exists(targets_path)):
             continue
 
-        preds = np.load(preds_path)
-        targets = np.load(targets_path)
+        preds = np.load(preds_path, allow_pickle=False)
+        targets = np.load(targets_path, allow_pickle=False)
+
+        if preds.ndim < 2 or targets.ndim < 2:
+            raise ValueError(
+                f'Prediction and target arrays must each have at least two '
+                f'dimensions ({preds_path}, {targets_path}).'
+            )
+        if not np.isfinite(preds).all():
+            raise ValueError(f'Predictions contain NaN or infinity: {preds_path}')
+        try:
+            targets = np.asarray(targets, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f'Targets must be numeric: {targets_path}') from exc
+        if np.isinf(targets).any():
+            raise ValueError(f'Targets contain infinity: {targets_path}')
 
         all_preds.append(preds)
         all_targets.append(targets)
@@ -86,7 +100,11 @@ def load_preds_and_targets(preds_dir: str,
 
     all_preds, all_targets = np.concatenate(all_preds, axis=0), np.concatenate(all_targets, axis=0)
 
-    assert all_preds.shape == all_targets.shape
+    if all_preds.shape != all_targets.shape:
+        raise ValueError(
+            f'Prediction shape {all_preds.shape} does not match target shape '
+            f'{all_targets.shape} for {experiment}/{dataset}.'
+        )
 
     return all_preds, all_targets
 
@@ -94,12 +112,26 @@ def load_preds_and_targets(preds_dir: str,
 def compute_values(dataset: str,
                    preds: List[List[List[float]]],
                    targets: List[List[List[float]]]) -> List[float]:
+    if dataset not in DATASETS:
+        raise ValueError(f'Unknown benchmark dataset {dataset!r}.')
+    if len(preds) == 0 or len(preds) != len(targets):
+        raise ValueError(
+            'Prediction and target groups must be non-empty and have equal length.'
+        )
+    if len(preds[0]) == 0 or len(preds[0][0]) == 0:
+        raise ValueError('Prediction groups must contain at least one task.')
     num_tasks = len(preds[0][0])
+
+    def normalize_missing_targets(target):
+        numeric = np.asarray(target, dtype=float)
+        normalized = numeric.astype(object)
+        normalized[np.isnan(numeric)] = None
+        return normalized
 
     values = [
         evaluate_predictions(
             preds=pred,
-            targets=target,
+            targets=normalize_missing_targets(target),
             num_tasks=num_tasks,
             metrics=[DATASETS[dataset]['metric']],
             dataset_type=DATASETS[dataset]['type'],
@@ -108,7 +140,8 @@ def compute_values(dataset: str,
         for pred, target in tqdm(zip(preds, targets), total=len(preds))
     ]
 
-    values = [np.nanmean(value) for value in values]
+    metric = DATASETS[dataset]['metric']
+    values = [np.nanmean(value[metric]) for value in values]
 
     return values
 
@@ -121,6 +154,7 @@ def wilcoxon_significance(preds_dir: str, split_type: str):
 
         # Compute values
         experiment_to_values = {}
+        reference_targets = None
         for experiment in EXPERIMENTS:
             if experiment == 'compare_lsc_scaffold' and split_type != 'scaffold':
                 continue
@@ -130,6 +164,14 @@ def wilcoxon_significance(preds_dir: str, split_type: str):
             if preds is None or targets is None:
                 experiment_to_values[experiment] = None
                 continue
+
+            if reference_targets is None:
+                reference_targets = np.array(targets, copy=True)
+            elif not np.array_equal(targets, reference_targets, equal_nan=True):
+                raise ValueError(
+                    f'Target rows for {dataset}/{experiment} are not aligned '
+                    'with the other experiments.'
+                )
 
             if dataset_type == 'regression':
                 preds, targets = [[pred] for pred in preds], [[target] for target in targets]
@@ -152,13 +194,33 @@ def wilcoxon_significance(preds_dir: str, split_type: str):
                 print('Error', end='\t')
                 continue
 
-            assert len(values_1) == len(values_2)
+            if len(values_1) != len(values_2):
+                raise ValueError(
+                    f'Paired comparison lengths differ for {dataset}: '
+                    f'{len(values_1)} != {len(values_2)}.'
+                )
 
-            # Remove nans
-            values_1, values_2 = zip(*[(v_1, v_2) for v_1, v_2 in zip(values_1, values_2) if not (np.isnan(v_1) or np.isnan(v_2))])
+            # Remove non-finite metric groups while preserving paired order.
+            finite_pairs = [
+                (v_1, v_2)
+                for v_1, v_2 in zip(values_1, values_2)
+                if np.isfinite(v_1) and np.isfinite(v_2)
+            ]
+            if not finite_pairs:
+                print('Error', end='\t')
+                continue
+            values_1, values_2 = zip(*finite_pairs)
 
             # test if error of 1 is less than error of 2
-            print(wilcoxon(values_1, values_2, alternative='less' if dataset_type == 'regression' else 'greater').pvalue, end='\t')
+            if np.array_equal(values_1, values_2):
+                pvalue = 1.0
+            else:
+                pvalue = wilcoxon(
+                    values_1,
+                    values_2,
+                    alternative='less' if dataset_type == 'regression' else 'greater',
+                ).pvalue
+            print(pvalue, end='\t')
         print()
 
 

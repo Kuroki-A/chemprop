@@ -13,6 +13,15 @@ from chemprop.web.app import app
 DB_PATH = 'chemprop.sqlite3'
 
 
+def _is_unique_constraint_error(error: sqlite3.IntegrityError) -> bool:
+    """Returns whether an integrity error is safe to resolve by renaming."""
+    # Python 3.10's sqlite3 exceptions do not expose ``sqlite_errorcode``.
+    # Distinguish the expected name collision from NOT NULL/foreign-key/check
+    # violations so those errors are raised instead of causing an endless
+    # rename loop.
+    return str(error).startswith('UNIQUE constraint failed:')
+
+
 def init_app(app: Flask):
     """Registers database cleanup once and selects this app's database path.
 
@@ -35,10 +44,10 @@ def init_db():
     This will wipe existing tables and the corresponding files.
     """
     shutil.rmtree(app.config['DATA_FOLDER'])
-    os.makedirs(app.config['DATA_FOLDER'])
+    os.makedirs(app.config['DATA_FOLDER'], mode=0o700)
 
     shutil.rmtree(app.config['CHECKPOINT_FOLDER'])
-    os.makedirs(app.config['CHECKPOINT_FOLDER'])
+    os.makedirs(app.config['CHECKPOINT_FOLDER'], mode=0o700)
 
     db = get_db()
 
@@ -121,7 +130,9 @@ def insert_user(username: str) -> Tuple[int, str]:
         try:
             cur = db.execute('INSERT INTO user (username) VALUES (?)', [temp_name])
             new_user_id = cur.lastrowid
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as error:
+            if not _is_unique_constraint_error(error):
+                raise
             count += 1
 
     db.commit()
@@ -189,7 +200,9 @@ def insert_ckpt(ckpt_name: str,
                              'VALUES (?, ?, ?, ?, ?, ?)',
                              [temp_name, associated_user, model_class, num_epochs, ensemble_size, training_size])
             new_ckpt_id = cur.lastrowid
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as error:
+            if not _is_unique_constraint_error(error):
+                raise
             count += 1
             continue
 
@@ -302,7 +315,9 @@ def insert_dataset(dataset_name: str,
             cur = db.execute('INSERT INTO dataset (dataset_name, associated_user, class) VALUES (?, ?, ?)',
                              [temp_name, associated_user, dataset_class])
             new_dataset_id = cur.lastrowid
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as error:
+            if not _is_unique_constraint_error(error):
+                raise
             count += 1
             continue
 

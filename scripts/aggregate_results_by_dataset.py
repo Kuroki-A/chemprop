@@ -1,6 +1,7 @@
 import os
 from typing_extensions import Literal
 
+import numpy as np
 from tap import Tap  # pip install typed-argument-parser (https://github.com/swansonk14/typed-argument-parser)
 
 EXPERIMENTS = [
@@ -39,20 +40,26 @@ def aggregate_results_by_dataset(dataset: str, ckpt_dir: str, split_type: str):
         paths = []
         for root, _, files in os.walk(exp_dir):
             paths += [os.path.join(root, fname) for fname in files if fname == 'verbose.log']
+        paths.sort()
 
         for path in paths:
+            result = None
             with open(path) as rf:
-                # Get last line
                 for line in rf:
-                    last_line = line
-
-                # e.g. Overall test rmse = 0.939207 +/- 0.000000
-                try:
-                    last_line = last_line.strip().split('=')[1]
-                    last_line = last_line.split('+')[0]
-                    results[experiment].append(float(last_line.strip()))
-                except (IndexError, ValueError):
-                    print(f'Invalid path "{path}"')
+                    if 'Overall test ' not in line or '=' not in line:
+                        continue
+                    try:
+                        candidate = float(
+                            line.split('=', 1)[1].split('+/-', 1)[0].strip()
+                        )
+                    except ValueError:
+                        continue
+                    if np.isfinite(candidate):
+                        result = candidate
+            if result is None:
+                print(f'Invalid path "{path}"')
+            else:
+                results[experiment].append(result)
 
     # Print results
     print('\t'.join(EXPERIMENTS))

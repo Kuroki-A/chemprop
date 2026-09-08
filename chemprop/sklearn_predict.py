@@ -33,6 +33,8 @@ def predict_sklearn(args: SklearnPredictArgs) -> None:
                  loading data, loading a trained scikit-learn model, and making predictions with the model.
     """
     print('Loading training arguments')
+    if not args.checkpoint_paths:
+        raise ValueError('At least one sklearn checkpoint is required for prediction.')
     bundles = [load_sklearn_checkpoint(path) for path in args.checkpoint_paths]
     reference_args = bundles[0].train_args
     compatibility_fields = (

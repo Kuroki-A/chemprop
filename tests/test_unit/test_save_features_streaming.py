@@ -8,7 +8,7 @@ from chemprop.features import load_features
 from scripts import save_features as save_features_script
 
 
-def _schema(_name, feature_vector=None):
+def _schema(_name, feature_vector=None, selected_feature_columns=None):
     dtype = str(np.asarray(feature_vector).dtype) if feature_vector is not None else 'float32'
     return {
         'schema_version': 1,
@@ -32,6 +32,7 @@ def _args(tmp_path, row_count, save_frequency=17):
         data_path=str(data_path),
         smiles_column='smiles',
         features_generator='streaming_test',
+        selected_features_path=None,
         save_path=str(tmp_path / 'features.npz'),
         save_frequency=save_frequency,
         restart=False,
@@ -113,6 +114,60 @@ def test_explicit_worker_count_can_override_a_pseudo_batch_generator():
     assert save_features_script._prefer_requested_process_pool(args, generator)
     args.sequential = True
     assert not save_features_script._prefer_requested_process_pool(args, generator)
+
+
+def test_resume_without_identity_manifest_is_rejected(tmp_path, monkeypatch):
+    args = _args(tmp_path, row_count=2, save_frequency=1)
+    _install_generator(monkeypatch)
+    temp_dir = tmp_path / 'features.npz_temp'
+    temp_dir.mkdir()
+    save_features_script._atomic_save_feature_chunk(
+        str(temp_dir / '0.npz'),
+        [np.asarray([999], dtype=np.float32)],
+    )
+
+    with pytest.raises(ValueError, match='Cannot safely resume.*without.*manifest'):
+        save_features_script.generate_and_save_features(args)
+
+
+@pytest.mark.parametrize(
+    ('sequential', 'num_workers'),
+    [(True, None), (False, 2)],
+    ids=['sequential', 'process-pool'],
+)
+def test_save_features_applies_selected_fixed_fingerprint_columns(
+    tmp_path, sequential, num_workers,
+):
+    data_path = tmp_path / 'selected.csv'
+    data_path.write_text('smiles\nCCO\nCC\n')
+    selected_path = tmp_path / 'selected_features.csv'
+    selected_path.write_text('morgan\nbit_17\nbit_3\nbit_17\n')
+    args = SimpleNamespace(
+        data_path=str(data_path),
+        smiles_column='smiles',
+        features_generator='morgan',
+        selected_features_path=str(selected_path),
+        save_path=str(tmp_path / 'selected_features.npz'),
+        save_frequency=10,
+        restart=False,
+        sequential=sequential,
+        num_workers=num_workers,
+        chunksize=1,
+        batch_size=None,
+    )
+
+    save_features_script.generate_and_save_features(args)
+
+    values = load_features(args.save_path)
+    assert values.shape == (2, 3)
+    assert values[:, 0].tolist() == values[:, 2].tolist()
+    manifest = json.loads(
+        (tmp_path / 'selected_features.npz.manifest.json').read_text()
+    )
+    assert manifest['feature_names'] == ['bit_17', 'bit_3', 'bit_17']
+    assert manifest['generator_config']['selected_feature_columns'] == [
+        'bit_17', 'bit_3', 'bit_17',
+    ]
 
 
 def test_streaming_resume_adopts_atomic_chunk_newer_than_manifest(

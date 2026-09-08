@@ -6,12 +6,12 @@ import io
 import ipaddress
 import os
 import secrets
-import sys
 import shutil
 from tempfile import TemporaryDirectory, NamedTemporaryFile
 from typing import Callable, List, Tuple
 import multiprocessing as mp
 import zipfile
+from urllib.parse import urlsplit
 
 from flask import abort, json, jsonify, redirect, render_template, request, send_file, send_from_directory, session, url_for
 import numpy as np
@@ -19,8 +19,6 @@ from rdkit import Chem
 from werkzeug.utils import secure_filename
 
 from chemprop.web.app import app, db
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 
 from chemprop.args import PredictArgs, TrainArgs
 from chemprop.constants import MODEL_FILE_NAME, TRAIN_LOGGER_NAME
@@ -31,6 +29,8 @@ from chemprop.utils import create_logger, load_task_names, load_args
 TRAINING = 0
 PROGRESS = mp.Value('d', 0.0)
 SAFE_RETURN_PAGES = {'home', 'train', 'predict', 'data', 'checkpoints'}
+SAFE_REFERRER_PATHS = {'/', '/train', '/predict', '/data', '/checkpoints', '/create_user'}
+MAX_RESOURCE_NAME_LENGTH = 255
 
 
 def current_user_id() -> int:
@@ -63,6 +63,37 @@ def csrf_token() -> str:
 
 
 app.jinja_env.globals['csrf_token'] = csrf_token
+
+
+def _validated_resource_name(field_name: str) -> str:
+    """Returns a bounded, non-empty name from a submitted form."""
+    value = request.form.get(field_name, '').strip()
+    if not value or len(value) > MAX_RESOURCE_NAME_LENGTH or not value.isprintable():
+        abort(
+            400,
+            description=(
+                f'{field_name} must contain 1 to {MAX_RESOURCE_NAME_LENGTH} '
+                'printable characters.'
+            ),
+        )
+    return value
+
+
+def _apply_gpu_selection(args, gpu: str) -> None:
+    """Validates a web GPU selection before applying it to Chemprop args."""
+    if gpu is None:
+        return
+    if gpu == 'None':
+        args.cuda = False
+        return
+
+    try:
+        gpu_id = int(gpu)
+    except (TypeError, ValueError):
+        abort(400, description='Invalid GPU selection.')
+    if gpu_id not in app.config['GPUS']:
+        abort(400, description='The selected GPU is not available.')
+    args.gpu = gpu_id
 
 
 @app.context_processor
@@ -118,6 +149,9 @@ def add_security_headers(response):
     response.headers.setdefault('X-Frame-Options', 'DENY')
     response.headers.setdefault('Referrer-Policy', 'no-referrer')
     response.headers.setdefault('Permissions-Policy', 'camera=(), geolocation=(), microphone=()')
+    if request.endpoint != 'static':
+        response.headers.setdefault('Cache-Control', 'no-store')
+        response.headers.setdefault('Pragma', 'no-cache')
     # Remote mode is contractually served through HTTPS. The backend request
     # may still be plain HTTP after TLS termination, so preserve HSTS there
     # without trusting spoofable forwarded-proto headers.
@@ -134,7 +168,10 @@ def _safe_checkpoint_paths_from_zip(zip_path: str, destination: str) -> List[str
     total_size = 0
 
     with zipfile.ZipFile(zip_path, mode='r') as archive:
-        members = [member for member in archive.infolist() if not member.is_dir()]
+        archive_members = archive.infolist()
+        if len(archive_members) > max_files:
+            raise ValueError(f'Checkpoint archive contains more than {max_files} entries.')
+        members = [member for member in archive_members if not member.is_dir()]
         if len(members) > max_files:
             raise ValueError(f'Checkpoint archive contains more than {max_files} files.')
 
@@ -229,7 +266,7 @@ def name_already_exists_message(thing_being_named: str, original_name: str, new_
     :param new_name: The new name of the object.
     :return: A string with a message about the changed name.
     """
-    return f'{thing_being_named} "{original_name} already exists. ' \
+    return f'{thing_being_named} "{original_name}" already exists. ' \
            f'Saving to "{new_name}".'
 
 
@@ -242,8 +279,20 @@ def get_upload_warnings_errors(upload_item: str) -> Tuple[List[str], List[str]]:
     """
     warnings_raw = request.args.get(f'{upload_item}_upload_warnings')
     errors_raw = request.args.get(f'{upload_item}_upload_errors')
-    warnings = json.loads(warnings_raw) if warnings_raw is not None else None
-    errors = json.loads(errors_raw) if errors_raw is not None else None
+    def decode_messages(raw):
+        if raw is None:
+            return None
+        try:
+            messages = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(messages, list):
+            return None
+        messages = [message for message in messages if isinstance(message, str)]
+        return messages[:100] or None
+
+    warnings = decode_messages(warnings_raw)
+    errors = decode_messages(errors_raw)
 
     return warnings, errors
 
@@ -296,7 +345,8 @@ def select_user():
     if user_id not in db.get_all_users():
         abort(404)
     session['current_user_id'] = user_id
-    return redirect(request.referrer or url_for('home'))
+    referrer_path = urlsplit(request.referrer or '').path
+    return redirect(referrer_path if referrer_path in SAFE_REFERRER_PATHS else url_for('home'))
 
 
 @app.route('/create_user', methods=['GET', 'POST'])
@@ -309,10 +359,7 @@ def create_user():
     if request.method == 'GET':
         return render_template('create_user.html', users=db.get_all_users())
 
-    new_name = request.form['newUserName']
-
-    if new_name is not None:
-        db.insert_user(new_name)
+    db.insert_user(_validated_resource_name('newUserName'))
 
     return redirect(url_for('create_user'))
 
@@ -343,19 +390,23 @@ def train():
         return render_train()
 
     # Get arguments
-    data_name, epochs, ensemble_size, checkpoint_name = \
-        request.form['dataName'], int(request.form['epochs']), \
-        int(request.form['ensembleSize']), request.form['checkpointName']
     try:
-        data_name = int(data_name)
-    except (TypeError, ValueError):
+        data_name = int(request.form['dataName'])
+        epochs = int(request.form['epochs'])
+        ensemble_size = int(request.form['ensembleSize'])
+    except (KeyError, TypeError, ValueError):
         abort(400)
+    if epochs < 1 or ensemble_size < 1:
+        abort(400, description='Epochs and ensemble size must be positive integers.')
+    checkpoint_name = _validated_resource_name('checkpointName')
     gpu = request.form.get('gpu')
     dataset_row = db.get_dataset(data_name, user_id=current_user_id())
     if dataset_row is None:
         abort(404)
     data_path = os.path.join(app.config['DATA_FOLDER'], f'{data_name}.csv')
     dataset_type = request.form.get('datasetType', 'regression')
+    if dataset_type not in {'classification', 'regression'}:
+        abort(400, description='Unsupported dataset type.')
     use_progress_bar = request.form.get('useProgressBar', 'True') == 'True'
 
     # Create and modify args
@@ -386,20 +437,9 @@ def train():
 
         return render_train(warnings=warnings, errors=errors)
 
-    if gpu is not None:
-        if gpu == 'None':
-            args.cuda = False
-        else:
-            args.gpu = int(gpu)
+    _apply_gpu_selection(args, gpu)
 
     current_user = current_user_id()
-
-    ckpt_id, ckpt_name = db.insert_ckpt(checkpoint_name,
-                                        current_user,
-                                        args.dataset_type,
-                                        args.epochs,
-                                        args.ensemble_size,
-                                        len(targets))
 
     with TemporaryDirectory() as temp_dir:
         args.save_dir = temp_dir
@@ -429,17 +469,33 @@ def train():
                 TRAINING = 0
                 PROGRESS = mp.Value('d', 0.0)
 
+        model_paths = sorted(
+            os.path.join(root, filename)
+            for root, _, files in os.walk(args.save_dir)
+            for filename in files
+            if filename.endswith('.pt')
+        )
+        if not model_paths:
+            raise RuntimeError('Training completed without producing a model checkpoint.')
+
+        # Only create database records after training succeeds. This avoids
+        # leaving an empty checkpoint behind when training raises an error.
+        ckpt_id, ckpt_name = db.insert_ckpt(checkpoint_name,
+                                            current_user,
+                                            args.dataset_type,
+                                            args.epochs,
+                                            args.ensemble_size,
+                                            len(targets))
+
         # Check if name overlap
         if checkpoint_name != ckpt_name:
             warnings.append(name_already_exists_message('Checkpoint', checkpoint_name, ckpt_name))
 
         # Move models
-        for root, _, files in os.walk(args.save_dir):
-            for fname in files:
-                if fname.endswith('.pt'):
-                    model_id = db.insert_model(ckpt_id)
-                    save_path = os.path.join(app.config['CHECKPOINT_FOLDER'], f'{model_id}.pt')
-                    shutil.move(os.path.join(args.save_dir, root, fname), save_path)
+        for model_path in model_paths:
+            model_id = db.insert_model(ckpt_id)
+            save_path = os.path.join(app.config['CHECKPOINT_FOLDER'], f'{model_id}.pt')
+            shutil.move(model_path, save_path)
 
     return render_train(trained=True,
                         metric=args.metric,
@@ -477,23 +533,30 @@ def predict():
     except (TypeError, ValueError):
         abort(400)
 
-    if request.form['textSmiles'] != '':
-        smiles = request.form['textSmiles'].split()
-    elif request.form['drawSmiles'] != '':
-        smiles = [request.form['drawSmiles']]
+    predictions_path = _predictions_path()
+    if os.path.isfile(predictions_path):
+        os.remove(predictions_path)
+
+    text_smiles = request.form.get('textSmiles', '').strip()
+    draw_smiles = request.form.get('drawSmiles', '').strip()
+    if text_smiles:
+        smiles = text_smiles.split()
+    elif draw_smiles:
+        smiles = [draw_smiles]
     else:
         # Upload data file with SMILES
-        data = request.files['data']
-        data_name = secure_filename(data.filename)
-        data_path = os.path.join(app.config['TEMP_FOLDER'], data_name)
-        data.save(data_path)
+        data = request.files.get('data')
+        if data is None or not secure_filename(data.filename or ''):
+            return render_predict(errors=['No SMILES strings given'])
+        with NamedTemporaryFile(suffix='.csv') as temp_file:
+            data.save(temp_file.name)
+            header = get_header(temp_file.name)
+            possible_smiles = header[0] if header else None
+            smiles = [possible_smiles] if possible_smiles and Chem.MolFromSmiles(possible_smiles) is not None else []
+            smiles.extend(get_smiles(temp_file.name))
 
-        # Check if header is smiles
-        possible_smiles = get_header(data_path)[0]
-        smiles = [possible_smiles] if Chem.MolFromSmiles(possible_smiles) is not None else []
-
-        # Get remaining smiles
-        smiles.extend(get_smiles(data_path))
+    if not smiles:
+        return render_predict(errors=['No SMILES strings given'])
 
     smiles = [[s] for s in smiles]
 
@@ -520,16 +583,41 @@ def predict():
         if gpu == 'None':
             arguments.append('--no_cuda')
         else:
-            arguments += ['--gpu', gpu]
+            try:
+                gpu_id = int(gpu)
+            except (TypeError, ValueError):
+                abort(400, description='Invalid GPU selection.')
+            if gpu_id not in app.config['GPUS']:
+                abort(400, description='The selected GPU is not available.')
+            arguments += ['--gpu', str(gpu_id)]
 
-    # Handle additional features
+    # The legacy Web form cannot collect row-aligned external molecular,
+    # phase, atom, bond, or constraint files. Guessing a generated descriptor
+    # here previously produced dimension errors or, worse, plausible-looking
+    # predictions from the wrong features. Direct these models to the CLI.
     if train_args.features_path is not None:
-        # TODO: make it possible to specify the features generator if trained using features_path
-        arguments += [
-            '--features_generator', 'rdkit_2d_normalized',
-            '--no_features_scaling'
-        ]
-    elif train_args.features_generator is not None:
+        return render_predict(errors=[
+            'This checkpoint requires external molecular features. '
+            'Use chemprop_predict with the matching --features_path file.'
+        ])
+    unsupported_external_inputs = (
+        'phase_features_path',
+        'atom_descriptors_path',
+        'bond_descriptors_path',
+        'constraints_path',
+    )
+    if any(getattr(train_args, field, None) is not None for field in unsupported_external_inputs):
+        return render_predict(errors=[
+            'This checkpoint requires external row-aligned inputs that the Web interface '
+            'cannot collect. Use chemprop_predict with the matching input files.'
+        ])
+    if getattr(train_args, 'number_of_molecules', 1) != 1:
+        return render_predict(errors=[
+            'The Web interface supports only one molecule column per prediction. '
+            'Use chemprop_predict for multi-molecule checkpoints.'
+        ])
+
+    if train_args.features_generator is not None:
         arguments += ['--features_generator', *train_args.features_generator]
 
         if not train_args.features_scaling:
@@ -541,7 +629,10 @@ def predict():
     # Run predictions
     preds = make_predictions(args=args, smiles=smiles, return_uncertainty=False)
 
-    if all(p is None for p in preds):
+    if not preds:
+        return render_predict(errors=['No SMILES strings given'])
+    invalid_smiles_count = sum(pred is None for pred in preds)
+    if invalid_smiles_count == len(preds):
         return render_predict(errors=['All SMILES are invalid'])
 
     # Replace invalid smiles with message
@@ -555,8 +646,8 @@ def predict():
                           task_names=task_names,
                           num_tasks=len(task_names),
                           preds=preds,
-                          warnings=["List contains invalid SMILES strings"] if None in preds else None,
-                          errors=["No SMILES strings given"] if len(preds) == 0 else None)
+                          warnings=["List contains invalid SMILES strings"] if invalid_smiles_count else None,
+                          errors=None)
 
 
 @app.route('/download_predictions')
@@ -609,7 +700,7 @@ def upload_data(return_page: str):
         if len(dataset_errors) > 0:
             errors.extend(dataset_errors)
         else:
-            dataset_name = request.form['datasetName']
+            dataset_name = _validated_resource_name('datasetName')
             # dataset_class = load_args(ckpt).dataset_type  # TODO: SWITCH TO ACTUALLY FINDING THE CLASS
 
             dataset_id, new_dataset_name = db.insert_dataset(dataset_name, current_user, 'UNKNOWN')
@@ -688,7 +779,7 @@ def upload_checkpoint(return_page: str):
 
     ckpt = request.files['checkpoint']
 
-    ckpt_name = request.form['checkpointName']
+    ckpt_name = _validated_resource_name('checkpointName')
     ckpt_ext = os.path.splitext(secure_filename(ckpt.filename))[1].lower()
 
     # Collect paths to all uploaded checkpoints (and unzip if necessary)
@@ -709,6 +800,8 @@ def upload_checkpoint(return_page: str):
             ckpt_paths = _safe_checkpoint_paths_from_zip(zip_path, ckpt_dir)
         except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
             errors.append(str(error))
+        if not ckpt_paths and not errors:
+            errors.append('Uploaded checkpoint archive does not contain any .pt files.')
 
     else:
         errors.append(f'Uploaded checkpoint(s) file must be either .pt or .zip but got {ckpt_ext}')

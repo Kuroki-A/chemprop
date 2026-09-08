@@ -155,23 +155,92 @@ class NoamLR(_LRScheduler):
                 f"len(final_lr)= {len(final_lr)}"
             )
 
+        if (
+            not isinstance(steps_per_epoch, (int, np.integer))
+            or isinstance(steps_per_epoch, (bool, np.bool_))
+            or steps_per_epoch < 1
+        ):
+            raise ValueError('steps_per_epoch must be a positive integer.')
+        if any(
+            not isinstance(epoch, (int, np.integer))
+            or isinstance(epoch, (bool, np.bool_))
+            or epoch < 0
+            for epoch in total_epochs
+        ):
+            raise ValueError('total_epochs values must be non-negative integers.')
+
+        numeric_types = (int, float, np.integer, np.floating)
+        if any(
+            not isinstance(value, numeric_types)
+            or isinstance(value, (bool, np.bool_))
+            for values in (warmup_epochs, init_lr, max_lr, final_lr)
+            for value in values
+        ):
+            raise ValueError('Warmup epochs and learning rates must be numeric scalars.')
+        try:
+            warmup_epochs_array = np.asarray(warmup_epochs, dtype=float)
+            init_lr_array = np.asarray(init_lr, dtype=float)
+            max_lr_array = np.asarray(max_lr, dtype=float)
+            final_lr_array = np.asarray(final_lr, dtype=float)
+        except (TypeError, ValueError) as error:
+            raise ValueError('Warmup epochs and learning rates must be numeric.') from error
+        expected_shape = (len(optimizer.param_groups),)
+        if any(
+            values.shape != expected_shape
+            for values in (warmup_epochs_array, init_lr_array, max_lr_array, final_lr_array)
+        ):
+            raise ValueError('Warmup epochs and learning rates must be one-dimensional.')
+        if not np.all(np.isfinite(warmup_epochs_array)) or np.any(warmup_epochs_array < 0):
+            raise ValueError('warmup_epochs values must be finite and non-negative.')
+        total_epochs_array = np.asarray(total_epochs, dtype=int)
+        for name, values in (
+            ('init_lr', init_lr_array),
+            ('max_lr', max_lr_array),
+            ('final_lr', final_lr_array),
+        ):
+            if not np.all(np.isfinite(values)) or np.any(values <= 0):
+                raise ValueError(f'{name} values must be finite and positive.')
+        if np.any(max_lr_array < init_lr_array) or np.any(max_lr_array < final_lr_array):
+            raise ValueError('max_lr values must be greater than or equal to init_lr and final_lr.')
+
         self.num_lrs = len(optimizer.param_groups)
 
         self.optimizer = optimizer
-        self.warmup_epochs = np.array(warmup_epochs)
-        self.total_epochs = np.array(total_epochs)
-        self.steps_per_epoch = steps_per_epoch
-        self.init_lr = np.array(init_lr)
-        self.max_lr = np.array(max_lr)
-        self.final_lr = np.array(final_lr)
+        self.warmup_epochs = warmup_epochs_array
+        self.total_epochs = total_epochs_array
+        self.steps_per_epoch = int(steps_per_epoch)
+        self.init_lr = init_lr_array
+        self.max_lr = max_lr_array
+        self.final_lr = final_lr_array
 
         self.current_step = 0
-        self.lr = init_lr
-        self.warmup_steps = (self.warmup_epochs * self.steps_per_epoch).astype(int)
+        self.lr = self.init_lr.copy()
+        requested_warmup_steps = (self.warmup_epochs * self.steps_per_epoch).astype(int)
         self.total_steps = self.total_epochs * self.steps_per_epoch
-        self.linear_increment = (self.max_lr - self.init_lr) / self.warmup_steps
+        # A zero-epoch schedule is retained for Chemprop v1's evaluation-only
+        # mode. warmup=0 begins directly with exponential decay. Clipping and
+        # masked division keep both boundary cases finite and warning-free.
+        self.warmup_steps = np.minimum(requested_warmup_steps, self.total_steps)
+        self.linear_increment = np.zeros(self.num_lrs, dtype=float)
+        np.divide(
+            self.max_lr - self.init_lr,
+            self.warmup_steps,
+            out=self.linear_increment,
+            where=self.warmup_steps > 0,
+        )
 
-        self.exponential_gamma = (self.final_lr / self.max_lr) ** (1 / (self.total_steps - self.warmup_steps))
+        decay_steps = self.total_steps - self.warmup_steps
+        inverse_decay_steps = np.zeros(self.num_lrs, dtype=float)
+        np.divide(
+            1.0,
+            decay_steps,
+            out=inverse_decay_steps,
+            where=decay_steps > 0,
+        )
+        self.exponential_gamma = np.power(
+            self.final_lr / self.max_lr,
+            inverse_decay_steps,
+        )
 
         super(NoamLR, self).__init__(optimizer)
 
@@ -191,6 +260,12 @@ class NoamLR(_LRScheduler):
                              If None, :code:`current_step = self.current_step + 1`.
         """
         if current_step is not None:
+            if (
+                not isinstance(current_step, (int, np.integer))
+                or isinstance(current_step, (bool, np.bool_))
+                or current_step < 0
+            ):
+                raise ValueError('current_step must be a non-negative integer.')
             self.current_step = current_step
         else:
             self.current_step += 1

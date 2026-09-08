@@ -209,3 +209,48 @@ def test_calibration_schema_validation_accepts_empty_or_all_invalid(smiles):
         calibration_data,
         input_label="Calibration",
     )
+
+
+def test_prediction_output_validation_rejects_bad_rows_and_nonfinite_values():
+    validate = make_predictions_module._validate_prediction_values
+
+    with pytest.raises(ValueError, match="row count"):
+        validate([[1.0]], "Prediction", expected_rows=2)
+    with pytest.raises(ValueError, match="non-finite"):
+        validate([[np.nan]], "Prediction", expected_rows=1)
+    with pytest.raises(ValueError, match="non-finite"):
+        validate([[np.inf]], "Prediction", expected_rows=1, allow_nan=True)
+
+    validate([[np.nan]], "Spectrum", expected_rows=1, allow_nan=True)
+
+
+def test_empty_conformal_regression_has_one_uncertainty_per_task(tmp_path):
+    args = SimpleNamespace(
+        loss_function="mse",
+        dataset_type="regression",
+        uncertainty_method="conformal_regression",
+        calibration_method="conformal_regression",
+        conformal_alpha=0.1,
+        drop_extra_columns=False,
+        individual_ensemble_predictions=False,
+        smiles_columns=["smiles"],
+        checkpoint_paths=["model.pt"],
+        preds_path=str(tmp_path / "predictions.csv"),
+    )
+    datapoint = SimpleNamespace(
+        row=OrderedDict([("smiles", "invalid")]),
+        smiles=["invalid"],
+    )
+
+    predictions, uncertainties = (
+        make_predictions_module._save_no_valid_ffn_predictions(
+            args=args,
+            full_data=[datapoint],
+            task_names=["a", "b"],
+            calibrator=SimpleNamespace(label="conformal_interval"),
+            return_invalid_smiles=True,
+        )
+    )
+
+    assert predictions == [["Invalid SMILES", "Invalid SMILES"]]
+    assert uncertainties == [["Invalid SMILES", "Invalid SMILES"]]

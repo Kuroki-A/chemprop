@@ -13,11 +13,15 @@ from chemprop.sklearn_predict import predict_sklearn
 from chemprop.sklearn_train import (
     SklearnModelBundle,
     _build_sklearn_model,
+    _fit_single_task_models,
     impute_sklearn,
     load_sklearn_checkpoint,
     predict,
     run_sklearn,
 )
+
+
+DATA_PATH = Path(__file__).parents[1] / 'data' / 'regression.csv'
 
 
 def _molecule_dataset(rows):
@@ -27,6 +31,37 @@ def _molecule_dataset(rows):
             for smiles, targets in rows
         ]
     )
+
+
+@pytest.mark.parametrize(
+    ('option', 'value', 'message'),
+    [
+        ('--radius', '-1', 'radius'),
+        ('--num_bits', '0', 'num_bits'),
+        ('--num_trees', '0', 'num_trees'),
+    ],
+)
+def test_sklearn_train_rejects_invalid_estimator_sizes(option, value, message):
+    with pytest.raises(ValueError, match=message):
+        SklearnTrainArgs().parse_args([
+            '--data_path', str(DATA_PATH),
+            '--dataset_type', 'regression',
+            '--model_type', 'random_forest',
+            option, value,
+        ])
+
+
+def test_sklearn_predict_validates_common_sizes(tmp_path):
+    test_path = tmp_path / 'test.csv'
+    test_path.write_text('smiles\nCC\n', encoding='utf-8')
+
+    with pytest.raises(ValueError, match='number_of_molecules'):
+        SklearnPredictArgs().parse_args([
+            '--test_path', str(test_path),
+            '--preds_path', str(tmp_path / 'preds.csv'),
+            '--checkpoint_path', str(tmp_path / 'model.pkl'),
+            '--number_of_molecules', '0',
+        ])
 
 
 def test_classification_estimators_return_positive_class_probabilities():
@@ -103,6 +138,59 @@ def test_svm_single_task_imputation_uses_probability_predictions():
 
     assert imputed[-1][0] in {0, 1}
     assert all(row[0] is not None for row in imputed)
+
+
+def test_single_task_svm_supports_multitask_data_and_uses_row_weights(
+    monkeypatch,
+):
+    features = np.asarray(
+        [[-3.0], [-2.0], [-1.0], [1.0], [2.0], [3.0]]
+    )
+    data = MoleculeDataset(
+        [
+            MoleculeDatapoint(
+                smiles=["C"],
+                features=row_features,
+                targets=[index / 2, None if index == 1 else index / 3],
+                data_weight=float(index + 1),
+            )
+            for index, row_features in enumerate(features)
+        ]
+    )
+    args = SimpleNamespace(
+        dataset_type="regression",
+        model_type="svm",
+        task_names=["first", "second"],
+        seed=3,
+        num_trees=4,
+        class_weight=None,
+    )
+
+    observed_weights = []
+    original_fit = __import__("sklearn.svm", fromlist=["SVR"]).SVR.fit
+
+    def capture_fit(estimator, fit_features, fit_targets, **kwargs):
+        observed_weights.append(np.asarray(kwargs["sample_weight"]))
+        return original_fit(estimator, fit_features, fit_targets, **kwargs)
+
+    monkeypatch.setattr("sklearn.svm.SVR.fit", capture_fit)
+    models = _fit_single_task_models(_build_sklearn_model(args), data, args)
+
+    assert len(models) == 2
+    np.testing.assert_array_equal(observed_weights[0], [1, 2, 3, 4, 5, 6])
+    np.testing.assert_array_equal(observed_weights[1], [1, 3, 4, 5, 6])
+    assert np.asarray(
+        predict(
+            SklearnModelBundle(
+                models=models,
+                train_args={"task_names": args.task_names},
+                single_task=True,
+            ),
+            "svm",
+            "regression",
+            features,
+        )
+    ).shape == (len(features), 2)
 
 
 def test_legacy_uncalibrated_svm_checkpoint_is_rejected():

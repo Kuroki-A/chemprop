@@ -1,3 +1,5 @@
+import math
+from numbers import Integral, Real
 from typing import List, Tuple, Optional
 
 import torch
@@ -38,6 +40,9 @@ class MultiReadout(nn.Module):
         :param weights_ffn_num_layers: Number of layers in FFN for determining weights used to correct the constrained targets.
         """
         super().__init__()
+
+        atom_constraints = [] if atom_constraints is None else list(atom_constraints)
+        bond_constraints = [] if bond_constraints is None else list(bond_constraints)
 
         if num_layers > 1 and shared_ffn:
             self.atom_ffn_base = nn.Sequential(
@@ -126,6 +131,16 @@ class MultiReadout(nn.Module):
         :param bond_types_batch: A list of PyTorch tensors storing bond types of each bond determined by RDKit molecules.
         :return: The output of the :class:`MultiReadout`, a list of PyTorch tensors which contains atomic/bond properties prediction.
         """
+        if len(constraints_batch) != len(self.ffn_list):
+            raise ValueError(
+                f'Expected constraints for {len(self.ffn_list)} atom/bond tasks but '
+                f'received {len(constraints_batch)}.'
+            )
+        if len(bond_types_batch) != len(self.ffn_list):
+            raise ValueError(
+                f'Expected bond-type inputs for {len(self.ffn_list)} atom/bond '
+                f'tasks but received {len(bond_types_batch)}.'
+            )
         results = []
         for i, ffn in enumerate(self.ffn_list):
             if isinstance(ffn, FFNAtten):
@@ -164,9 +179,25 @@ class FFN(nn.Module):
         """
         super().__init__()
 
+        for name, value in (
+            ('features_size', features_size),
+            ('hidden_size', hidden_size),
+            ('output_size', output_size),
+            ('num_layers', num_layers),
+        ):
+            if not isinstance(value, Integral) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f'{name} must be a positive integer; got {value!r}.')
+        if not isinstance(dropout, Real) or isinstance(dropout, bool) \
+                or not math.isfinite(dropout) or not 0 <= dropout < 1:
+            raise ValueError(
+                f'dropout must be finite and in the interval [0, 1); got {dropout!r}.'
+            )
+        if ffn_type not in {'atom', 'bond'}:
+            raise ValueError(f'ffn_type must be "atom" or "bond"; got {ffn_type!r}.')
+
         base_output_size = features_size if num_layers == 1 else hidden_size
 
-        if ffn_base:
+        if ffn_base is not None:
             self.ffn = ffn_base
         else:
             if num_layers > 1:
@@ -328,19 +359,48 @@ class FFNAtten(FFN):
         if self.ffn_type == "bond" and bond_types is not None:
             output = output + bond_types.reshape(-1, 1)
 
+        if len(scope) != len(constraints):
+            raise ValueError(
+                f'Expected {len(scope)} constraint values but received '
+                f'{len(constraints)}.'
+            )
+        expected_start = 1 if self.ffn_type == 'atom' else 0
+        for start, size in scope:
+            if start != expected_start or size < 0:
+                raise ValueError('Atom/bond scopes must be contiguous and non-negative.')
+            expected_start += size
+        expected_output_length = expected_start
+        if expected_output_length != len(output):
+            raise ValueError(
+                'Atom/bond scope sizes do not match the readout tensor length.'
+            )
+
         W_a = self.weights_readout(input)
         constrained_output = []
         for i, (start, size) in enumerate(scope):
+            Q = constraints[i]
+            if Q is None:
+                raise ValueError('A constrained atom/bond task is missing its constraint.')
+            if not torch.is_tensor(Q):
+                Q = torch.as_tensor(Q, dtype=output.dtype, device=output.device)
+            if not torch.isfinite(Q).all():
+                raise ValueError('Atom/bond constraints contain NaN or infinity.')
             if size == 0:
+                if not torch.allclose(Q, torch.zeros_like(Q)):
+                    raise ValueError(
+                        'A molecule with no atoms/bonds cannot satisfy a non-zero constraint.'
+                    )
                 continue
             else:
                 q_i = output[start:start+size]
                 w_i = W_a[start:start+size].softmax(0)
-                Q = constraints[i]
                 q_f = q_i + w_i * (Q - q_i.sum())
                 constrained_output.append(q_f)
 
-        output = torch.cat(constrained_output, dim=0)
+        if constrained_output:
+            output = torch.cat(constrained_output, dim=0)
+        else:
+            output = output[:0]
 
         return output
 
@@ -394,6 +454,22 @@ def build_ffn(
     :param dataset_type: Type of dataset.
     :param spectra_activation: Activation function used in dataset_type spectra training to constrain outputs to be positive.
     """
+    dimensions = {
+        'first_linear_dim': first_linear_dim,
+        'hidden_size': hidden_size,
+        'output_size': output_size,
+    }
+    for name, value in dimensions.items():
+        if not isinstance(value, Integral) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f'{name} must be a positive integer; got {value!r}.')
+    if not isinstance(num_layers, Integral) or isinstance(num_layers, bool) or num_layers <= 0:
+        raise ValueError(f'num_layers must be a positive integer; got {num_layers!r}.')
+    if not isinstance(dropout, Real) or isinstance(dropout, bool) \
+            or not math.isfinite(dropout) or not 0 <= dropout < 1:
+        raise ValueError(
+            f'dropout must be finite and in the interval [0, 1); got {dropout!r}.'
+        )
+
     activation = get_activation_function(activation)
 
     if num_layers == 1:
@@ -420,6 +496,10 @@ def build_ffn(
 
     # If spectra model, also include spectra activation
     if dataset_type == "spectra":
+        if spectra_activation not in {'softplus', 'exp'}:
+            raise ValueError(
+                'spectra_activation must be "softplus" or "exp" for spectra datasets.'
+            )
         spectra_activation = nn.Softplus() if spectra_activation == "softplus" else Exp()
         layers.append(spectra_activation)
 

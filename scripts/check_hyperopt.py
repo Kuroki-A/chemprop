@@ -13,16 +13,27 @@ class Args(Tap):
 
 
 def main(ckpts_dirs: List[str], split_type: str, num_folds: int):
+    if num_folds <= 0:
+        raise ValueError('num_folds must be positive.')
     for ckpts_dir in ckpts_dirs:
         # Find all config.json files
         fnames = []
         for root, _, files in os.walk(ckpts_dir):
-            if split_type not in root:
+            if split_type not in os.path.normpath(root).split(os.sep):
                 continue
             fnames += [os.path.join(root, fname) for fname in files if fname == 'config.json']
 
         # Print out complete and incomplete
-        complete = {int(os.path.basename(os.path.dirname(fname))) for fname in fnames}
+        complete = set()
+        for fname in fnames:
+            directory = os.path.basename(os.path.dirname(fname))
+            try:
+                fold = int(directory)
+            except ValueError:
+                print(f'Ignoring config outside a numeric fold directory: {fname}')
+                continue
+            if 0 <= fold < num_folds:
+                complete.add(fold)
         incomplete = set(range(num_folds)) - complete
 
         print(os.path.basename(ckpts_dir))

@@ -41,7 +41,8 @@ def find_similar_mols(test_smiles: List[str],
                       distance_measure: str,
                       model: MoleculeModel = None,
                       num_neighbors: int = None,
-                      batch_size: int = 50) -> List[OrderedDict]:
+                      batch_size: int = 50,
+                      num_workers: int = 0) -> List[OrderedDict]:
     """
     For each test molecule, finds the N most similar training molecules according to some distance measure.
 
@@ -54,6 +55,35 @@ def find_similar_mols(test_smiles: List[str],
     :return: A list of OrderedDicts containing the test smiles, the num_neighbors nearest training smiles,
     and other relevant distance info.
     """
+    if not test_smiles or not train_smiles:
+        raise ValueError('Test and training SMILES collections must both be non-empty.')
+    if distance_measure not in {'embedding', 'morgan', 'tanimoto'}:
+        raise ValueError(f'Distance measure {distance_measure!r} is not supported.')
+    def invalid_smiles(smiles_values):
+        invalid = []
+        for smiles in smiles_values:
+            mol = Chem.MolFromSmiles(smiles) if smiles else None
+            if mol is None or mol.GetNumHeavyAtoms() == 0:
+                invalid.append(smiles)
+        return invalid
+
+    invalid_test = invalid_smiles(test_smiles)
+    invalid_train = invalid_smiles(train_smiles)
+    if invalid_test or invalid_train:
+        raise ValueError(
+            'All SMILES must be valid so neighbor rows remain aligned with the '
+            f'input files (invalid test={len(invalid_test)}, train={len(invalid_train)}).'
+        )
+    if num_neighbors is None:
+        num_neighbors = 5
+    if not isinstance(num_neighbors, int) or isinstance(num_neighbors, bool) or num_neighbors <= 0:
+        raise ValueError('num_neighbors must be a positive integer.')
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
+        raise ValueError('batch_size must be a positive integer.')
+    if not isinstance(num_workers, int) or isinstance(num_workers, bool) or num_workers < 0:
+        raise ValueError('num_workers must be a non-negative integer.')
+    num_neighbors = min(num_neighbors, len(train_smiles))
+
     test_data = get_data_from_smiles(smiles=[[smiles] for smiles in test_smiles])
     train_data = get_data_from_smiles(smiles=[[smiles] for smiles in train_smiles])
     train_smiles_set = set(train_smiles)
@@ -62,17 +92,20 @@ def find_similar_mols(test_smiles: List[str],
     test_data_loader = MoleculeDataLoader(
         dataset=test_data,
         batch_size=batch_size,
-        num_workers=args.num_workers
+        num_workers=num_workers
     )
     train_data_loader = MoleculeDataLoader(
         dataset=train_data,
         batch_size=batch_size,
-        num_workers=args.num_workers
+        num_workers=num_workers
     )
 
     print(f'Computing {distance_measure} vectors')
     if distance_measure == 'embedding':
-        assert model is not None
+        if model is None:
+            raise ValueError(
+                'A trained model is required when distance_measure="embedding".'
+            )
         test_vecs = np.array(model_fingerprint(model=model, data_loader=test_data_loader, fingerprint_type='last_FFN'))
         train_vecs = np.array(model_fingerprint(model=model, data_loader=train_data_loader, fingerprint_type='last_FFN'))
         metric = 'cosine'
@@ -100,6 +133,16 @@ def find_similar_mols(test_smiles: List[str],
     if distance_measure in ('embedding', 'morgan'):
         print('Computing distances')
         distances = cdist(test_vecs, train_vecs, metric=metric)
+    if distances.shape != (len(test_smiles), len(train_smiles)):
+        raise ValueError(
+            f'Distance matrix has shape {distances.shape}; expected '
+            f'{(len(test_smiles), len(train_smiles))}.'
+        )
+    if not np.isfinite(distances).all():
+        raise ValueError(
+            'Distance computation produced NaN or infinity. For embedding '
+            'distance, this can indicate an all-zero model embedding.'
+        )
 
     print('Finding neighbors')
     neighbors = []
@@ -125,9 +168,10 @@ def find_similar_mols_from_file(test_path: str,
                                 train_path: str,
                                 distance_measure: str,
                                 checkpoint_path: str = None,
-                                num_neighbors: int = -1,
+                                num_neighbors: int = 5,
                                 batch_size: int = 50,
-                                smiles_column: str = None) -> List[OrderedDict]:
+                                smiles_column: str = None,
+                                num_workers: int = 0) -> List[OrderedDict]:
     """
     For each test molecule, finds the N most similar training molecules according to some distance measure.
     Loads molecules and model from file.
@@ -144,6 +188,17 @@ def find_similar_mols_from_file(test_path: str,
     print('Loading data')
     test_smiles, train_smiles = get_smiles(test_path, flatten=True, smiles_columns=smiles_column), get_smiles(train_path, flatten=True, smiles_columns=smiles_column)
 
+    if distance_measure not in {'embedding', 'morgan', 'tanimoto'}:
+        raise ValueError(f'Distance measure {distance_measure!r} is not supported.')
+    if distance_measure == 'embedding' and checkpoint_path is None:
+        raise ValueError(
+            'checkpoint_path is required when distance_measure="embedding".'
+        )
+    if distance_measure != 'embedding' and checkpoint_path is not None:
+        raise ValueError(
+            'checkpoint_path is only used when distance_measure="embedding".'
+        )
+
     if checkpoint_path is not None:
         print('Loading model')
         model = load_checkpoint(checkpoint_path)
@@ -156,7 +211,8 @@ def find_similar_mols_from_file(test_path: str,
         distance_measure=distance_measure,
         model=model,
         num_neighbors=num_neighbors,
-        batch_size=batch_size
+        batch_size=batch_size,
+        num_workers=num_workers,
     )
 
 
@@ -167,7 +223,8 @@ def save_similar_mols(test_path: str,
                       checkpoint_path: str = None,
                       num_neighbors: int = None,
                       batch_size: int = 50,
-                      smiles_column: str = None):
+                      smiles_column: str = None,
+                      num_workers: int = 0):
     """
     For each test molecule, finds the N most similar training molecules according to some distance measure.
     Loads molecules and model from file and saves results to file.
@@ -192,6 +249,7 @@ def save_similar_mols(test_path: str,
         num_neighbors=num_neighbors,
         batch_size=batch_size,
         smiles_column=smiles_column,
+        num_workers=num_workers,
     )
 
     # Save results
@@ -216,4 +274,5 @@ if __name__ == '__main__':
         num_neighbors=args.num_neighbors,
         batch_size=args.batch_size,
         smiles_column=args.smiles_column,
+        num_workers=args.num_workers,
     )

@@ -31,12 +31,34 @@ class ChempropModel:
         validate_checkpoint_ensemble(checkpoint_train_args)
         self.train_args = checkpoint_train_args[0]
 
-        # If features were used during training, they must be used when predicting
-        if ((self.train_args.features_path is not None or self.train_args.features_generator is not None)
-                and args.features_generator is None):
+        # Arbitrary external rows cannot be recomputed for the changing
+        # substructures explored by MCTS. Pretending that a same-width
+        # generator is equivalent would silently change the trained schema.
+        if self.train_args.features_path is not None:
+            raise ValueError(
+                'Interpretation is not supported for checkpoints trained with '
+                '--features_path because external features cannot be generated '
+                'for MCTS substructures. Retrain with a deterministic '
+                '--features_generator if interpretation is required.'
+            )
+
+        # If generated features were used during training, they must be used
+        # again for every dynamically constructed substructure.
+        if self.train_args.features_generator is not None and args.features_generator is None:
             raise ValueError('Features were used during training so they must be specified again during prediction '
                              'using the same type of features as before (with --features_generator <generator> '
                              'and using --no_features_scaling if applicable).')
+
+        task_names = getattr(self.train_args, 'task_names', None)
+        property_id = getattr(args, 'property_id', 1)
+        if (
+            task_names is not None
+            and not 1 <= property_id <= len(task_names)
+        ):
+            raise ValueError(
+                f'property_id must be between 1 and {len(task_names)} for this '
+                f'checkpoint; received {property_id}.'
+            )
 
         if self.train_args.atom_descriptors_size > 0 or self.train_args.atom_features_size > 0 or self.train_args.bond_descriptors_size > 0 or self.train_args.bond_features_size > 0:
             raise NotImplementedError('The interpret function does not yet work with additional atom or bond features')
@@ -58,18 +80,29 @@ class ChempropModel:
         :param batch_size: The batch size.
         :return: A list of lists of floats containing the predicted values.
         """
-        test_data = get_data_from_smiles(
+        full_data = get_data_from_smiles(
             smiles=smiles,
             skip_invalid_smiles=False,
             features_generator=self.args.features_generator,
             selected_features_path=self.args.selected_features_path,
         )
-        valid_indices = [i for i in range(len(test_data)) if is_valid_datapoint(test_data[i])]
-        valid_data = MoleculeDataset([test_data[i] for i in valid_indices])
+        valid_indices = [
+            i for i in range(len(full_data)) if is_valid_datapoint(full_data[i])
+        ]
+        valid_data = MoleculeDataset([full_data[i] for i in valid_indices])
         validate_checkpoint_feature_schema(
-            self.args, self.train_args, test_data, valid_data,
+            self.args, self.train_args, full_data, valid_data,
         )
         test_data = valid_data
+
+        if not valid_indices:
+            num_tasks = len(getattr(self.train_args, 'task_names', []) or [])
+            if num_tasks == 0:
+                raise ValueError(
+                    'The checkpoint does not record its task count, so empty '
+                    'or entirely invalid interpretation input cannot be shaped.'
+                )
+            return np.full((len(full_data), num_tasks), np.nan)
 
         sum_preds = []
         for model, checkpoint_scalers in zip(
@@ -98,10 +131,27 @@ class ChempropModel:
             sum_preds.append(np.array(model_preds))
 
         # Ensemble predictions
-        sum_preds = sum(sum_preds)
-        avg_preds = sum_preds / len(self.checkpoints)
+        prediction_shapes = {predictions.shape for predictions in sum_preds}
+        if len(prediction_shapes) != 1:
+            raise ValueError(
+                'Interpretation ensemble members returned incompatible '
+                f'prediction shapes: {sorted(prediction_shapes)}.'
+            )
+        avg_preds = np.sum(sum_preds, axis=0) / len(self.checkpoints)
+        if not np.all(np.isfinite(avg_preds)):
+            raise ValueError(
+                'The interpretation model produced a non-finite prediction for '
+                'a valid molecule.'
+            )
 
-        return avg_preds
+        # Preserve the caller's row order. The old implementation silently
+        # removed invalid rows, which shifted every subsequent prediction.
+        full_preds = np.full(
+            (len(full_data),) + avg_preds.shape[1:], np.nan, dtype=float,
+        )
+        full_preds[valid_indices] = avg_preds
+
+        return full_preds
 
 
 class MCTSNode:

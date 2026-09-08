@@ -2,7 +2,7 @@ import json
 import os
 from tempfile import TemporaryDirectory
 import pickle
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union, get_args, get_origin
 from typing_extensions import Literal
 from packaging import version
 from warnings import warn
@@ -18,6 +18,58 @@ from chemprop.features import get_available_features_generators
 
 Metric = Literal['auc', 'prc-auc', 'rmse', 'mae', 'mse', 'r2', 'accuracy', 'cross_entropy', 'binary_cross_entropy', 'sid', 'wasserstein', 'f1', 'mcc', 'bounded_rmse', 'bounded_mae', 'bounded_mse',
                 'recall', 'precision','balanced_accuracy']
+
+
+def _is_finite_number(value) -> bool:
+    """Returns whether ``value`` is a finite, non-boolean real scalar."""
+    return (
+        isinstance(value, (int, float, np.integer, np.floating))
+        and not isinstance(value, (bool, np.bool_))
+        and bool(np.isfinite(value))
+    )
+
+
+def _config_value_matches_annotation(value, annotation) -> bool:
+    """Checks JSON values against the CLI annotation which Tap normally enforces.
+
+    ``config_path`` values are assigned after command-line parsing, so they do
+    not pass through argparse's type and ``choices`` checks.  This deliberately
+    implements only the JSON-representable annotations used by these argument
+    classes; an unknown annotation is left for the argument's semantic
+    validation rather than being guessed here.
+    """
+    origin = get_origin(annotation)
+    annotation_args = get_args(annotation)
+
+    if origin is Literal:
+        return value in annotation_args
+    if origin in (list, List):
+        return isinstance(value, list) and (
+            not annotation_args
+            or all(_config_value_matches_annotation(item, annotation_args[0]) for item in value)
+        )
+    if origin in (dict, Dict):
+        if not isinstance(value, dict):
+            return False
+        if len(annotation_args) != 2:
+            return True
+        key_type, value_type = annotation_args
+        return all(
+            _config_value_matches_annotation(key, key_type)
+            and _config_value_matches_annotation(item, value_type)
+            for key, item in value.items()
+        )
+    if origin is Union:
+        return any(_config_value_matches_annotation(value, option) for option in annotation_args)
+    if annotation is bool:
+        return isinstance(value, bool)
+    if annotation is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if annotation is float:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if annotation is str:
+        return isinstance(value, str)
+    return True
 
 
 def get_checkpoint_paths(checkpoint_path: Optional[str] = None,
@@ -41,18 +93,33 @@ def get_checkpoint_paths(checkpoint_path: Optional[str] = None,
     if sum(var is not None for var in [checkpoint_dir, checkpoint_path, checkpoint_paths]) > 1:
         raise ValueError('Can only specify one of checkpoint_dir, checkpoint_path, and checkpoint_paths')
 
+    expected_extension = ext.lower()
+
+    def validate_extensions(paths: List[str]) -> List[str]:
+        invalid_paths = [
+            path
+            for path in paths
+            if os.path.splitext(os.fspath(path))[1].lower() != expected_extension
+        ]
+        if invalid_paths:
+            raise ValueError(
+                f'Expected checkpoint files with extension "{ext}", but received: '
+                + ', '.join(map(os.fspath, invalid_paths))
+            )
+        return paths
+
     if checkpoint_path is not None:
-        return [checkpoint_path]
+        return validate_extensions([checkpoint_path])
 
     if checkpoint_paths is not None:
-        return checkpoint_paths
+        return validate_extensions(checkpoint_paths)
 
     if checkpoint_dir is not None:
         checkpoint_paths = []
 
         for root, _, files in os.walk(checkpoint_dir):
             for fname in files:
-                if fname.endswith(ext):
+                if os.path.splitext(fname)[1].lower() == expected_extension:
                     checkpoint_paths.append(os.path.join(root, fname))
 
         if len(checkpoint_paths) == 0:
@@ -227,7 +294,34 @@ class CommonArgs(Tap):
         self.add_argument('--gpu', choices=list(range(torch.cuda.device_count())))
         self.add_argument('--features_generator', choices=get_available_features_generators())
 
+    def _validate_common_numeric_args(self) -> None:
+        """Validates sizes shared by data loading, training, and prediction."""
+        for name, value, minimum in (
+            ('batch_size', self.batch_size, 1),
+            ('num_workers', self.num_workers, 0),
+            ('number_of_molecules', self.number_of_molecules, 1),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f'{name} must be an integer of at least {minimum}.')
+        if (
+            self.max_data_size is not None
+            and (
+                not isinstance(self.max_data_size, int)
+                or isinstance(self.max_data_size, bool)
+                or self.max_data_size < 1
+            )
+        ):
+            raise ValueError('max_data_size must be None or a positive integer.')
+        if self.gpu is not None and (
+            not isinstance(self.gpu, int)
+            or isinstance(self.gpu, bool)
+            or self.gpu not in range(torch.cuda.device_count())
+        ):
+            raise ValueError('gpu must identify an available CUDA device.')
+
     def process_args(self) -> None:
+        self._validate_common_numeric_args()
+
         # LightGBM bundles use ``.pkl`` while neural-network checkpoints use
         # ``.pt``. Infer the model type when the supplied source is
         # unambiguous, so prediction from a LightGBM checkpoint directory does
@@ -247,6 +341,12 @@ class CommonArgs(Tap):
                         for filename in files
                         if os.path.splitext(filename)[1].lower() in {'.pt', '.pkl'}
                     )
+            if checkpoint_extensions == {'.pt', '.pkl'}:
+                raise ValueError(
+                    'Checkpoint sources mix FFN .pt files and LightGBM .pkl '
+                    'bundles. Specify a directory or explicit path list '
+                    'containing only one model type.'
+                )
             if checkpoint_extensions == {'.pkl'}:
                 self.model_type = 'lgbm'
 
@@ -578,6 +678,10 @@ class TrainArgs(CommonArgs):
 
     def __init__(self, *args, **kwargs) -> None:
         super(TrainArgs, self).__init__(*args, **kwargs)
+        # The annotated class default is a mutable list. Keep programmatic
+        # changes to one training job from leaking into later args instances.
+        self.extra_metrics = []
+        self._temp_save_dir = None
         self._task_names = None
         self._crossval_index_sets = None
         self._task_names = None
@@ -716,10 +820,161 @@ class TrainArgs(CommonArgs):
     def bond_constraints(self, bond_constraints: List[bool]) -> None:
         self._bond_constraints = bond_constraints
 
+    def _load_config_overrides(self) -> None:
+        """Loads validated JSON overrides before deriving any argument state."""
+        if self.config_path is None:
+            return
+
+        original_config_path = self.config_path
+        with open(original_config_path, encoding='utf-8') as config_file:
+            config = json.load(config_file)
+        if not isinstance(config, dict):
+            raise ValueError('config_path must contain a JSON object of argument overrides.')
+
+        annotations = {}
+        # Start with base classes so a subclass annotation wins if a name is
+        # deliberately redefined.
+        for cls in reversed(type(self).mro()):
+            annotations.update(getattr(cls, '__annotations__', {}))
+        allowed_keys = set(annotations)
+        forbidden_keys = {
+            key for key in config
+            if (
+                not isinstance(key, str)
+                or key.startswith('_')
+                or key == 'config_path'
+                or key not in allowed_keys
+            )
+        }
+        if forbidden_keys:
+            raise ValueError(
+                'Unknown or unsafe config key(s): '
+                f'{", ".join(sorted(map(str, forbidden_keys)))}.'
+            )
+
+        available_generators = set(get_available_features_generators())
+        for key, value in config.items():
+            class_default = getattr(type(self), key, object())
+            if value is None:
+                if class_default is not None:
+                    raise ValueError(f'Config value for "{key}" cannot be null.')
+            elif not _config_value_matches_annotation(value, annotations[key]):
+                raise ValueError(
+                    f'Invalid config value for "{key}": expected {annotations[key]!r}, '
+                    f'received {value!r}.'
+                )
+            if key == 'features_generator' and value is not None:
+                unknown_generators = sorted(set(value) - available_generators)
+                if unknown_generators:
+                    raise ValueError(
+                        'Unknown feature generator(s) in config: '
+                        f'{", ".join(unknown_generators)}.'
+                    )
+            setattr(self, key, value)
+
+    def _validate_training_numeric_args(self) -> None:
+        """Rejects numeric settings which would fail or degenerate at runtime."""
+        ffn_hidden_size = self.hidden_size if self.ffn_hidden_size is None else self.ffn_hidden_size
+        for name, value in (
+            ('hidden_size', self.hidden_size),
+            ('depth', self.depth),
+            ('hidden_size_solvent', self.hidden_size_solvent),
+            ('depth_solvent', self.depth_solvent),
+            ('ffn_hidden_size', ffn_hidden_size),
+            ('ffn_num_layers', self.ffn_num_layers),
+            ('weights_ffn_num_layers', self.weights_ffn_num_layers),
+            ('log_frequency', self.log_frequency),
+            ('num_folds', self.num_folds),
+        ):
+            if not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_)) or value < 1:
+                raise ValueError(f'{name} must be a positive integer.')
+
+        for name, value in (
+            ('epochs', self.epochs),
+            ('early_stopping', self.early_stopping),
+            ('frzn_ffn_layers', self.frzn_ffn_layers),
+        ):
+            if not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_)) or value < 0:
+                raise ValueError(f'{name} must be a non-negative integer.')
+
+        for name, value in (('seed', self.seed), ('pytorch_seed', self.pytorch_seed)):
+            if not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_)):
+                raise ValueError(f'{name} must be an integer.')
+
+        if (
+            not isinstance(self.multiclass_num_classes, (int, np.integer))
+            or isinstance(self.multiclass_num_classes, (bool, np.bool_))
+            or self.multiclass_num_classes < 2
+        ):
+            raise ValueError('multiclass_num_classes must be an integer of at least 2.')
+
+        if not _is_finite_number(self.dropout) or not 0 <= self.dropout < 1:
+            raise ValueError('dropout must be finite and in the range [0, 1).')
+        if not _is_finite_number(self.aggregation_norm) or self.aggregation_norm <= 0:
+            raise ValueError('aggregation_norm must be finite and greater than 0.')
+        if not _is_finite_number(self.warmup_epochs) or self.warmup_epochs < 0:
+            raise ValueError('warmup_epochs must be finite and non-negative.')
+
+        for name, value in (
+            ('init_lr', self.init_lr),
+            ('max_lr', self.max_lr),
+            ('final_lr', self.final_lr),
+        ):
+            if not _is_finite_number(value) or value <= 0:
+                raise ValueError(f'{name} must be finite and greater than 0.')
+        if self.max_lr < self.init_lr or self.max_lr < self.final_lr:
+            raise ValueError('max_lr must be greater than or equal to init_lr and final_lr.')
+
+        if self.grad_clip is not None and (
+            not _is_finite_number(self.grad_clip) or self.grad_clip <= 0
+        ):
+            raise ValueError('grad_clip must be None or a finite number greater than 0.')
+        if (
+            not _is_finite_number(self.cache_cutoff)
+            and self.cache_cutoff != float('inf')
+        ) or self.cache_cutoff < 0:
+            raise ValueError('cache_cutoff must be a non-negative finite number or positive infinity.')
+        if (
+            not _is_finite_number(self.evidential_regularization)
+            or self.evidential_regularization < 0
+        ):
+            raise ValueError('evidential_regularization must be finite and non-negative.')
+        if (
+            not _is_finite_number(self.quantile_loss_alpha)
+            or not 0 <= self.quantile_loss_alpha <= 0.5
+        ):
+            raise ValueError('quantile_loss_alpha must be finite and in the range [0, 0.5].')
+
+        if (
+            not isinstance(self.split_key_molecule, (int, np.integer))
+            or isinstance(self.split_key_molecule, (bool, np.bool_))
+            or self.split_key_molecule < 0
+        ):
+            raise ValueError('split_key_molecule must be a non-negative integer.')
+        for name, value in (
+            ('val_fold_index', self.val_fold_index),
+            ('test_fold_index', self.test_fold_index),
+        ):
+            if value is not None and (
+                not isinstance(value, (int, np.integer))
+                or isinstance(value, (bool, np.bool_))
+                or value < 0
+            ):
+                raise ValueError(f'{name} must be None or a non-negative integer.')
+
     def process_args(self) -> None:
+        # Config values must be applied before CommonArgs resolves checkpoint
+        # paths, validates feature combinations, or changes global caches, and
+        # before SMILES columns are derived from the selected data file.
+        self._load_config_overrides()
         super(TrainArgs, self).process_args()
 
-        global temp_save_dir  # Prevents the temporary directory from being deleted upon function return
+        self._validate_training_numeric_args()
+        if self.test and not self.checkpoint_paths:
+            raise ValueError(
+                '--test skips optimization and therefore requires an existing '
+                '--checkpoint_path, --checkpoint_paths, or --checkpoint_dir.'
+            )
 
         # Adapt the number of molecules for reaction_solvent mode
         if self.reaction_solvent is True and self.number_of_molecules != 2:
@@ -731,13 +986,6 @@ class TrainArgs(CommonArgs):
             smiles_columns=self.smiles_columns,
             number_of_molecules=self.number_of_molecules,
         )
-
-        # Load config file
-        if self.config_path is not None:
-            with open(self.config_path) as f:
-                config = json.load(f)
-                for key, value in config.items():
-                    setattr(self, key, value)
 
         # Determine the target_columns when training atomic and bond targets
         if self.is_atom_bond_targets:
@@ -777,8 +1025,8 @@ class TrainArgs(CommonArgs):
 
         # Create temporary directory as save directory if not provided
         if self.save_dir is None:
-            temp_save_dir = TemporaryDirectory()
-            self.save_dir = temp_save_dir.name
+            self._temp_save_dir = TemporaryDirectory()
+            self.save_dir = self._temp_save_dir.name
 
         # Fix ensemble size if loading checkpoints
         if self.checkpoint_paths is not None and len(self.checkpoint_paths) > 0:
@@ -813,7 +1061,7 @@ class TrainArgs(CommonArgs):
                 raise ValueError(f'Metric "{metric}" invalid for dataset type "{self.dataset_type}".')
 
             if metric == "quantile" and self.loss_function != "quantile_interval":
-                raise ValueError(f'Metric quantile is only compatible with quantile_interval loss.')
+                raise ValueError('Metric quantile is only compatible with quantile_interval loss.')
 
         if self.loss_function is None:
             if self.dataset_type == 'classification':
@@ -829,6 +1077,19 @@ class TrainArgs(CommonArgs):
 
         if self.loss_function != 'bounded_mse' and any(metric in ['bounded_mse', 'bounded_rmse', 'bounded_mae'] for metric in self.metrics):
             raise ValueError('Bounded metrics can only be used in conjunction with the regression loss function bounded_mse.')
+
+        if self.dataset_type == 'spectra' and (
+            not np.isfinite(self.spectra_target_floor)
+            or self.spectra_target_floor <= 0
+        ):
+            raise ValueError(
+                'spectra_target_floor must be a finite number greater than 0.'
+            )
+        if self.spectra_phase_mask_path is not None and self.phase_features_path is None:
+            raise ValueError(
+                'spectra_phase_mask_path requires phase_features_path so each '
+                'spectrum has a phase assignment.'
+            )
 
         # Validate class balance
         if self.class_balance and self.dataset_type != 'classification':
@@ -861,9 +1122,22 @@ class TrainArgs(CommonArgs):
             with open(self.crossval_index_file, 'rb') as rf:
                 self._crossval_index_sets = pickle.load(rf)
             self.num_folds = len(self.crossval_index_sets)
+            if self.num_folds < 1:
+                raise ValueError('crossval_index_file must contain at least one fold.')
             self.seed = 0
 
         # Validate split size entry and set default values
+        if self.split_sizes is not None:
+            try:
+                split_sizes = np.asarray(self.split_sizes, dtype=float)
+            except (TypeError, ValueError) as error:
+                raise ValueError('split_sizes must contain only numeric values.') from error
+            if split_sizes.ndim != 1 or split_sizes.size not in {2, 3}:
+                raise ValueError('split_sizes must contain two or three values.')
+            if not np.all(np.isfinite(split_sizes)):
+                raise ValueError('split_sizes must contain only finite values.')
+            self.split_sizes = split_sizes.tolist()
+
         if self.split_sizes is None:
             if self.separate_val_path is None and self.separate_test_path is None: # separate data paths are not provided
                 self.split_sizes = [0.8, 0.1, 0.1]
@@ -955,7 +1229,7 @@ class TrainArgs(CommonArgs):
         # normalize target weights
         if self.target_weights is not None:
             target_weights = np.asarray(self.target_weights, dtype=float)
-            if target_weights.size == 0:
+            if target_weights.ndim != 1 or target_weights.size == 0:
                 raise ValueError('At least one target weight must be provided.')
             if not np.all(np.isfinite(target_weights)):
                 raise ValueError('Provided target weights must be finite.')
@@ -972,17 +1246,23 @@ class TrainArgs(CommonArgs):
                 "The index provided with the argument `--split_key_molecule` must be less than the number of molecules. Note that this index begins with 0 for the first molecule. "
             )
 
-        if not 0 <= self.quantile_loss_alpha <= 0.5:
-            raise ValueError(
-                "quantile_loss_alpha should be in the range [0, 0.5]"
-            )
-
-        if not isinstance(self.ensemble_size, int) or self.ensemble_size < 1:
+        if (
+            not isinstance(self.ensemble_size, (int, np.integer))
+            or isinstance(self.ensemble_size, (bool, np.bool_))
+            or self.ensemble_size < 1
+        ):
             raise ValueError('ensemble_size must be a positive integer.')
 
         if self.model_type == 'lgbm':
             if self.dataset_type not in {'classification', 'regression'}:
                 raise ValueError('LightGBM supports only classification and regression datasets.')
+            if not self.features_only:
+                raise ValueError(
+                    'LightGBM requires --features_only because its MPN encoder is '
+                    'not trained. Provide deterministic molecular features, for '
+                    'example --features_generator morgan --features_only, or use '
+                    '--features_path together with --features_only.'
+                )
             if self.is_atom_bond_targets:
                 raise NotImplementedError('LightGBM does not support atom/bond target mode.')
             supported_primary_metrics = {
@@ -1020,25 +1300,55 @@ class TrainArgs(CommonArgs):
                     'LightGBM --test mode is not supported; use chemprop_predict '
                     'with the saved .pkl bundle.'
                 )
-            if not isinstance(self.lgbm_num_boost_round, int) or self.lgbm_num_boost_round < 1:
+            if (
+                not isinstance(self.lgbm_num_boost_round, int)
+                or isinstance(self.lgbm_num_boost_round, bool)
+                or self.lgbm_num_boost_round < 1
+            ):
                 raise ValueError('lgbm_num_boost_round must be a positive integer.')
-            if not isinstance(self.lgbm_early_stopping_rounds, int) or self.lgbm_early_stopping_rounds < 0:
+            if (
+                not isinstance(self.lgbm_early_stopping_rounds, int)
+                or isinstance(self.lgbm_early_stopping_rounds, bool)
+                or self.lgbm_early_stopping_rounds < 0
+            ):
                 raise ValueError('lgbm_early_stopping_rounds must be non-negative.')
-            if self.lgbm_learning_rate <= 0:
-                raise ValueError('lgbm_learning_rate must be greater than 0.')
-            if not isinstance(self.lgbm_num_leaves, int) or self.lgbm_num_leaves < 2:
+            if not _is_finite_number(self.lgbm_learning_rate) or self.lgbm_learning_rate <= 0:
+                raise ValueError('lgbm_learning_rate must be finite and greater than 0.')
+            if (
+                not isinstance(self.lgbm_num_leaves, int)
+                or isinstance(self.lgbm_num_leaves, bool)
+                or self.lgbm_num_leaves < 2
+            ):
                 raise ValueError('lgbm_num_leaves must be at least 2.')
-            if not 0 < self.lgbm_feature_fraction <= 1:
-                raise ValueError('lgbm_feature_fraction must be in (0, 1].')
-            if not 0 < self.lgbm_bagging_fraction <= 1:
-                raise ValueError('lgbm_bagging_fraction must be in (0, 1].')
-            if not isinstance(self.lgbm_bagging_freq, int) or self.lgbm_bagging_freq < 0:
+            if (
+                not _is_finite_number(self.lgbm_feature_fraction)
+                or not 0 < self.lgbm_feature_fraction <= 1
+            ):
+                raise ValueError('lgbm_feature_fraction must be finite and in (0, 1].')
+            if (
+                not _is_finite_number(self.lgbm_bagging_fraction)
+                or not 0 < self.lgbm_bagging_fraction <= 1
+            ):
+                raise ValueError('lgbm_bagging_fraction must be finite and in (0, 1].')
+            if (
+                not isinstance(self.lgbm_bagging_freq, int)
+                or isinstance(self.lgbm_bagging_freq, bool)
+                or self.lgbm_bagging_freq < 0
+            ):
                 raise ValueError('lgbm_bagging_freq must be non-negative.')
-            if not isinstance(self.lgbm_min_data_in_leaf, int) or self.lgbm_min_data_in_leaf < 1:
+            if (
+                not isinstance(self.lgbm_min_data_in_leaf, int)
+                or isinstance(self.lgbm_min_data_in_leaf, bool)
+                or self.lgbm_min_data_in_leaf < 1
+            ):
                 raise ValueError('lgbm_min_data_in_leaf must be positive.')
             if self.lgbm_num_threads is None:
                 self.lgbm_num_threads = max(1, self.num_workers)
-            elif not isinstance(self.lgbm_num_threads, int) or self.lgbm_num_threads < 1:
+            elif (
+                not isinstance(self.lgbm_num_threads, int)
+                or isinstance(self.lgbm_num_threads, bool)
+                or self.lgbm_num_threads < 1
+            ):
                 raise ValueError('lgbm_num_threads must be positive.')
 
 
@@ -1117,6 +1427,36 @@ class PredictArgs(CommonArgs):
     def process_args(self) -> None:
         super(PredictArgs, self).process_args()
 
+        if (self.calibration_method is None) != (self.calibration_path is None):
+            raise ValueError(
+                '--calibration_method and --calibration_path must be provided together.'
+            )
+        calibration_auxiliary_paths = (
+            self.calibration_features_path,
+            self.calibration_phase_features_path,
+            self.calibration_atom_descriptors_path,
+            self.calibration_bond_descriptors_path,
+        )
+        if self.calibration_path is None and any(
+            path is not None for path in calibration_auxiliary_paths
+        ):
+            raise ValueError(
+                'Calibration feature/descriptor paths require --calibration_path.'
+            )
+        if self.evaluation_scores_path is not None and self.evaluation_methods is None:
+            raise ValueError(
+                '--evaluation_scores_path requires --evaluation_methods.'
+            )
+        if (
+            self.individual_ensemble_predictions
+            and self.uncertainty_method == 'dropout'
+        ):
+            raise ValueError(
+                '--individual_ensemble_predictions is not supported with '
+                '--uncertainty_method dropout because Monte Carlo samples are '
+                'not checkpoint ensemble members.'
+            )
+
         if self.regression_calibrator_metric is None:
             if self.calibration_method == 'zelikman_interval':
                 self.regression_calibrator_metric = 'interval'
@@ -1154,13 +1494,24 @@ class PredictArgs(CommonArgs):
                         argument is deprecated and should be replaced with `--uncertainty_method ensemble`.'
                 )
 
-        if self.calibration_interval_percentile <= 1 or self.calibration_interval_percentile >= 100:
+        if (
+            not _is_finite_number(self.calibration_interval_percentile)
+            or self.calibration_interval_percentile <= 1
+            or self.calibration_interval_percentile >= 100
+        ):
             raise ValueError('The calibration interval must be a percentile value in the range (1,100).')
 
-        if self.uncertainty_dropout_p < 0 or self.uncertainty_dropout_p > 1:
+        if (
+            not _is_finite_number(self.uncertainty_dropout_p)
+            or not 0 < self.uncertainty_dropout_p < 1
+        ):
             raise ValueError('The dropout probability must be in the range (0,1).')
 
-        if self.dropout_sampling_size <= 1:
+        if (
+            not isinstance(self.dropout_sampling_size, int)
+            or isinstance(self.dropout_sampling_size, bool)
+            or self.dropout_sampling_size <= 1
+        ):
             raise ValueError('The argument `--dropout_sampling_size` must be an integer greater than 1.')
 
         # Validate that features provided for the prediction test set are also provided for the calibration set
@@ -1179,9 +1530,12 @@ class PredictArgs(CommonArgs):
                     f"Additional features were provided using the argument {features_argument}. The same kinds of features must be provided for the calibration dataset."
                 )
 
-        if not 0 <= self.conformal_alpha <= 1:
+        if (
+            not _is_finite_number(self.conformal_alpha)
+            or not 0 < self.conformal_alpha < 1
+        ):
             raise ValueError(
-                "conformal_alpha should be in the range [0,1]"
+                "conformal_alpha should be in the range (0,1)"
             )
 
 
@@ -1207,6 +1561,25 @@ class InterpretArgs(CommonArgs):
 
     def process_args(self) -> None:
         super(InterpretArgs, self).process_args()
+
+        for name, value in (
+            ('property_id', self.property_id),
+            ('rollout', self.rollout),
+            ('max_atoms', self.max_atoms),
+            ('min_atoms', self.min_atoms),
+        ):
+            if (
+                not isinstance(value, (int, np.integer))
+                or isinstance(value, (bool, np.bool_))
+                or value < 1
+            ):
+                raise ValueError(f'{name} must be a positive integer.')
+        if self.min_atoms > self.max_atoms:
+            raise ValueError('min_atoms must be less than or equal to max_atoms.')
+        if not _is_finite_number(self.c_puct):
+            raise ValueError('c_puct must be finite.')
+        if not _is_finite_number(self.prop_delta):
+            raise ValueError('prop_delta must be finite.')
 
         self.smiles_columns = chemprop.data.utils.preprocess_smiles_columns(
             path=self.data_path,
@@ -1273,6 +1646,12 @@ class HyperoptArgs(TrainArgs):
     ``init_lr``, ``max_lr``, and ``warmup_epochs``.
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        super(HyperoptArgs, self).__init__(*args, **kwargs)
+        # argparse mutates list-valued options in place. Do not expose the
+        # annotated class default to mutations performed by another instance.
+        self.search_parameter_keywords = list(self.search_parameter_keywords)
+
     def process_args(self) -> None:
         super(HyperoptArgs, self).process_args()
 
@@ -1282,6 +1661,18 @@ class HyperoptArgs(TrainArgs):
                 'Tune LightGBM with its --lgbm_* training arguments or an '
                 'external validation-only search.'
             )
+
+        if (
+            not isinstance(self.num_iters, (int, np.integer))
+            or isinstance(self.num_iters, (bool, np.bool_))
+            or self.num_iters < 1
+        ):
+            raise ValueError('num_iters must be a positive integer.')
+        if (
+            not isinstance(self.hyperopt_seed, (int, np.integer))
+            or isinstance(self.hyperopt_seed, (bool, np.bool_))
+        ):
+            raise ValueError('hyperopt_seed must be an integer.')
 
         # Hyperparameters must be selected exclusively on validation data.
         # Evaluating trials on the test split leaks test labels into model
@@ -1298,6 +1689,14 @@ class HyperoptArgs(TrainArgs):
         # Set number of startup random trials
         if self.startup_random_iters is None:
             self.startup_random_iters = self.num_iters // 2
+        if (
+            not isinstance(self.startup_random_iters, (int, np.integer))
+            or isinstance(self.startup_random_iters, (bool, np.bool_))
+            or not 0 <= self.startup_random_iters <= self.num_iters
+        ):
+            raise ValueError(
+                'startup_random_iters must be an integer between 0 and num_iters.'
+            )
 
         # Construct set of search parameters
         supported_keywords = [
@@ -1357,6 +1756,50 @@ class SklearnTrainArgs(TrainArgs):
     impute_mode: Literal['single_task', 'median', 'mean', 'linear', 'frequent'] = None
     """How to impute missing data (None means no imputation)."""
 
+    def process_args(self) -> None:
+        super(SklearnTrainArgs, self).process_args()
+
+        for name, value, minimum in (
+            ('radius', self.radius, 0),
+            ('num_bits', self.num_bits, 1),
+            ('num_trees', self.num_trees, 1),
+        ):
+            if (
+                not isinstance(value, (int, np.integer))
+                or isinstance(value, (bool, np.bool_))
+                or value < minimum
+            ):
+                raise ValueError(f'{name} must be an integer of at least {minimum}.')
+
+        if self.dataset_type not in {'classification', 'regression'}:
+            raise ValueError(
+                'Sklearn models support only classification and regression datasets.'
+            )
+        if self.target_weights is not None:
+            raise NotImplementedError(
+                'Sklearn models do not support --target_weights. Use '
+                '--data_weights_path for row-wise sample weights instead.'
+            )
+        if self.class_weight is not None and self.dataset_type != 'classification':
+            raise ValueError('--class_weight is only supported for classification.')
+        if self.single_task and self.impute_mode is not None:
+            raise ValueError(
+                '--single_task already removes missing labels per task and cannot '
+                'be combined with --impute_mode.'
+            )
+        regression_imputation = {'single_task', 'median', 'mean', 'linear'}
+        classification_imputation = {'single_task', 'linear', 'frequent'}
+        supported_imputation = (
+            regression_imputation
+            if self.dataset_type == 'regression'
+            else classification_imputation
+        )
+        if self.impute_mode is not None and self.impute_mode not in supported_imputation:
+            raise ValueError(
+                f'--impute_mode {self.impute_mode} is not supported for '
+                f'{self.dataset_type} data.'
+            )
+
 
 class SklearnPredictArgs(CommonArgs):
     """:class:`SklearnPredictArgs` contains arguments used for predicting with a trained scikit-learn model."""
@@ -1379,7 +1822,7 @@ class SklearnPredictArgs(CommonArgs):
     """List of paths to model checkpoints (:code:`.pkl` files)"""
 
     def process_args(self) -> None:
-
+        self._validate_common_numeric_args()
         self.smiles_columns = chemprop.data.utils.preprocess_smiles_columns(
             path=self.test_path,
             smiles_columns=self.smiles_columns,
@@ -1393,3 +1836,8 @@ class SklearnPredictArgs(CommonArgs):
             checkpoint_dir=self.checkpoint_dir,
             ext='.pkl'
         )
+        if not self.checkpoint_paths:
+            raise ValueError(
+                'Found no sklearn checkpoints. Specify --checkpoint_path, '
+                '--checkpoint_paths, or --checkpoint_dir.'
+            )

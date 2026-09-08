@@ -3,7 +3,12 @@ Runs the web interface version of Chemprop.
 Designed to be used for production only, along with Gunicorn.
 """
 from chemprop.web.app import app, db
-from chemprop.web.utils import clear_temp_folder, set_root_folder, validate_web_security_config
+from chemprop.web.utils import (
+    clear_temp_folder,
+    set_root_folder,
+    validate_web_security_config,
+    validate_web_storage_config,
+)
 
 
 def build_app(*args, **kwargs):
@@ -23,6 +28,8 @@ def build_app(*args, **kwargs):
         create_folders=True
     )
     clear_temp_folder(app=app)
+    if allow_remote:
+        validate_web_storage_config(app)
 
     db.init_app(app)
     if kwargs.get('init_db', False):

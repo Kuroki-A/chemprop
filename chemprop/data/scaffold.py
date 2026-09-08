@@ -24,9 +24,13 @@ def generate_scaffold(mol: Union[str, Chem.Mol, Tuple[Chem.Mol, Chem.Mol]], incl
     if isinstance(mol, str):
         mol = make_mol(mol, keep_h = False, add_h = False, keep_atom_map = False)
     if isinstance(mol, tuple):
+        if len(mol) != 2 or mol[0] is None:
+            raise ValueError('Reaction scaffold input must contain a valid reactant molecule.')
         mol = copy.deepcopy(mol[0])
         for atom in mol.GetAtoms():
             atom.SetAtomMapNum(0)
+    if mol is None or not isinstance(mol, Chem.Mol):
+        raise ValueError('Cannot generate a scaffold from an invalid molecule.')
     scaffold = MurckoScaffold.MurckoScaffoldSmiles(mol = mol, includeChirality = include_chirality)
 
     return scaffold
@@ -73,11 +77,29 @@ def scaffold_split(data: MoleculeDataset,
     :return: A tuple of :class:`~chemprop.data.MoleculeDataset`\ s containing the train,
              validation, and test splits of the data.
     """
-    if not (len(sizes) == 3 and np.isclose(sum(sizes), 1)):
+    try:
+        split_sizes = np.asarray(sizes, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid train/val/test splits! got: {sizes}") from exc
+    if (
+        split_sizes.shape != (3,)
+        or not np.isfinite(split_sizes).all()
+        or np.any(split_sizes < 0)
+        or np.any(split_sizes > 1)
+        or not np.isclose(split_sizes.sum(), 1)
+    ):
         raise ValueError(f"Invalid train/val/test splits! got: {sizes}")
+    if not isinstance(key_molecule_index, int) or isinstance(key_molecule_index, bool) \
+            or key_molecule_index < 0:
+        raise ValueError('key_molecule_index must be a non-negative integer.')
+    if len(data) > 0 and key_molecule_index >= data.number_of_molecules:
+        raise ValueError(
+            f'key_molecule_index {key_molecule_index} is out of range for data '
+            f'with {data.number_of_molecules} molecule(s) per datapoint.'
+        )
 
     # Split
-    train_size, val_size, test_size = sizes[0] * len(data), sizes[1] * len(data), sizes[2] * len(data)
+    train_size, val_size, test_size = split_sizes * len(data)
     train, val, test = [], [], []
     train_scaffold_count, val_scaffold_count, test_scaffold_count = 0, 0, 0
 

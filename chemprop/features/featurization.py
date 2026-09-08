@@ -1,4 +1,4 @@
-from typing import List, Tuple, Union
+from typing import List, Sequence, Tuple, Union
 from itertools import zip_longest
 import logging
 
@@ -50,6 +50,7 @@ class Featurization_parameters:
 
 # Create a global parameter object for reference throughout this module
 PARAMS = Featurization_parameters()
+_BOND_STEREO_CHOICES = tuple(range(6))
 
 
 def reset_featurization_parameters(logger: logging.Logger = None) -> None:
@@ -186,7 +187,7 @@ def set_extra_bond_fdim(extra):
     PARAMS.EXTRA_BOND_FDIM = extra
 
 
-def onek_encoding_unk(value: int, choices: List[int]) -> List[int]:
+def onek_encoding_unk(value: int, choices: Sequence[int]) -> List[int]:
     """
     Creates a one-hot encoding with an extra category for uncommon values.
 
@@ -196,7 +197,13 @@ def onek_encoding_unk(value: int, choices: List[int]) -> List[int]:
              If :code:`value` is not in :code:`choices`, then the final element in the encoding is 1.
     """
     encoding = [0] * (len(choices) + 1)
-    index = choices.index(value) if value in choices else -1
+    try:
+        # A single ``index`` scan is measurably cheaper than the historical
+        # membership test followed by a second scan, especially for the
+        # 100-entry atomic-number vocabulary used for every atom.
+        index = choices.index(value)
+    except ValueError:
+        index = -1
     encoding[index] = 1
 
     return encoding
@@ -261,7 +268,7 @@ def bond_features(bond: Chem.rdchem.Bond) -> List[Union[bool, int, float]]:
             (bond.GetIsConjugated() if bt is not None else 0),
             (bond.IsInRing() if bt is not None else 0)
         ]
-        fbond += onek_encoding_unk(int(bond.GetStereo()), list(range(6)))
+        fbond += onek_encoding_unk(int(bond.GetStereo()), _BOND_STEREO_CHOICES)
     return fbond
 
 
@@ -341,7 +348,7 @@ class MolGraph:
         self.reaction_mode = reaction_mode()
         
         # Convert SMILES to RDKit molecule if necessary
-        if type(mol) == str:
+        if isinstance(mol, str):
             if self.is_reaction:
                 mol = (make_mol(mol.split(">")[0], self.is_explicit_h, self.is_adding_hs, self.is_keeping_atom_map), make_mol(mol.split(">")[-1], self.is_explicit_h, self.is_adding_hs, self.is_keeping_atom_map)) 
             else:
@@ -378,36 +385,41 @@ class MolGraph:
             # Initialize f_bonds to real bonds mapping for each bond
             self.b2br = np.zeros([len(mol.GetBonds()), 2])
 
-            # Get bond features
-            for a1 in range(self.n_atoms):
-                for a2 in range(a1 + 1, self.n_atoms):
-                    bond = mol.GetBondBetweenAtoms(a1, a2)
+            # Get bond features. Iterating the actual bonds avoids the
+            # quadratic all-atom-pairs scan while sorting by atom pair retains
+            # the exact directed-bond order used by the historical loop.
+            ordered_bonds = sorted(
+                (
+                    min(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
+                    max(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
+                    bond,
+                )
+                for bond in mol.GetBonds()
+            )
+            for a1, a2, bond in ordered_bonds:
 
-                    if bond is None:
-                        continue
+                f_bond = bond_features(bond)
+                if bond_features_extra is not None:
+                    descr = bond_features_extra[bond.GetIdx()].tolist()
+                    if overwrite_default_bond_features:
+                        f_bond = descr
+                    else:
+                        f_bond += descr
 
-                    f_bond = bond_features(bond)
-                    if bond_features_extra is not None:
-                        descr = bond_features_extra[bond.GetIdx()].tolist()
-                        if overwrite_default_bond_features:
-                            f_bond = descr
-                        else:
-                            f_bond += descr
+                self.f_bonds.append(self.f_atoms[a1] + f_bond)
+                self.f_bonds.append(self.f_atoms[a2] + f_bond)
 
-                    self.f_bonds.append(self.f_atoms[a1] + f_bond)
-                    self.f_bonds.append(self.f_atoms[a2] + f_bond)
-
-                    # Update index mappings
-                    b1 = self.n_bonds
-                    b2 = b1 + 1
-                    self.a2b[a2].append(b1)  # b1 = a1 --> a2
-                    self.b2a.append(a1)
-                    self.a2b[a1].append(b2)  # b2 = a2 --> a1
-                    self.b2a.append(a2)
-                    self.b2revb.append(b2)
-                    self.b2revb.append(b1)
-                    self.b2br[bond.GetIdx(), :] = [self.n_bonds, self.n_bonds + 1]
-                    self.n_bonds += 2
+                # Update index mappings
+                b1 = self.n_bonds
+                b2 = b1 + 1
+                self.a2b[a2].append(b1)  # b1 = a1 --> a2
+                self.b2a.append(a1)
+                self.a2b[a1].append(b2)  # b2 = a2 --> a1
+                self.b2a.append(a2)
+                self.b2revb.append(b2)
+                self.b2revb.append(b1)
+                self.b2br[bond.GetIdx(), :] = [self.n_bonds, self.n_bonds + 1]
+                self.n_bonds += 2
 
             if bond_features_extra is not None and len(bond_features_extra) != self.n_bonds / 2:
                 raise ValueError(f'The number of bonds in {Chem.MolToSmiles(mol)} is different from the length of '
@@ -456,60 +468,82 @@ class MolGraph:
             for _ in range(self.n_atoms):
                 self.a2b.append([])
 
-            # Get bond features
-            for a1 in range(self.n_atoms):
-                for a2 in range(a1 + 1, self.n_atoms):
-                    if a1 >= n_atoms_reac and a2 >= n_atoms_reac: # Both atoms only in product
-                        bond_prod = mol_prod.GetBondBetweenAtoms(pio[a1 - n_atoms_reac], pio[a2 - n_atoms_reac])
-                        if self.reaction_mode in ['reac_prod_balance', 'reac_diff_balance', 'prod_diff_balance']:
-                            bond_reac = bond_prod
-                        else:
-                            bond_reac = None
-                    elif a1 < n_atoms_reac and a2 >= n_atoms_reac: # One atom only in product
-                        bond_reac = None
-                        if a1 in ri2pi.keys():
-                            bond_prod = mol_prod.GetBondBetweenAtoms(ri2pi[a1], pio[a2 - n_atoms_reac])
-                        else:
-                            bond_prod = None # Atom atom only in reactant, the other only in product
+            # A reaction graph can contain a bond from either side. Build the
+            # sparse union of those real bonds rather than probing every pair
+            # in the (potentially large) union atom set.
+            reaction_bond_pairs = {
+                tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())))
+                for bond in mol_reac.GetBonds()
+            }
+            product_to_graph_ids = {}
+            for reactant_index, product_index in ri2pi.items():
+                product_to_graph_ids.setdefault(product_index, []).append(reactant_index)
+            for offset, product_index in enumerate(pio):
+                product_to_graph_ids.setdefault(product_index, []).append(
+                    n_atoms_reac + offset
+                )
+            for bond in mol_prod.GetBonds():
+                begin_ids = product_to_graph_ids.get(bond.GetBeginAtomIdx(), ())
+                end_ids = product_to_graph_ids.get(bond.GetEndAtomIdx(), ())
+                for begin_index in begin_ids:
+                    for end_index in end_ids:
+                        if begin_index != end_index:
+                            reaction_bond_pairs.add(tuple(sorted((begin_index, end_index))))
+
+            # Sorting retains the exact bond ordering of the historical nested
+            # ``for a1`` / ``for a2`` implementation.
+            for a1, a2 in sorted(reaction_bond_pairs):
+                if a1 >= n_atoms_reac and a2 >= n_atoms_reac: # Both atoms only in product
+                    bond_prod = mol_prod.GetBondBetweenAtoms(pio[a1 - n_atoms_reac], pio[a2 - n_atoms_reac])
+                    if self.reaction_mode in ['reac_prod_balance', 'reac_diff_balance', 'prod_diff_balance']:
+                        bond_reac = bond_prod
                     else:
-                        bond_reac = mol_reac.GetBondBetweenAtoms(a1, a2)
-                        if a1 in ri2pi.keys() and a2 in ri2pi.keys():
-                            bond_prod = mol_prod.GetBondBetweenAtoms(ri2pi[a1], ri2pi[a2]) #Both atoms in both reactant and product
+                        bond_reac = None
+                elif a1 < n_atoms_reac and a2 >= n_atoms_reac: # One atom only in product
+                    bond_reac = None
+                    if a1 in ri2pi:
+                        bond_prod = mol_prod.GetBondBetweenAtoms(ri2pi[a1], pio[a2 - n_atoms_reac])
+                    else:
+                        bond_prod = None # Atom atom only in reactant, the other only in product
+                else:
+                    bond_reac = mol_reac.GetBondBetweenAtoms(a1, a2)
+                    if a1 in ri2pi and a2 in ri2pi:
+                        bond_prod = mol_prod.GetBondBetweenAtoms(ri2pi[a1], ri2pi[a2]) #Both atoms in both reactant and product
+                    else:
+                        if self.reaction_mode in ['reac_prod_balance', 'reac_diff_balance', 'prod_diff_balance']:
+                            if a1 in ri2pi or a2 in ri2pi:
+                                bond_prod = None # One atom only in reactant
+                            else:
+                                bond_prod = bond_reac # Both atoms only in reactant
                         else:
-                            if self.reaction_mode in ['reac_prod_balance', 'reac_diff_balance', 'prod_diff_balance']:
-                                if a1 in ri2pi.keys() or a2 in ri2pi.keys():
-                                    bond_prod = None # One atom only in reactant
-                                else:
-                                    bond_prod = bond_reac # Both atoms only in reactant
-                            else:    
-                                bond_prod = None # One or both atoms only in reactant
+                            bond_prod = None # One or both atoms only in reactant
 
-                    if bond_reac is None and bond_prod is None:
-                        continue
+                if bond_reac is None and bond_prod is None:
+                    continue
 
-                    f_bond_reac = bond_features(bond_reac)
-                    f_bond_prod = bond_features(bond_prod)
-                    if self.reaction_mode in ['reac_diff', 'prod_diff', 'reac_diff_balance', 'prod_diff_balance']:
-                        f_bond_diff = [y - x for x, y in zip(f_bond_reac, f_bond_prod)]
-                    if self.reaction_mode in ['reac_prod', 'reac_prod_balance']:
-                        f_bond = f_bond_reac + f_bond_prod
-                    elif self.reaction_mode in ['reac_diff', 'reac_diff_balance']:
-                        f_bond = f_bond_reac + f_bond_diff
-                    elif self.reaction_mode in ['prod_diff', 'prod_diff_balance']:
-                        f_bond = f_bond_prod + f_bond_diff
-                    self.f_bonds.append(self.f_atoms[a1] + f_bond)
-                    self.f_bonds.append(self.f_atoms[a2] + f_bond)
+                f_bond_reac = bond_features(bond_reac)
+                f_bond_prod = bond_features(bond_prod)
+                if self.reaction_mode in ['reac_diff', 'prod_diff', 'reac_diff_balance', 'prod_diff_balance']:
+                    f_bond_diff = [y - x for x, y in zip(f_bond_reac, f_bond_prod)]
+                if self.reaction_mode in ['reac_prod', 'reac_prod_balance']:
+                    f_bond = f_bond_reac + f_bond_prod
+                elif self.reaction_mode in ['reac_diff', 'reac_diff_balance']:
+                    f_bond = f_bond_reac + f_bond_diff
+                elif self.reaction_mode in ['prod_diff', 'prod_diff_balance']:
+                    f_bond = f_bond_prod + f_bond_diff
+                self.f_bonds.append(self.f_atoms[a1] + f_bond)
+                self.f_bonds.append(self.f_atoms[a2] + f_bond)
 
-                    # Update index mappings
-                    b1 = self.n_bonds
-                    b2 = b1 + 1
-                    self.a2b[a2].append(b1)  # b1 = a1 --> a2
-                    self.b2a.append(a1)
-                    self.a2b[a1].append(b2)  # b2 = a2 --> a1
-                    self.b2a.append(a2)
-                    self.b2revb.append(b2)
-                    self.b2revb.append(b1)
-                    self.n_bonds += 2                
+                # Update index mappings
+                b1 = self.n_bonds
+                b2 = b1 + 1
+                self.a2b[a2].append(b1)  # b1 = a1 --> a2
+                self.b2a.append(a1)
+                self.a2b[a1].append(b2)  # b2 = a2 --> a1
+                self.b2a.append(a2)
+                self.b2revb.append(b2)
+                self.b2revb.append(b1)
+                self.n_bonds += 2
 
 class BatchMolGraph:
     """
@@ -620,7 +654,9 @@ class BatchMolGraph:
         if self.b2b is None:
             b2b = self.a2b[self.b2a]  # num_bonds x max_num_bonds
             # b2b includes reverse edge for each bond so need to mask out
-            revmask = (b2b != self.b2revb.unsqueeze(1).repeat(1, b2b.size(1))).long()  # num_bonds x max_num_bonds
+            # Broadcasting avoids allocating a repeated num_bonds x
+            # max_num_bonds copy of b2revb.
+            revmask = (b2b != self.b2revb.unsqueeze(1)).long()
             self.b2b = b2b * revmask
 
         return self.b2b

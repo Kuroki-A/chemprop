@@ -85,6 +85,76 @@ def validate_features_source_metadata(reference_data: MoleculeDataset,
         )
 
 
+def _validate_training_split(args: TrainArgs,
+                             train_data: MoleculeDataset,
+    val_data: MoleculeDataset) -> None:
+    """Rejects splits which would leave random, untrained prediction heads."""
+    if len(val_data) == 0:
+        raise ValueError(
+            'The validation data split is empty. Chemprop FFN training '
+            'requires validation data for model selection and early stopping.'
+        )
+    if len(train_data) == 0:
+        raise ValueError(
+            'The training data split is empty. Increase the data set size, '
+            'change --split_sizes, or provide a non-empty training file.'
+        )
+
+    task_masks = train_data.mask()
+    if len(task_masks) != args.num_tasks:
+        raise ValueError(
+            'The training target schema is inconsistent: '
+            f'the data contain {len(task_masks)} task columns but the model '
+            f'expects {args.num_tasks}.'
+        )
+
+    missing_tasks = [
+        task_index
+        for task_index, task_mask in enumerate(task_masks)
+        if not any(bool(is_observed) for is_observed in task_mask)
+    ]
+    if missing_tasks:
+        task_names = list(args.task_names or [])
+        labels = [
+            task_names[index] if index < len(task_names) else f'index {index}'
+            for index in missing_tasks
+        ]
+        raise ValueError(
+            'The training split has no observed labels for the following '
+            f'task(s): {", ".join(labels)}. A prediction head with no labels '
+            'would remain randomly initialized.'
+        )
+
+    if args.class_balance:
+        if args.num_tasks != 1:
+            raise ValueError(
+                '--class_balance is supported only for single-task binary '
+                'classification data.'
+            )
+        observed_classes = {
+            datapoint.targets[0]
+            for datapoint in train_data
+            if datapoint.targets[0] is not None
+        }
+        if observed_classes != {0, 1}:
+            raise ValueError(
+                '--class_balance requires both binary classes in the training '
+                f'split; observed classes were {sorted(observed_classes)}.'
+            )
+
+
+def _validate_primary_validation_score(metric: str, score: float) -> None:
+    """Prevents an unusable validation split from selecting random weights."""
+    if not np.isfinite(score):
+        raise ValueError(
+            f'The primary validation metric {metric!r} is not finite, so '
+            'Chemprop cannot select a trained checkpoint. Check that the '
+            'validation split has labels and enough class/sample diversity '
+            'for this metric; for multitask data, --ignore_nan_metrics may '
+            'be used only when at least one task still has a finite score.'
+        )
+
+
 def run_training(args: TrainArgs,
                  data: MoleculeDataset,
                  fold_num: int = None,
@@ -190,6 +260,8 @@ def run_training(args: TrainArgs,
     if skip_test_evaluation:
         test_data = MoleculeDataset([])
 
+    _validate_training_split(args, train_data, val_data)
+
     if args.dataset_type == 'classification':
         class_sizes = get_class_sizes(train_data)
         debug('Training class sizes')
@@ -246,11 +318,6 @@ def run_training(args: TrainArgs,
     else:
         debug(f'Total size = {len(data):,} | '
               f'train size = {len(train_data):,} | val size = {len(val_data):,} | test size = {len(test_data):,}')
-
-    if len(val_data) == 0:
-        raise ValueError('The validation data split is empty. During normal chemprop training (non-sklearn functions), \
-            a validation set is required to conduct early stopping according to the selected evaluation metric. This \
-            may have occurred because validation data provided with `--separate_val_path` was empty or contained only invalid molecules.')
 
     empty_test_set = len(test_data) == 0
     evaluate_test = not skip_test_evaluation and not empty_test_set
@@ -474,6 +541,7 @@ def run_training(args: TrainArgs,
                 metric=args.metric,
                 ignore_nan_metrics=args.ignore_nan_metrics
             )
+            _validate_primary_validation_score(args.metric, mean_val_score)
             if args.minimize_score and mean_val_score < best_score or \
                     not args.minimize_score and mean_val_score > best_score:
                 best_score, best_epoch = mean_val_score, epoch

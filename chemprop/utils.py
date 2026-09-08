@@ -442,7 +442,10 @@ def load_checkpoint_lgbm(
 
 
 def load_checkpoint(
-    path: str, device: torch.device = None, logger: logging.Logger = None
+    path: str,
+    device: torch.device = None,
+    logger: logging.Logger = None,
+    strict: bool = True,
 ) -> MoleculeModel:
     """
     Loads a model checkpoint.
@@ -450,6 +453,10 @@ def load_checkpoint(
     :param path: Path where checkpoint is saved.
     :param device: Device where the model will be moved.
     :param logger: A logger for recording output.
+    :param strict: Whether every model parameter must be present with the
+                   expected shape. Disable only for deliberate legacy partial
+                   loading; transfer learning should normally use
+                   :func:`load_frzn_model` instead.
     :return: The loaded :class:`~chemprop.models.model.MoleculeModel`.
     """
     if logger is not None:
@@ -475,6 +482,8 @@ def load_checkpoint(
 
     # Skip missing parameters and parameters of mismatched size
     pretrained_state_dict = {}
+    unexpected_parameters = []
+    mismatched_parameters = []
     for loaded_param_name in loaded_state_dict.keys():
         # Backward compatibility for parameter names
         if re.match(r"(encoder\.encoder\.)([Wc])", loaded_param_name) and not args.reaction_solvent:
@@ -486,10 +495,18 @@ def load_checkpoint(
 
         # Load pretrained parameter, skipping unmatched parameters
         if param_name not in model_state_dict:
+            unexpected_parameters.append(loaded_param_name)
             info(
                 f'Warning: Pretrained parameter "{loaded_param_name}" cannot be found in model parameters.'
             )
         elif model_state_dict[param_name].shape != loaded_state_dict[loaded_param_name].shape:
+            mismatched_parameters.append(
+                (
+                    loaded_param_name,
+                    tuple(loaded_state_dict[loaded_param_name].shape),
+                    tuple(model_state_dict[param_name].shape),
+                )
+            )
             info(
                 f'Warning: Pretrained parameter "{loaded_param_name}" '
                 f"of shape {loaded_state_dict[loaded_param_name].shape} does not match corresponding "
@@ -499,9 +516,28 @@ def load_checkpoint(
             debug(f'Loading pretrained parameter "{loaded_param_name}".')
             pretrained_state_dict[param_name] = loaded_state_dict[loaded_param_name]
 
-    # Load pretrained weights
-    model_state_dict.update(pretrained_state_dict)
-    model.load_state_dict(model_state_dict)
+    missing_parameters = sorted(set(model_state_dict) - set(pretrained_state_dict))
+    if strict and (unexpected_parameters or mismatched_parameters or missing_parameters):
+        issue_parts = []
+        if missing_parameters:
+            issue_parts.append(f'missing parameters={missing_parameters}')
+        if unexpected_parameters:
+            issue_parts.append(f'unexpected parameters={sorted(unexpected_parameters)}')
+        if mismatched_parameters:
+            issue_parts.append(f'shape mismatches={mismatched_parameters}')
+        raise ValueError(
+            f'Checkpoint {path!r} is incompatible with its saved model '
+            f'configuration: {"; ".join(issue_parts)}. Refusing to predict '
+            'with randomly initialized or mismatched weights.'
+        )
+
+    # Strict loading prevents a corrupt checkpoint from silently leaving
+    # random parameters in an otherwise plausible-looking prediction model.
+    if strict:
+        model.load_state_dict(pretrained_state_dict, strict=True)
+    else:
+        model_state_dict.update(pretrained_state_dict)
+        model.load_state_dict(model_state_dict)
 
     if args.cuda:
         debug("Moving model to cuda")
@@ -1004,7 +1040,6 @@ def save_smiles_splits(
         smiles_columns = preprocess_smiles_columns(path=data_path, smiles_columns=smiles_columns)
 
     with open(data_path) as f:
-        f = open(data_path)
         reader = csv.DictReader(f)
 
         indices_by_smiles = {}
@@ -1111,9 +1146,29 @@ def save_smiles_splits(
                     for weight in data_weights:
                         writer.writerow([weight])
 
+    split_indices_path = os.path.join(save_dir, "split_indices.pckl")
     if save_split_indices:
-        with open(os.path.join(save_dir, "split_indices.pckl"), "wb") as f:
-            pickle.dump(all_split_indices, f)
+        descriptor, temporary_path = tempfile.mkstemp(
+            dir=save_dir, prefix='.split-indices-', suffix='.tmp',
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as split_file:
+                pickle.dump(
+                    all_split_indices,
+                    split_file,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+                split_file.flush()
+                os.fsync(split_file.fileno())
+            os.replace(temporary_path, split_indices_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+    elif os.path.exists(split_indices_path):
+        # Never leave a valid-looking index file from an earlier invocation
+        # when the current splits contain duplicate or external SMILES that
+        # cannot be represented unambiguously.
+        os.unlink(split_indices_path)
 
 
 def update_prediction_args(

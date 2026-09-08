@@ -1,6 +1,5 @@
 """Computes the similarity of molecular scaffolds between two datasets."""
 
-from itertools import product
 import math
 import os
 import sys
@@ -11,7 +10,7 @@ from typing_extensions import Literal
 import numpy as np
 from rdkit import Chem
 from rdkit import DataStructs
-from rdkit.Chem import AllChem
+from rdkit.Chem import rdFingerprintGenerator
 from tqdm import tqdm
 from tap import Tap  # pip install typed-argument-parser (https://github.com/swansonk14/typed-argument-parser)
 
@@ -28,6 +27,7 @@ class Args(Tap):
     similarity_measure: Literal['scaffold', 'morgan']  # Similarity measure to use to compare the two datasets
     radius: int = 3  # Radius of Morgan fingerprint
     sample_rate: float = 1.0  # Rate at which to sample pairs of molecules for Morgan similarity (to reduce time)
+    seed: int = 0  # Random seed used when sampling molecule pairs
 
 
 def scaffold_similarity(smiles_1: List[str], smiles_2: List[str]):
@@ -37,6 +37,9 @@ def scaffold_similarity(smiles_1: List[str], smiles_2: List[str]):
     :param smiles_1: A list of smiles strings.
     :param smiles_2: A list of smiles strings.
     """
+    if not smiles_1 or not smiles_2:
+        raise ValueError('Both SMILES datasets must be non-empty.')
+
     # Get scaffolds
     scaffold_to_smiles_1 = scaffold_to_smiles(smiles_1)
     scaffold_to_smiles_2 = scaffold_to_smiles(smiles_2)
@@ -99,7 +102,13 @@ def scaffold_similarity(smiles_1: List[str], smiles_2: List[str]):
     print(' | '.join([f'{i}% = {int(np.percentile(sizes_2, i)):,}' for i in range(0, 101, 10)]))
 
 
-def morgan_similarity(smiles_1: List[str], smiles_2: List[str], radius: int, sample_rate: float):
+def morgan_similarity(
+    smiles_1: List[str],
+    smiles_2: List[str],
+    radius: int,
+    sample_rate: float,
+    seed: int = 0,
+):
     """
     Determines the similarity between the morgan fingerprints of two lists of smiles strings.
 
@@ -108,35 +117,53 @@ def morgan_similarity(smiles_1: List[str], smiles_2: List[str], radius: int, sam
     :param radius: The radius of the morgan fingerprints.
     :param sample_rate: Rate at which to sample pairs of molecules for Morgan similarity (to reduce time).
     """
+    if not smiles_1 or not smiles_2:
+        raise ValueError('Both SMILES datasets must be non-empty.')
+    if not isinstance(radius, int) or isinstance(radius, bool) or radius < 0:
+        raise ValueError('radius must be a non-negative integer.')
+    if not np.isfinite(sample_rate) or not 0 < sample_rate <= 1:
+        raise ValueError('sample_rate must be finite and in the interval (0, 1].')
+
     # Compute similarities
-    similarities = []
     num_pairs = len(smiles_1) * len(smiles_2)
 
     # Sample to improve speed
     if sample_rate < 1.0:
         sample_num_pairs = sample_rate * num_pairs
         sample_size = math.ceil(math.sqrt(sample_num_pairs))
-        sample_smiles_1 = np.random.choice(smiles_1, size=sample_size, replace=True)
-        sample_smiles_2 = np.random.choice(smiles_2, size=sample_size, replace=True)
+        rng = np.random.default_rng(seed)
+        sample_smiles_1 = rng.choice(smiles_1, size=sample_size, replace=True)
+        sample_smiles_2 = rng.choice(smiles_2, size=sample_size, replace=True)
     else:
         sample_smiles_1, sample_smiles_2 = smiles_1, smiles_2
 
-    sample_num_pairs = len(sample_smiles_1) * len(sample_smiles_2)
+    generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius)
 
-    for smile_1, smile_2 in tqdm(product(sample_smiles_1, sample_smiles_2), total=sample_num_pairs):
-        mol_1, mol_2 = Chem.MolFromSmiles(smile_1), Chem.MolFromSmiles(smile_2)
-        fp_1, fp_2 = AllChem.GetMorganFingerprint(mol_1, radius), AllChem.GetMorganFingerprint(mol_2, radius)
-        similarity = DataStructs.TanimotoSimilarity(fp_1, fp_2)
-        similarities.append(similarity)
-    similarities = np.array(similarities)
+    def fingerprints(smiles_values):
+        output = []
+        for index, smile in enumerate(smiles_values):
+            mol = Chem.MolFromSmiles(str(smile))
+            if mol is None or mol.GetNumHeavyAtoms() == 0:
+                raise ValueError(f'Invalid SMILES at sampled row {index}: {smile!r}.')
+            output.append(generator.GetSparseCountFingerprint(mol))
+        return output
+
+    # Fingerprints depend on molecules, not pairs. Computing them once reduces
+    # the expensive RDKit work from O(number of pairs) to O(number of rows).
+    fps_1 = fingerprints(sample_smiles_1)
+    fps_2 = fingerprints(sample_smiles_2)
+    similarities = np.concatenate([
+        np.asarray(DataStructs.BulkTanimotoSimilarity(fp_1, fps_2), dtype=float)
+        for fp_1 in tqdm(fps_1, total=len(fps_1))
+    ])
 
     # Print results
     print()
-    print(f'Average dice similarity = {np.mean(similarities):.4f} +/- {np.std(similarities):.4f}')
-    print(f'Minimum dice similarity = {np.min(similarities):.4f}')
-    print(f'Maximum dice similarity = {np.max(similarities):.4f}')
+    print(f'Average Tanimoto similarity = {np.mean(similarities):.4f} +/- {np.std(similarities):.4f}')
+    print(f'Minimum Tanimoto similarity = {np.min(similarities):.4f}')
+    print(f'Maximum Tanimoto similarity = {np.max(similarities):.4f}')
     print()
-    print('Percentiles for dice similarity')
+    print('Percentiles for Tanimoto similarity')
     print(' | '.join([f'{i}% = {np.percentile(similarities, i):.4f}' for i in range(0, 101, 10)]))
 
 
@@ -149,6 +176,6 @@ if __name__ == '__main__':
     if args.similarity_measure == 'scaffold':
         scaffold_similarity(smiles_1, smiles_2)
     elif args.similarity_measure == 'morgan':
-        morgan_similarity(smiles_1, smiles_2, args.radius, args.sample_rate)
+        morgan_similarity(smiles_1, smiles_2, args.radius, args.sample_rate, args.seed)
     else:
         raise ValueError(f'Similarity measure "{args.similarity_measure}" not supported.')

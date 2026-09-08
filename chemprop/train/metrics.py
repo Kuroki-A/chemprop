@@ -365,6 +365,59 @@ def mcc_metric(targets: List[int], preds: Union[List[float], List[List[float]]],
     return matthews_corrcoef(targets, hard_preds)
 
 
+def _validate_spectra_metric_inputs(
+    model_spectra: List[List[float]],
+    target_spectra: List[List[float]],
+    threshold: float,
+    batch_size: int,
+):
+    """Validates and converts inputs shared by spectrum metrics."""
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+        raise ValueError('Spectra metric batch_size must be a positive integer.')
+    if threshold is not None and (not np.isfinite(threshold) or threshold <= 0):
+        raise ValueError('Spectra metric threshold must be finite and positive.')
+    if len(model_spectra) == 0 or len(target_spectra) == 0:
+        raise ValueError('Spectra metrics require at least one spectrum.')
+
+    try:
+        predictions = np.asarray(model_spectra, dtype=float)
+    except (TypeError, ValueError) as error:
+        raise ValueError('Predicted spectra must form a numeric rectangular matrix.') from error
+    if predictions.ndim != 2 or predictions.shape[1] == 0:
+        raise ValueError('Predicted spectra must form a non-empty rectangular matrix.')
+
+    try:
+        targets_object = np.asarray(target_spectra, dtype=object)
+    except (TypeError, ValueError) as error:
+        raise ValueError('Target spectra must form a rectangular matrix.') from error
+    if targets_object.ndim != 2 or targets_object.shape != predictions.shape:
+        raise ValueError('Predicted and target spectra must have the same rectangular shape.')
+    mask = np.asarray(
+        [[value is not None for value in row] for row in targets_object],
+        dtype=bool,
+    )
+    try:
+        targets = np.asarray(
+            [[0 if value is None else value for value in row] for row in targets_object],
+            dtype=float,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError('Target spectra must contain numeric or missing values.') from error
+
+    if np.any(np.sum(mask, axis=1) == 0):
+        raise ValueError('Every target spectrum must contain at least one observed value.')
+    if not np.all(np.isfinite(predictions[mask])):
+        raise ValueError('Observed predicted spectrum values must be finite.')
+    if not np.all(np.isfinite(targets[mask])):
+        raise ValueError('Observed target spectrum values must be finite.')
+    if np.any(targets[mask] < 0):
+        raise ValueError('Observed target spectrum values must be non-negative.')
+    if np.any(np.sum(targets, axis=1) <= 0):
+        raise ValueError('Every target spectrum must have a positive observed sum.')
+
+    return predictions, targets, mask
+
+
 def sid_metric(model_spectra: List[List[float]], target_spectra: List[List[float]], threshold: float = None,
                batch_size: int = 50) -> float:
     """
@@ -377,27 +430,36 @@ def sid_metric(model_spectra: List[List[float]], target_spectra: List[List[float
     :param batch_size: Batch size for calculating metric.
     :return: The average SID value for the predicted spectra.
     """
+    predictions, targets, mask = _validate_spectra_metric_inputs(
+        model_spectra, target_spectra, threshold, batch_size
+    )
+    if np.any(targets[mask] <= 0):
+        raise ValueError('SID requires strictly positive observed target values.')
     losses = []
-    num_iters, iter_step = len(model_spectra), batch_size
+    num_iters, iter_step = len(predictions), batch_size
 
     for i in trange(0, num_iters, iter_step):
-
-        # Create batches
-        batch_preds = model_spectra[i:i + iter_step]
-        batch_preds = np.array(batch_preds)
-        batch_targets = target_spectra[i:i + iter_step]
-        batch_mask = np.array([[x is not None for x in b] for b in batch_targets])
-        batch_targets = np.array([[1 if x is None else x for x in b] for b in batch_targets])
+        batch_preds = predictions[i:i + iter_step].copy()
+        batch_targets = targets[i:i + iter_step].copy()
+        batch_mask = mask[i:i + iter_step]
 
         # Normalize the model spectra before comparison
         if threshold is not None:
             batch_preds[batch_preds < threshold] = threshold
+        elif np.any(batch_preds[batch_mask] <= 0):
+            raise ValueError(
+                'SID requires strictly positive observed predictions when no '
+                'threshold is provided.'
+            )
         batch_preds[~batch_mask] = 0
         sum_preds = np.sum(batch_preds, axis=1, keepdims=True)
+        if np.any(~np.isfinite(sum_preds)) or np.any(sum_preds <= 0):
+            raise ValueError('Every predicted spectrum must have a positive finite observed sum.')
         batch_preds = batch_preds / sum_preds
 
         # Calculate loss value
         batch_preds[~batch_mask] = 1  # losses in excluded regions will be zero because log(1/1) = 0.
+        batch_targets[~batch_mask] = 1
         loss = batch_preds * np.log(batch_preds / batch_targets) + batch_targets * np.log(batch_targets / batch_preds)
         loss = np.sum(loss, axis=1)
 
@@ -405,7 +467,9 @@ def sid_metric(model_spectra: List[List[float]], target_spectra: List[List[float
         loss = loss.tolist()
         losses.extend(loss)
 
-    loss = np.mean(losses)
+    loss = float(np.mean(losses))
+    if not np.isfinite(loss):
+        raise ValueError('SID produced a non-finite value.')
 
     return loss
 
@@ -422,23 +486,29 @@ def wasserstein_metric(model_spectra: List[List[float]], target_spectra: List[Li
     :param batch_size: Batch size for calculating metric.
     :return: The average wasserstein loss value for the predicted spectra.
     """
+    predictions, targets, mask = _validate_spectra_metric_inputs(
+        model_spectra, target_spectra, threshold, batch_size
+    )
     losses = []
-    num_iters, iter_step = len(model_spectra), batch_size
+    num_iters, iter_step = len(predictions), batch_size
 
     for i in trange(0, num_iters, iter_step):
-
-        # Create batches
-        batch_preds = model_spectra[i:i + iter_step]
-        batch_preds = np.array(batch_preds)
-        batch_targets = target_spectra[i:i + iter_step]
-        batch_mask = np.array([[x is not None for x in b] for b in batch_targets])
-        batch_targets = np.array([[0 if x is None else x for x in b] for b in batch_targets])
+        batch_preds = predictions[i:i + iter_step].copy()
+        batch_targets = targets[i:i + iter_step]
+        batch_mask = mask[i:i + iter_step]
 
         # Normalize the model spectra before comparison
         if threshold is not None:
             batch_preds[batch_preds < threshold] = threshold
+        elif np.any(batch_preds[batch_mask] < 0):
+            raise ValueError(
+                'Wasserstein requires non-negative observed predictions when '
+                'no threshold is provided.'
+            )
         batch_preds[~batch_mask] = 0
         sum_preds = np.sum(batch_preds, axis=1, keepdims=True)
+        if np.any(~np.isfinite(sum_preds)) or np.any(sum_preds <= 0):
+            raise ValueError('Every predicted spectrum must have a positive finite observed sum.')
         batch_preds = batch_preds / sum_preds
 
         # Calculate loss value
@@ -451,6 +521,8 @@ def wasserstein_metric(model_spectra: List[List[float]], target_spectra: List[Li
         loss = loss.tolist()
         losses.extend(loss)
 
-    loss = np.mean(losses)
+    loss = float(np.mean(losses))
+    if not np.isfinite(loss):
+        raise ValueError('Wasserstein metric produced a non-finite value.')
 
     return loss

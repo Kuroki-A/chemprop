@@ -3,7 +3,7 @@ Chemprop
 
 .. note::
    These pages accompany the Kuroki-maintained Chemprop v1 compatibility
-   branch. The package version is ``1.7.1+kuroki.1`` and the source repository
+   branch. The package version is ``1.7.1+kuroki.2`` and the source repository
    is `<https://github.com/Kuroki-A/chemprop>`_.
 
 .. note:: The `fork README <https://github.com/Kuroki-A/chemprop/blob/master/README.md>`_ and `args.py <https://github.com/Kuroki-A/chemprop/blob/master/chemprop/args.py>`_ are the authoritative references for maintenance-only additions.

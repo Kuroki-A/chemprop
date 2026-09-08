@@ -57,12 +57,26 @@ def lsc_to_our_format(lsc_dir: str, ckpt_dir: str, save_dir: str):
             save_preds_path = os.path.join(save_fold_dir, 'preds.npy')
             save_targets_path = os.path.join(save_fold_dir, 'targets.npy')
 
-            # Copy targets
-            shutil.copy(ckpt_targets_path, save_targets_path)
+            # Validate alignment before publishing either output file.
+            targets = np.load(ckpt_targets_path, allow_pickle=False)
+            with h5py.File(lsc_preds_path, 'r') as preds_file:
+                if 'predictions' not in preds_file:
+                    raise ValueError(
+                        f'HDF5 file does not contain a predictions dataset: '
+                        f'{lsc_preds_path}'
+                    )
+                preds = np.asarray(preds_file['predictions'])
+            if preds.shape != targets.shape:
+                raise ValueError(
+                    f'Prediction shape {preds.shape} does not match target shape '
+                    f'{targets.shape} for {dataset} fold {fold}.'
+                )
+            if not np.issubdtype(preds.dtype, np.number) or not np.isfinite(preds).all():
+                raise ValueError(
+                    f'Predictions must be numeric and finite: {lsc_preds_path}'
+                )
 
-            # Convert and copy preds
-            preds_file = h5py.File(lsc_preds_path)
-            preds = np.array(preds_file['predictions'])
+            shutil.copy2(ckpt_targets_path, save_targets_path)
             np.save(save_preds_path, preds)
 
             success += 1

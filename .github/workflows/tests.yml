@@ -9,26 +9,45 @@ on:
   pull_request:
     branches: [ master ]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    # The historical integration module contains full multi-fold training and
+    # Hyperopt studies (individual cases can take around ten minutes).  Running
+    # all of those on every push made the nominal 180-minute job unreliable.
+    # Keep push/PR CI deterministic with the full unit suite plus a real,
+    # bounded train/predict smoke test; the exhaustive integration module can
+    # still be run manually before a release.
+    timeout-minutes: 90
     strategy:
       matrix:
         python-version: ['3.10']
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
     - name: Setup Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
         architecture: x64
     - name: Install dependencies
       shell: bash {0}
       run: |
-        python -m pip install --upgrade pip
-        python -m pip install flake8
+        python -m pip install "pip>=25,<27" "setuptools>=78,<82" "wheel>=0.45,<0.46"
+        python -m pip install "flake8==7.3.0" "build==1.6.0"
         python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
-        python -m pip install -e ".[test,features]"
+        # Unit coverage includes the maintained analysis scripts, whose HDF5
+        # regression tests require the optional ``scripts`` dependencies.
+        python -m pip install -e ".[test,features,docs,scripts]"
+        python -m pip check
     - name: Lint with flake8
       shell: bash {0}
       run: |
@@ -36,14 +55,41 @@ jobs:
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
         # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    - name: Test with pytest
+    - name: Run unit tests
       shell: bash {0}
       run: |
-        pytest -v
+        python -m pytest -q tests/test_unit
+    - name: Smoke-test training and prediction
+      shell: bash {0}
+      run: |
+        smoke_dir="${RUNNER_TEMP}/chemprop-smoke"
+        chemprop_train \
+          --data_path tests/data/regression.csv \
+          --dataset_type regression \
+          --save_dir "${smoke_dir}/model" \
+          --epochs 1 \
+          --warmup_epochs 0 \
+          --hidden_size 32 \
+          --ffn_hidden_size 32 \
+          --depth 2 \
+          --batch_size 64 \
+          --num_workers 0 \
+          --seed 0 \
+          --pytorch_seed 0 \
+          --quiet
+        chemprop_predict \
+          --test_path tests/data/regression.csv \
+          --preds_path "${smoke_dir}/predictions.csv" \
+          --checkpoint_dir "${smoke_dir}/model" \
+          --num_workers 0
+        python -c "import numpy as np, pandas as pd; values = pd.read_csv('${smoke_dir}/predictions.csv').iloc[:, 1:].to_numpy(dtype=float); assert values.size and np.isfinite(values).all()"
+    - name: Build documentation
+      shell: bash {0}
+      run: |
+        python -m sphinx -W -b html docs/source docs/build
     - name: Build and inspect wheel
       if: matrix.python-version == '3.10'
       shell: bash {0}
       run: |
-        python -m pip install build
-        python -m build --wheel --outdir dist/ .
-        python -c "import glob, zipfile; wheel = glob.glob('dist/*.whl')[0]; names = set(zipfile.ZipFile(wheel).namelist()); required = {'chemprop/web/app/schema.sql', 'chemprop/web/app/templates/layout.html', 'chemprop/web/app/static/stylesheets/style.css', 'chemprop/web/app/static/jsme/jsme/jsme.nocache.js'}; forbidden = {'chemprop/features/_features_generators.py'}; missing = sorted(required - names); unexpected = sorted(forbidden & names); assert not missing, f'Missing wheel assets: {missing}'; assert not unexpected, f'Unexpected local-only modules: {unexpected}'"
+        python -m build --sdist --wheel --outdir dist/ .
+        python -c "import glob, tarfile, zipfile; wheel = glob.glob('dist/*.whl')[0]; names = set(zipfile.ZipFile(wheel).namelist()); required = {'chemprop/web/app/schema.sql', 'chemprop/web/app/templates/layout.html', 'chemprop/web/app/static/stylesheets/style.css', 'chemprop/web/app/static/jsme/jsme/jsme.nocache.js'}; forbidden_suffix = 'chemprop/features/_features_generators.py'; missing = sorted(required - names); assert not missing, f'Missing wheel assets: {missing}'; assert not any(name.endswith(forbidden_suffix) for name in names), 'Comparison-only module leaked into wheel'; sdist = glob.glob('dist/*.tar.gz')[0]; sdist_names = set(tarfile.open(sdist, 'r:gz').getnames()); assert any(name.endswith('/README.md') for name in sdist_names), 'README missing from sdist'; assert not any(name.endswith(forbidden_suffix) for name in sdist_names), 'Comparison-only module leaked into sdist'"

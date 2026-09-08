@@ -11,7 +11,89 @@ from sklearn.isotonic import IsotonicRegression
 from chemprop.data import MoleculeDataset, StandardScaler
 from chemprop.models import MoleculeModel
 from chemprop.uncertainty.uncertainty_predictor import build_uncertainty_predictor, UncertaintyPredictor
-from chemprop.multitask_utils import reshape_values
+from chemprop.multitask_utils import (
+    flatten_atom_bond_value_sets,
+    flatten_atom_bond_values,
+    reshape_values,
+    validate_task_masks,
+)
+
+
+def _atom_bond_calibration_arrays(
+    calibration_data: MoleculeDataset, **row_major_values
+):
+    """Returns aligned flattened task arrays for variable-size targets."""
+    masks = validate_task_masks(calibration_data.mask())
+    lengths = [len(task_mask) for task_mask in masks]
+    task_values = flatten_atom_bond_value_sets(
+        row_major_values,
+        num_tasks=len(masks),
+        expected_lengths=lengths,
+    )
+    return masks, task_values
+
+
+def _observed_regression_calibration_task(
+    method: str,
+    task_index: int,
+    predictions,
+    targets,
+    variances,
+    mask,
+):
+    """Validates and selects one task used to fit a variance calibrator."""
+    task_predictions = np.asarray(predictions, dtype=float).reshape(-1)
+    task_targets = np.asarray(targets, dtype=float).reshape(-1)
+    task_variances = np.asarray(variances, dtype=float).reshape(-1)
+    task_mask = np.asarray(mask, dtype=bool).reshape(-1)
+    lengths = {
+        len(task_predictions), len(task_targets), len(task_variances), len(task_mask)
+    }
+    if len(lengths) != 1:
+        raise ValueError(
+            f'{method} calibration task {task_index} has misaligned '
+            'predictions, targets, variances, and mask.'
+        )
+
+    task_predictions = task_predictions[task_mask]
+    task_targets = task_targets[task_mask]
+    task_variances = task_variances[task_mask]
+    if task_targets.size == 0:
+        raise ValueError(
+            f'{method} calibration task {task_index} has no observed targets.'
+        )
+    if (
+        not np.all(np.isfinite(task_predictions))
+        or not np.all(np.isfinite(task_targets))
+        or not np.all(np.isfinite(task_variances))
+        or np.any(task_variances <= 0)
+    ):
+        raise ValueError(
+            f'{method} calibration task {task_index} requires finite '
+            'predictions and targets and finite, strictly positive variances.'
+        )
+    return task_predictions, task_targets, task_variances
+
+
+def _conformal_quantile(scores, alpha: float) -> float:
+    """Returns the finite-sample corrected conformal quantile."""
+    if (
+        not isinstance(alpha, (int, float, np.integer, np.floating))
+        or isinstance(alpha, (bool, np.bool_))
+        or not np.isfinite(alpha)
+        or not 0 < alpha < 1
+    ):
+        raise ValueError('conformal_alpha must be finite and in the range (0, 1).')
+    scores = np.asarray(scores, dtype=float).reshape(-1)
+    if scores.size == 0:
+        raise ValueError('Every conformal calibration task needs observed targets.')
+    if not np.all(np.isfinite(scores)):
+        raise ValueError('Conformal calibration scores must be finite.')
+    quantile_level = min(
+        1.0,
+        np.ceil((scores.size + 1) * (1 - alpha)) / scores.size,
+    )
+    return float(np.quantile(scores, quantile_level, method='higher'))
 
 
 class UncertaintyCalibrator(ABC):
@@ -149,37 +231,47 @@ class ZScalingCalibrator(UncertaintyCalibrator):
             raise ValueError("Z Score Scaling is only compatible with regression datasets.")
 
     def calibrate(self):
-        uncal_preds = np.array(self.calibration_predictor.get_uncal_preds())  # shape(data, tasks)
-        uncal_vars = np.array(self.calibration_predictor.get_uncal_vars())
-        targets = np.array(self.calibration_data.targets())
-        mask = np.array(self.calibration_data.mask())
-        self.num_tasks = len(mask)
         if self.calibration_data.is_atom_bond_targets:
-            uncal_preds = [np.concatenate(x) for x in zip(*uncal_preds)]
-            uncal_vars = [np.concatenate(x) for x in zip(*uncal_vars)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            mask, arrays = _atom_bond_calibration_arrays(
+                self.calibration_data,
+                predictions=self.calibration_predictor.get_uncal_preds(),
+                variances=self.calibration_predictor.get_uncal_vars(),
+                targets=self.calibration_data.targets(),
+            )
+            uncal_preds = arrays['predictions']
+            uncal_vars = arrays['variances']
+            targets = arrays['targets']
         else:
-            uncal_preds = np.array(list(zip(*uncal_preds)))
-            uncal_vars = np.array(list(zip(*uncal_vars)))
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
+            uncal_preds = np.asarray(
+                self.calibration_predictor.get_uncal_preds(), dtype=float,
+            ).T
+            uncal_vars = np.asarray(
+                self.calibration_predictor.get_uncal_vars(), dtype=float,
+            ).T
+            targets = np.asarray(self.calibration_data.targets(), dtype=float).T
+            mask = np.asarray(self.calibration_data.mask(), dtype=bool)
+        self.num_tasks = len(mask)
         self.scaling = np.zeros(self.num_tasks)
 
         for i in range(self.num_tasks):
-            task_mask = mask[i]
-            task_targets = targets[i][task_mask]
-            task_preds = uncal_preds[i][task_mask]
-            task_vars = uncal_vars[i][task_mask]
+            task_preds, task_targets, task_vars = (
+                _observed_regression_calibration_task(
+                    'Z-scaling', i, uncal_preds[i], targets[i], uncal_vars[i], mask[i]
+                )
+            )
             task_errors = task_preds - task_targets
             task_zscore = task_errors / np.sqrt(task_vars)
 
             def objective(scaler_value: float):
+                scaler_value = float(np.asarray(scaler_value).reshape(-1)[0])
+                if not np.isfinite(scaler_value) or scaler_value <= 0:
+                    return np.inf
                 scaled_vars = task_vars * scaler_value**2
                 nll = np.log(2 * np.pi * scaled_vars) / 2 + (task_errors) ** 2 / (2 * scaled_vars)
                 return nll.sum()
 
-            initial_guess = np.std(task_zscore)
-            sol = fmin(objective, initial_guess)
+            initial_guess = max(float(np.std(task_zscore)), np.sqrt(np.finfo(float).eps))
+            sol = float(fmin(objective, initial_guess, disp=False)[0])
 
             if self.regression_calibrator_metric == "stdev":
                 self.scaling[i] = sol
@@ -209,19 +301,26 @@ class ZScalingCalibrator(UncertaintyCalibrator):
         targets: List[List[float]],
         mask: List[List[bool]],
     ):
-        unc_var = np.square(unc)
-        preds = np.array(preds)
-        targets = np.array(targets)
-        mask = np.array(mask)
         if self.calibration_data.is_atom_bond_targets:
-            unc_var = [np.concatenate(x) for x in zip(*unc_var)]
-            preds = [np.concatenate(x) for x in zip(*preds)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            task_masks = validate_task_masks(mask, num_tasks=self.num_tasks)
+            lengths = [len(task_mask) for task_mask in task_masks]
+            preds = flatten_atom_bond_values(
+                preds, self.num_tasks, 'Predictions', lengths,
+            )
+            unc_var = [
+                np.square(values) for values in flatten_atom_bond_values(
+                    unc, self.num_tasks, 'Uncertainties', lengths,
+                )
+            ]
+            targets = flatten_atom_bond_values(
+                targets, self.num_tasks, 'Targets', lengths,
+            )
+            mask = task_masks
         else:
-            unc_var = np.array(list(zip(*unc_var)))
-            preds = np.array(list(zip(*preds)))
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
+            unc_var = np.square(np.asarray(unc, dtype=float)).T
+            preds = np.asarray(preds, dtype=float).T
+            targets = np.asarray(targets, dtype=float).T
+            mask = np.asarray(mask, dtype=bool)
         nll = []
         for i in range(self.num_tasks):
             task_mask = mask[i]
@@ -265,27 +364,34 @@ class TScalingCalibrator(UncertaintyCalibrator):
             raise ValueError("T scaling is intended for use with ensemble models.")
 
     def calibrate(self):
-        uncal_preds = np.array(self.calibration_predictor.get_uncal_preds())  # shape(data, tasks)
-        uncal_vars = np.array(self.calibration_predictor.get_uncal_vars())
-        targets = np.array(self.calibration_data.targets())
-        mask = np.array(self.calibration_data.mask())
-        self.num_tasks = len(mask)
         if self.calibration_data.is_atom_bond_targets:
-            uncal_preds = [np.concatenate(x) for x in zip(*uncal_preds)]
-            uncal_vars = [np.concatenate(x) for x in zip(*uncal_vars)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            mask, arrays = _atom_bond_calibration_arrays(
+                self.calibration_data,
+                predictions=self.calibration_predictor.get_uncal_preds(),
+                variances=self.calibration_predictor.get_uncal_vars(),
+                targets=self.calibration_data.targets(),
+            )
+            uncal_preds = arrays['predictions']
+            uncal_vars = arrays['variances']
+            targets = arrays['targets']
         else:
-            uncal_preds = np.array(list(zip(*uncal_preds)))
-            uncal_vars = np.array(list(zip(*uncal_vars)))
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
+            uncal_preds = np.asarray(
+                self.calibration_predictor.get_uncal_preds(), dtype=float,
+            ).T
+            uncal_vars = np.asarray(
+                self.calibration_predictor.get_uncal_vars(), dtype=float,
+            ).T
+            targets = np.asarray(self.calibration_data.targets(), dtype=float).T
+            mask = np.asarray(self.calibration_data.mask(), dtype=bool)
+        self.num_tasks = len(mask)
         self.scaling = np.zeros(self.num_tasks)
 
         for i in range(self.num_tasks):
-            task_mask = mask[i]
-            task_targets = targets[i][task_mask]
-            task_preds = uncal_preds[i][task_mask]
-            task_vars = uncal_vars[i][task_mask]
+            task_preds, task_targets, task_vars = (
+                _observed_regression_calibration_task(
+                    'T-scaling', i, uncal_preds[i], targets[i], uncal_vars[i], mask[i]
+                )
+            )
             std_error_of_mean = np.sqrt(
                 task_vars / (self.num_models - 1)
             )  # reduced for number of samples and include Bessel's correction
@@ -293,6 +399,9 @@ class TScalingCalibrator(UncertaintyCalibrator):
             task_tscore = task_errors / std_error_of_mean
 
             def objective(scaler_value: np.ndarray):
+                scaler_value = float(np.asarray(scaler_value).reshape(-1)[0])
+                if not np.isfinite(scaler_value) or scaler_value <= 0:
+                    return np.inf
                 scaled_std = std_error_of_mean * scaler_value
                 likelihood = t.pdf(
                     x=task_errors, df=self.num_models - 1, scale=scaled_std
@@ -300,8 +409,8 @@ class TScalingCalibrator(UncertaintyCalibrator):
                 nll = -1 * np.sum(np.log(likelihood), axis=0)
                 return nll
 
-            initial_guess = np.std(task_tscore)
-            stdev_scaling = fmin(objective, initial_guess)
+            initial_guess = max(float(np.std(task_tscore)), np.sqrt(np.finfo(float).eps))
+            stdev_scaling = float(fmin(objective, initial_guess, disp=False)[0])
             if self.regression_calibrator_metric == "stdev":
                 self.scaling[i] = stdev_scaling
             else:  # interval
@@ -336,25 +445,47 @@ class TScalingCalibrator(UncertaintyCalibrator):
         targets: List[List[float]],
         mask: List[List[bool]],
     ):
-        unc = np.square(unc)
-        preds = np.array(preds)
-        targets = np.array(targets)
-        mask = np.array(mask)
+        # ``apply_calibration`` returns the Student-t scale (a calibrated
+        # standard deviation), which is exactly what scipy's ``scale``
+        # parameter expects. Squaring it here incorrectly treated a variance
+        # as a scale and distorted every T-scaling NLL evaluation.
         if self.calibration_data.is_atom_bond_targets:
-            unc = [np.concatenate(x) for x in zip(*unc)]
-            preds = [np.concatenate(x) for x in zip(*preds)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            task_masks = validate_task_masks(mask, num_tasks=self.num_tasks)
+            lengths = [len(task_mask) for task_mask in task_masks]
+            unc = flatten_atom_bond_values(
+                unc, self.num_tasks, 'Uncertainties', lengths,
+            )
+            preds = flatten_atom_bond_values(
+                preds, self.num_tasks, 'Predictions', lengths,
+            )
+            targets = flatten_atom_bond_values(
+                targets, self.num_tasks, 'Targets', lengths,
+            )
+            mask = task_masks
         else:
-            unc = np.array(list(zip(*unc)))
-            preds = np.array(list(zip(*preds)))
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
+            unc = np.asarray(unc, dtype=float).T
+            preds = np.asarray(preds, dtype=float).T
+            targets = np.asarray(targets, dtype=float).T
+            mask = np.asarray(mask, dtype=bool)
         nll = []
         for i in range(self.num_tasks):
             task_mask = mask[i]
             task_preds = preds[i][task_mask]
             task_targets = targets[i][task_mask]
             task_unc = unc[i][task_mask]
+            if task_unc.size == 0:
+                nll.append(float('nan'))
+                continue
+            if (
+                not np.all(np.isfinite(task_preds))
+                or not np.all(np.isfinite(task_targets))
+                or not np.all(np.isfinite(task_unc))
+                or np.any(task_unc <= 0)
+            ):
+                raise ValueError(
+                    'T-scaling NLL expects finite predictions and targets and '
+                    'finite, strictly positive scale values.'
+                )
             task_nll = -1 * t.logpdf(
                 x=task_preds - task_targets, scale=task_unc, df=self.num_models - 1
             )
@@ -386,27 +517,34 @@ class ZelikmanCalibrator(UncertaintyCalibrator):
             raise ValueError("Crude Scaling is only compatible with regression datasets.")
 
     def calibrate(self):
-        uncal_preds = np.array(self.calibration_predictor.get_uncal_preds())  # shape(data, tasks)
-        uncal_vars = np.array(self.calibration_predictor.get_uncal_vars())
-        targets = np.array(self.calibration_data.targets())
-        mask = np.array(self.calibration_data.mask())
-        self.num_tasks = len(mask)
         if self.calibration_data.is_atom_bond_targets:
-            uncal_preds = [np.concatenate(x) for x in zip(*uncal_preds)]
-            uncal_vars = [np.concatenate(x) for x in zip(*uncal_vars)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            mask, arrays = _atom_bond_calibration_arrays(
+                self.calibration_data,
+                predictions=self.calibration_predictor.get_uncal_preds(),
+                variances=self.calibration_predictor.get_uncal_vars(),
+                targets=self.calibration_data.targets(),
+            )
+            uncal_preds = arrays['predictions']
+            uncal_vars = arrays['variances']
+            targets = arrays['targets']
         else:
-            uncal_preds = np.array(list(zip(*uncal_preds)))
-            uncal_vars = np.array(list(zip(*uncal_vars)))
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
+            uncal_preds = np.asarray(
+                self.calibration_predictor.get_uncal_preds(), dtype=float,
+            ).T
+            uncal_vars = np.asarray(
+                self.calibration_predictor.get_uncal_vars(), dtype=float,
+            ).T
+            targets = np.asarray(self.calibration_data.targets(), dtype=float).T
+            mask = np.asarray(self.calibration_data.mask(), dtype=bool)
+        self.num_tasks = len(mask)
         self.histogram_parameters = []
         self.scaling = np.zeros(self.num_tasks)
         for i in range(self.num_tasks):
-            task_mask = mask[i]
-            task_preds = uncal_preds[i][task_mask]
-            task_targets = targets[i][task_mask]
-            task_vars = uncal_vars[i][task_mask]
+            task_preds, task_targets, task_vars = (
+                _observed_regression_calibration_task(
+                    'Zelikman', i, uncal_preds[i], targets[i], uncal_vars[i], mask[i]
+                )
+            )
             task_preds = np.abs(task_preds - task_targets) / np.sqrt(task_vars)
             if self.regression_calibrator_metric == "interval":
                 interval_scaling = np.percentile(task_preds, self.interval_percentile)
@@ -442,19 +580,24 @@ class ZelikmanCalibrator(UncertaintyCalibrator):
         targets: List[List[float]],
         mask: List[List[bool]],
     ):
-        preds = np.array(preds)
-        unc = np.array(unc)
-        targets = np.array(targets)
-        mask = np.array(mask)
         if self.calibration_data.is_atom_bond_targets:
-            preds = [np.concatenate(x) for x in zip(*preds)]
-            unc = [np.concatenate(x) for x in zip(*unc)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            task_masks = validate_task_masks(mask, num_tasks=self.num_tasks)
+            lengths = [len(task_mask) for task_mask in task_masks]
+            preds = flatten_atom_bond_values(
+                preds, self.num_tasks, 'Predictions', lengths,
+            )
+            unc = flatten_atom_bond_values(
+                unc, self.num_tasks, 'Uncertainties', lengths,
+            )
+            targets = flatten_atom_bond_values(
+                targets, self.num_tasks, 'Targets', lengths,
+            )
+            mask = task_masks
         else:
-            preds = np.array(list(zip(*preds)))
-            unc = np.array(list(zip(*unc)))
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
+            preds = np.asarray(preds, dtype=float).T
+            unc = np.asarray(unc, dtype=float).T
+            targets = np.asarray(targets, dtype=float).T
+            mask = np.asarray(mask, dtype=bool)
         nll = []
         for i in range(self.num_tasks):
             task_mask = mask[i]
@@ -505,22 +648,60 @@ class MVEWeightingCalibrator(UncertaintyCalibrator):
             )
 
     def calibrate(self):
-        uncal_preds = np.array(self.calibration_predictor.get_uncal_preds())  # shape(data, tasks)
-        individual_vars = np.array(
-            self.calibration_predictor.get_individual_vars()
-        )  # shape(models, data, tasks)
-        targets = np.array(self.calibration_data.targets())
-        mask = np.array(self.calibration_data.mask())
-        self.num_tasks = len(mask)
+        individual_vars = self.calibration_predictor.get_individual_vars()
         if self.calibration_data.is_atom_bond_targets:
-            uncal_preds = [np.concatenate(x) for x in zip(*uncal_preds)]
-            individual_vars = [np.array([np.concatenate(individual_vars[j][i][:, :]) for j in range(self.num_models)]) for i in range(self.num_tasks)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            mask, arrays = _atom_bond_calibration_arrays(
+                self.calibration_data,
+                predictions=self.calibration_predictor.get_uncal_preds(),
+                targets=self.calibration_data.targets(),
+            )
+            self.num_tasks = len(mask)
+            uncal_preds = arrays['predictions']
+            targets = arrays['targets']
+            if len(individual_vars) != self.num_models:
+                raise ValueError('MVE weighting received the wrong number of model variances.')
+            task_lengths = [len(task_mask) for task_mask in mask]
+            task_individual_vars = []
+            for task_index, expected_length in enumerate(task_lengths):
+                try:
+                    model_values = [
+                        np.asarray(model_vars[task_index], dtype=float).reshape(-1)
+                        for model_vars in individual_vars
+                    ]
+                    task_values = np.stack(model_values, axis=0)
+                except (IndexError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        'Atom/bond MVE variances must have matching shapes for '
+                        'every model and task.'
+                    ) from error
+                if task_values.shape != (self.num_models, expected_length):
+                    raise ValueError(
+                        f'Atom/bond MVE variance task {task_index} has shape '
+                        f'{task_values.shape}; expected '
+                        f'{(self.num_models, expected_length)}.'
+                    )
+                task_individual_vars.append(task_values)
+            individual_vars = task_individual_vars
         else:
-            uncal_preds = np.array(list(zip(*uncal_preds)))
-            individual_vars = [individual_vars[:, :, i] for i in range(self.num_tasks)]
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
+            uncal_preds = np.asarray(
+                self.calibration_predictor.get_uncal_preds(), dtype=float,
+            ).T
+            individual_vars = np.asarray(individual_vars, dtype=float)
+            targets = np.asarray(self.calibration_data.targets(), dtype=float).T
+            mask = np.asarray(self.calibration_data.mask(), dtype=bool)
+            self.num_tasks = len(mask)
+            if (
+                individual_vars.ndim != 3
+                or individual_vars.shape[0] != self.num_models
+                or individual_vars.shape[2] != self.num_tasks
+            ):
+                raise ValueError(
+                    'MVE individual variances must have shape (models, data, tasks).'
+                )
+            individual_vars = [
+                individual_vars[:, :, task_index]
+                for task_index in range(self.num_tasks)
+            ]
         self.var_weighting = np.zeros([self.num_models, self.num_tasks])  # shape(models, tasks)
 
         for i in range(self.num_tasks):
@@ -549,29 +730,67 @@ class MVEWeightingCalibrator(UncertaintyCalibrator):
 
     def apply_calibration(self, uncal_predictor: UncertaintyPredictor):
         uncal_preds = np.array(uncal_predictor.get_uncal_preds())
-        uncal_individual_vars = np.array(uncal_predictor.get_individual_vars())
-        weighted_vars = None
-        for ind_vars, s in zip(uncal_individual_vars, self.var_weighting):
-            if weighted_vars is None:
-                weighted_vars = ind_vars
-                for i in range(len(s)):
-                    weighted_vars[i] *= s[i]
-            else:
-                for i in range(len(s)):
-                    weighted_vars[i] += ind_vars[i] * s[i]
+        uncal_individual_vars = uncal_predictor.get_individual_vars()
         if self.calibration_data.is_atom_bond_targets:
-            sqrt_weighted_vars = [np.array([np.sqrt(var) for var in uncal_var]) for uncal_var in weighted_vars]
-            weighted_stdev = sqrt_weighted_vars * self.scaling
+            if len(uncal_individual_vars) != self.num_models:
+                raise ValueError('MVE weighting received the wrong number of model variances.')
+            weighted_vars = []
+            for task_index in range(self.num_tasks):
+                try:
+                    task_model_vars = np.stack(
+                        [
+                            np.asarray(model_vars[task_index], dtype=float)
+                            for model_vars in uncal_individual_vars
+                        ],
+                        axis=0,
+                    )
+                except (IndexError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        'Atom/bond MVE variances must have matching shapes for '
+                        'every model and task.'
+                    ) from error
+                task_weights = self.var_weighting[:, task_index].reshape(
+                    (self.num_models,) + (1,) * (task_model_vars.ndim - 1)
+                )
+                weighted_vars.append(np.sum(task_model_vars * task_weights, axis=0))
+
+            weighted_stdev = [
+                np.sqrt(task_vars) * self.scaling[task_index]
+                for task_index, task_vars in enumerate(weighted_vars)
+            ]
             natom_targets = len(self.calibration_data[0].atom_targets) if self.calibration_data[0].atom_targets is not None else 0
             nbond_targets = len(self.calibration_data[0].bond_targets) if self.calibration_data[0].bond_targets is not None else 0
             weighted_stdev = reshape_values(
                 weighted_stdev,
-                self.calibration_data,
+                uncal_predictor.test_data,
                 natom_targets,
                 nbond_targets,
             )
             return uncal_preds, weighted_stdev
         else:
+            try:
+                uncal_individual_vars = np.asarray(
+                    uncal_individual_vars, dtype=float,
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    'MVE variances must form a numeric (models, data, tasks) array.'
+                ) from error
+            expected_prefix = (self.num_models,)
+            if (
+                uncal_individual_vars.ndim != 3
+                or uncal_individual_vars.shape[:1] != expected_prefix
+                or uncal_individual_vars.shape[2] != self.num_tasks
+                or self.var_weighting.shape != (self.num_models, self.num_tasks)
+            ):
+                raise ValueError(
+                    'MVE variances and calibration weights have incompatible shapes.'
+                )
+            weighted_vars = np.sum(
+                uncal_individual_vars
+                * self.var_weighting[:, np.newaxis, :],
+                axis=0,
+            )
             weighted_stdev = np.sqrt(weighted_vars) * self.scaling
             return uncal_preds.tolist(), weighted_stdev.tolist()
 
@@ -582,19 +801,26 @@ class MVEWeightingCalibrator(UncertaintyCalibrator):
         targets: List[List[float]],
         mask: List[List[bool]],
     ):
-        unc_var = np.square(unc)
-        preds = np.array(preds)
-        targets = np.array(targets)
-        mask = np.array(mask)
         if self.calibration_data.is_atom_bond_targets:
-            unc_var = [np.concatenate(np.square(x)) for x in zip(*unc)]
-            preds = [np.concatenate(x) for x in zip(*preds)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            task_masks = validate_task_masks(mask, num_tasks=self.num_tasks)
+            lengths = [len(task_mask) for task_mask in task_masks]
+            unc_var = [
+                np.square(values) for values in flatten_atom_bond_values(
+                    unc, self.num_tasks, 'Uncertainties', lengths,
+                )
+            ]
+            preds = flatten_atom_bond_values(
+                preds, self.num_tasks, 'Predictions', lengths,
+            )
+            targets = flatten_atom_bond_values(
+                targets, self.num_tasks, 'Targets', lengths,
+            )
+            mask = task_masks
         else:
-            unc_var = np.array(list(zip(*unc_var)))
-            preds = np.array(list(zip(*preds)))
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
+            unc_var = np.square(np.asarray(unc, dtype=float)).T
+            preds = np.asarray(preds, dtype=float).T
+            targets = np.asarray(targets, dtype=float).T
+            mask = np.asarray(mask, dtype=bool)
         nll = []
         for i in range(self.num_tasks):
             task_mask = mask[i]
@@ -625,18 +851,19 @@ class PlattCalibrator(UncertaintyCalibrator):
             raise ValueError("Platt scaling is only implemented for classification dataset types.")
 
     def calibrate(self):
-        uncal_preds = np.array(
-            self.calibration_predictor.get_uncal_preds()
-        )  # shape(data, tasks)
-        targets = np.array(self.calibration_data.targets())
+        raw_predictions = self.calibration_predictor.get_uncal_preds()
         if self.calibration_data.is_atom_bond_targets:
-            uncal_preds = [np.concatenate(x) for x in zip(*uncal_preds)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            mask, arrays = _atom_bond_calibration_arrays(
+                self.calibration_data,
+                predictions=raw_predictions,
+                targets=self.calibration_data.targets(),
+            )
+            uncal_preds = arrays['predictions']
+            targets = arrays['targets']
         else:
-            uncal_preds = np.array(list(zip(*uncal_preds)))
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
-        mask = np.array(self.calibration_data.mask())
+            uncal_preds = np.asarray(raw_predictions, dtype=float).T
+            targets = np.asarray(self.calibration_data.targets(), dtype=float).T
+            mask = np.asarray(self.calibration_data.mask(), dtype=bool)
         self.num_tasks = len(mask)
         # If train class sizes are available, set Bayes corrected calibration targets
         if self.calibration_predictor.train_class_sizes is not None:
@@ -688,24 +915,65 @@ class PlattCalibrator(UncertaintyCalibrator):
         self.platt_b = platt_parameters[:, 1]
 
     def apply_calibration(self, uncal_predictor: UncertaintyPredictor):
-        uncal_preds = np.array(uncal_predictor.get_uncal_preds())  # shape(data, task)
+        raw_predictions = uncal_predictor.get_uncal_preds()
+        if self.calibration_data.is_atom_bond_targets:
+            task_predictions = flatten_atom_bond_values(
+                raw_predictions,
+                num_tasks=self.num_tasks,
+                label='predictions',
+            )
+            eps = np.finfo(float).eps
+            task_calibrated = [
+                expit(
+                    self.platt_a[task_index]
+                    * logit(np.clip(values, eps, 1 - eps))
+                    + self.platt_b[task_index]
+                )
+                for task_index, values in enumerate(task_predictions)
+            ]
+            calibration_example = self.calibration_data[0]
+            natom_targets = (
+                len(calibration_example.atom_targets)
+                if calibration_example.atom_targets is not None
+                else 0
+            )
+            nbond_targets = (
+                len(calibration_example.bond_targets)
+                if calibration_example.bond_targets is not None
+                else 0
+            )
+            cal_preds = reshape_values(
+                task_calibrated,
+                uncal_predictor.test_data,
+                natom_targets,
+                nbond_targets,
+            )
+            return raw_predictions, cal_preds
+
+        uncal_preds = np.asarray(raw_predictions, dtype=float)
+        eps = np.finfo(float).eps
         cal_preds = expit(
-            np.expand_dims(self.platt_a, axis=0) * logit(uncal_preds)
+            np.expand_dims(self.platt_a, axis=0)
+            * logit(np.clip(uncal_preds, eps, 1 - eps))
             + np.expand_dims(self.platt_b, axis=0)
         )
         return uncal_preds.tolist(), cal_preds.tolist()
 
     def nll(self, preds: List[List[float]], unc: List[List[float]], targets: List[List[float]], mask: List[List[bool]]):
-        targets = np.array(targets)
-        unc = np.array(unc)
-        mask = np.array(mask)
         if self.calibration_data.is_atom_bond_targets:
-            targets = [np.concatenate(x) for x in zip(*targets)]
-            unc = [np.concatenate(x) for x in zip(*unc)]
+            task_masks = validate_task_masks(mask, num_tasks=self.num_tasks)
+            lengths = [len(task_mask) for task_mask in task_masks]
+            targets = flatten_atom_bond_values(
+                targets, self.num_tasks, 'Targets', lengths,
+            )
+            unc = flatten_atom_bond_values(
+                unc, self.num_tasks, 'Uncertainties', lengths,
+            )
+            mask = task_masks
         else:
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
-            unc = np.array(list(zip(*unc)))
+            targets = np.asarray(targets, dtype=float).T
+            unc = np.asarray(unc, dtype=float).T
+            mask = np.asarray(mask, dtype=bool)
         nll = []
         for i in range(self.num_tasks):
             task_mask = mask[i]
@@ -738,20 +1006,20 @@ class IsotonicCalibrator(UncertaintyCalibrator):
             )
 
     def calibrate(self):
-        uncal_preds = np.array(
-            self.calibration_predictor.get_uncal_preds()
-        )  # shape(data, tasks)
-        targets = np.array(self.calibration_data.targets())
-        mask = np.array(self.calibration_data.mask())
-        self.num_tasks = len(mask)
-
+        raw_predictions = self.calibration_predictor.get_uncal_preds()
         if self.calibration_data.is_atom_bond_targets:
-            uncal_preds = [np.concatenate(x) for x in zip(*uncal_preds)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            mask, arrays = _atom_bond_calibration_arrays(
+                self.calibration_data,
+                predictions=raw_predictions,
+                targets=self.calibration_data.targets(),
+            )
+            uncal_preds = arrays['predictions']
+            targets = arrays['targets']
         else:
-            uncal_preds = np.array(list(zip(*uncal_preds)))
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
+            uncal_preds = np.asarray(raw_predictions, dtype=float).T
+            targets = np.asarray(self.calibration_data.targets(), dtype=float).T
+            mask = np.asarray(self.calibration_data.mask(), dtype=bool)
+        self.num_tasks = len(mask)
 
         isotonic_models = []
         for i in range(self.num_tasks):
@@ -786,16 +1054,20 @@ class IsotonicCalibrator(UncertaintyCalibrator):
             return uncal_preds.tolist(), cal_preds.tolist()
 
     def nll(self, preds: List[List[float]], unc: List[List[float]], targets: List[List[float]], mask: List[List[bool]]):
-        targets = np.array(targets)
-        mask = np.array(mask)
-        unc = np.array(unc)
         if self.calibration_data.is_atom_bond_targets:
-            targets = [np.concatenate(x) for x in zip(*targets)]
-            unc = [np.concatenate(x) for x in zip(*unc)]
+            task_masks = validate_task_masks(mask, num_tasks=self.num_tasks)
+            lengths = [len(task_mask) for task_mask in task_masks]
+            targets = flatten_atom_bond_values(
+                targets, self.num_tasks, 'Targets', lengths,
+            )
+            unc = flatten_atom_bond_values(
+                unc, self.num_tasks, 'Uncertainties', lengths,
+            )
+            mask = task_masks
         else:
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
-            unc = np.array(list(zip(*unc)))
+            targets = np.asarray(targets, dtype=float).T
+            unc = np.asarray(unc, dtype=float).T
+            mask = np.asarray(mask, dtype=bool)
         nll = []
         for i in range(self.num_tasks):
             task_mask = mask[i]
@@ -877,7 +1149,7 @@ class IsotonicMulticlassCalibrator(UncertaintyCalibrator):
         targets: List[List[float]],
         mask: List[List[bool]],
     ):
-        targets = np.array(targets, dtype=int)  # shape(data, tasks)
+        targets = np.array(targets, dtype=float)  # shape(data, tasks)
         mask = np.array(mask)
         unc = np.array(unc)
         preds = np.array(preds)
@@ -885,9 +1157,17 @@ class IsotonicMulticlassCalibrator(UncertaintyCalibrator):
         for i in range(targets.shape[1]):
             task_mask = mask[i]
             task_preds = unc[task_mask, i]
-            task_targets = targets[task_mask, i]  # shape(data)
-            bin_targets = np.zeros_like(preds[:, 0, :])  # shape(data, classes)
-            bin_targets[np.arange(targets.shape[0]), task_targets] = 1
+            task_target_values = targets[task_mask, i]
+            if (
+                not np.all(np.isfinite(task_target_values))
+                or np.any(task_target_values != np.floor(task_target_values))
+            ):
+                raise ValueError('Multiclass targets must be finite integer class indices.')
+            task_targets = task_target_values.astype(int)  # shape(data)
+            if np.any(task_targets < 0) or np.any(task_targets >= task_preds.shape[1]):
+                raise ValueError('Multiclass targets must be valid class indices.')
+            bin_targets = np.zeros_like(task_preds)  # shape(valid_data, classes)
+            bin_targets[np.arange(task_targets.shape[0]), task_targets] = 1
             task_likelihood = np.sum(bin_targets * task_preds, axis=1)
             task_nll = -1 * np.log(task_likelihood)
             nll.append(task_nll.mean())
@@ -941,19 +1221,27 @@ class ConformalMulticlassCalibrator(UncertaintyCalibrator):
         )  # shape(data, tasks, num_classes)
         targets = np.array(self.calibration_data.targets(), dtype=float)  # shape(data, tasks)
         mask = np.array(self.calibration_data.mask(), dtype=bool)
-        num_data, self.num_tasks, self.num_classes = uncal_preds.shape
+        _, self.num_tasks, self.num_classes = uncal_preds.shape
 
         all_scores = self.nonconformity_scores(uncal_preds)
         self.qhats = []
 
         for i in range(self.num_tasks):
             task_mask = mask[i]
+            task_targets = targets[task_mask, i]
+            if (
+                not np.all(np.isfinite(task_targets))
+                or np.any(task_targets != np.floor(task_targets))
+                or np.any(task_targets < 0)
+                or np.any(task_targets >= self.num_classes)
+            ):
+                raise ValueError('Multiclass targets must be valid integer class indices.')
             task_scores = np.take_along_axis(
-                all_scores[task_mask, i], targets[task_mask, i].reshape(-1, 1).astype(int), axis=1
+                all_scores[task_mask, i], task_targets.reshape(-1, 1).astype(int), axis=1
             ).squeeze(1)  # shape(valid_data)
-            q_level = np.ceil((num_data + 1) * (1 - self.conformal_alpha)) / num_data
-            qhat = np.quantile(task_scores, q_level, interpolation='higher')
-            self.qhats.append(qhat)
+            self.qhats.append(
+                _conformal_quantile(task_scores, self.conformal_alpha)
+            )
 
     def apply_calibration(self, uncal_predictor: UncertaintyPredictor):
         uncal_preds = np.array(uncal_predictor.get_uncal_preds())  # shape(data, task)
@@ -1047,36 +1335,46 @@ class ConformalMultilabelCalibrator(UncertaintyCalibrator):
         uncal_preds = np.array(
             self.calibration_predictor.get_uncal_preds()
         )  # shape(data, tasks)
-        targets = np.array(self.calibration_data.targets(), dtype=bool)  # shape(data, tasks)
+        targets = np.array(self.calibration_data.targets(), dtype=float)  # shape(data, tasks)
         mask = np.array(self.calibration_data.mask(), dtype=bool)
         self.num_data, self.num_tasks = targets.shape
+        observed = mask.T
+        if uncal_preds.shape != targets.shape or observed.shape != targets.shape:
+            raise ValueError('Multilabel calibration predictions and targets must have matching shapes.')
+        if not np.all(np.isfinite(uncal_preds)):
+            raise ValueError('Multilabel calibration predictions must be finite.')
+        if np.any(~np.isin(targets[observed], [0, 1])):
+            raise ValueError('Observed multilabel calibration targets must be 0 or 1.')
 
-        has_zeros = np.any(targets == 0, axis=1)
-        inds_zeros = targets[has_zeros] == 0
-        scores_in = self.nonconformity_scores(uncal_preds[has_zeros])
-        masked_scores_in = scores_in * inds_zeros + np.nan_to_num(
-            np.inf * (1 - inds_zeros).astype(float)
+        scores = self.nonconformity_scores(uncal_preds)
+        negative_labels = observed & (targets == 0)
+        positive_labels = observed & (targets == 1)
+        rows_with_negatives = np.any(negative_labels, axis=1)
+        rows_with_positives = np.any(positive_labels, axis=1)
+        if not np.any(rows_with_negatives) or not np.any(rows_with_positives):
+            raise ValueError(
+                'Multilabel conformal calibration requires observed positive '
+                'and negative labels.'
+            )
+        calibration_scores_in = np.min(
+            np.where(negative_labels[rows_with_negatives], scores[rows_with_negatives], np.inf),
+            axis=1,
         )
-        calibration_scores_in = np.empty(masked_scores_in.shape[0])
-        for i, score_row in enumerate(masked_scores_in):
-            data_mask = mask.T[i]
-            masked_scores = score_row[data_mask]
-            calibration_scores_in[i] = np.min(masked_scores)
-
-        has_ones = np.any(targets == 1, axis=1)
-        inds_ones = targets[has_ones] == 1
-        scores_out = self.nonconformity_scores(uncal_preds[has_ones])
-        masked_scores_out = scores_out * inds_ones + np.nan_to_num(
-            -np.inf * (1 - inds_ones).astype(float)
+        calibration_scores_out = np.max(
+            np.where(positive_labels[rows_with_positives], scores[rows_with_positives], -np.inf),
+            axis=1,
         )
-        calibration_scores_out = np.empty(masked_scores_out.shape[0])
-        for i, score_row in enumerate(masked_scores_out):
-            data_mask = mask.T[i]
-            masked_scores = score_row[data_mask]
-            calibration_scores_out[i] = np.max(masked_scores)
 
-        self.tout = np.quantile(calibration_scores_out, 1 - self.conformal_alpha / 2, interpolation="higher")
-        self.tin = np.quantile(calibration_scores_in, self.conformal_alpha / 2, interpolation="higher")
+        self.tout = float(np.quantile(
+            calibration_scores_out,
+            1 - self.conformal_alpha / 2,
+            method="higher",
+        ))
+        self.tin = float(np.quantile(
+            calibration_scores_in,
+            self.conformal_alpha / 2,
+            method="higher",
+        ))
 
     def apply_calibration(self, uncal_predictor: UncertaintyPredictor):
         uncal_preds = np.array(uncal_predictor.get_uncal_preds())  # shape(data, task)
@@ -1120,21 +1418,26 @@ class ConformalRegressionCalibrator(UncertaintyCalibrator):
             )
 
     def calibrate(self):
-        uncal_preds = np.array(self.calibration_predictor.get_uncal_preds())  # shape(data, tasks)
-        uncal_interval = np.array(self.calibration_predictor.get_uncal_output())
-        targets = np.array(self.calibration_data.targets())
-        mask = np.array(self.calibration_data.mask())
-        num_data = uncal_interval.shape[0]
-        self.num_tasks = uncal_interval.shape[1]
         if self.calibration_data.is_atom_bond_targets:
-            uncal_preds = [np.concatenate(x) for x in zip(*uncal_preds)]
-            uncal_interval = [np.concatenate(x) for x in zip(*uncal_interval)]
-            targets = [np.concatenate(x) for x in zip(*targets)]
+            mask, arrays = _atom_bond_calibration_arrays(
+                self.calibration_data,
+                predictions=self.calibration_predictor.get_uncal_preds(),
+                intervals=self.calibration_predictor.get_uncal_output(),
+                targets=self.calibration_data.targets(),
+            )
+            uncal_preds = arrays['predictions']
+            uncal_interval = arrays['intervals']
+            targets = arrays['targets']
         else:
-            uncal_preds = np.array(list(zip(*uncal_preds)))
-            uncal_interval = np.array(list(zip(*uncal_interval)))
-            targets = targets.astype(float)
-            targets = np.array(list(zip(*targets)))
+            uncal_preds = np.asarray(
+                self.calibration_predictor.get_uncal_preds(), dtype=float,
+            ).T
+            uncal_interval = np.asarray(
+                self.calibration_predictor.get_uncal_output(), dtype=float,
+            ).T
+            targets = np.asarray(self.calibration_data.targets(), dtype=float).T
+            mask = np.asarray(self.calibration_data.mask(), dtype=bool)
+        self.num_tasks = len(mask)
 
         self.qhats = []
         for i in range(self.num_tasks):
@@ -1147,13 +1450,43 @@ class ConformalRegressionCalibrator(UncertaintyCalibrator):
             calibration_scores = np.maximum(
                 uncal_interval_lower - task_targets, task_targets - uncal_interval_upper
             )
-            q_level = np.ceil((num_data + 1) * (1 - self.conformal_alpha)) / num_data
-            qhat = np.quantile(calibration_scores, q_level, interpolation='higher')
-            self.qhats.append(qhat)
+            self.qhats.append(
+                _conformal_quantile(calibration_scores, self.conformal_alpha)
+            )
 
     def apply_calibration(self, uncal_predictor: UncertaintyPredictor):
-        uncal_preds = np.array(uncal_predictor.get_uncal_preds())  # shape(data, task)
-        uncal_interval = np.array(uncal_predictor.get_uncal_output())  # shape(data, task)
+        raw_preds = uncal_predictor.get_uncal_preds()
+        raw_intervals = uncal_predictor.get_uncal_output()
+        if self.calibration_data.is_atom_bond_targets:
+            task_values = flatten_atom_bond_value_sets(
+                {'predictions': raw_preds, 'intervals': raw_intervals},
+                num_tasks=self.num_tasks,
+            )
+            cal_task_intervals = [
+                values + self.qhats[task_index]
+                for task_index, values in enumerate(task_values['intervals'])
+            ]
+            calibration_example = self.calibration_data[0]
+            natom_targets = (
+                len(calibration_example.atom_targets)
+                if calibration_example.atom_targets is not None
+                else 0
+            )
+            nbond_targets = (
+                len(calibration_example.bond_targets)
+                if calibration_example.bond_targets is not None
+                else 0
+            )
+            cal_intervals = reshape_values(
+                cal_task_intervals,
+                uncal_predictor.test_data,
+                natom_targets,
+                nbond_targets,
+            )
+            return raw_preds, cal_intervals
+
+        uncal_preds = np.asarray(raw_preds, dtype=float)
+        uncal_interval = np.asarray(raw_intervals, dtype=float)
         cal_intervals = uncal_interval + self.qhats
         return uncal_preds, cal_intervals
 
@@ -1186,7 +1519,7 @@ def build_uncertainty_calibrator(
             else:
                 calibration_method = "zelikman_interval"
         if dataset_type in ["classification", "multiclass"]:
-            calibration_method == "isotonic"
+            calibration_method = "isotonic"
 
     supported_calibrators = {
         "zscaling": ZScalingCalibrator,

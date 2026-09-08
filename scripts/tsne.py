@@ -31,13 +31,23 @@ class Args(Tap):
     save_path: str  # Path to a .png file where the t-SNE plot will be saved
     cluster: bool = False  # Whether to create new clusters from all smiles, ignoring original csv groupings
 
+    def process_args(self) -> None:
+        # Tap class attributes are shared; give each parsed Args object its own
+        # mutable plotting lists.
+        self.colors = list(self.colors)
+        self.sizes = list(self.sizes)
+
 
 def compare_datasets_tsne(args: Args):
     if len(args.smiles_paths) > len(args.colors) or len(args.smiles_paths) > len(args.sizes):
         raise ValueError('Must have at least as many colors and sizes as datasets')
+    if args.max_per_dataset <= 0 or args.scale <= 0:
+        raise ValueError('max_per_dataset and scale must be positive.')
+    if any(not np.isfinite(size) or size <= 0 for size in args.sizes):
+        raise ValueError('All plotting sizes must be finite and positive.')
 
-    # Random seed for random subsampling
-    np.random.seed(0)
+    # Local RNG keeps subsampling reproducible without modifying global state.
+    rng = np.random.default_rng(0)
 
     # Load the smiles datasets
     print('Loading data')
@@ -53,11 +63,16 @@ def compare_datasets_tsne(args: Args):
         # Subsample if dataset is too large
         if len(new_smiles) > args.max_per_dataset:
             print(f'Subsampling to {args.max_per_dataset:,} molecules')
-            new_smiles = np.random.choice(new_smiles, size=args.max_per_dataset, replace=False).tolist()
+            new_smiles = rng.choice(
+                new_smiles, size=args.max_per_dataset, replace=False
+            ).tolist()
 
         slices.append(slice(len(smiles), len(smiles) + len(new_smiles)))
         labels.append(label)
         smiles += new_smiles
+
+    if len(smiles) < 2:
+        raise ValueError('t-SNE requires at least two molecules in total.')
 
     # Compute Morgan fingerprints
     print('Computing Morgan fingerprints')
@@ -66,7 +81,13 @@ def compare_datasets_tsne(args: Args):
 
     print('Running t-SNE')
     start = time.time()
-    tsne = TSNE(n_components=2, init='pca', random_state=0, metric='jaccard')
+    tsne = TSNE(
+        n_components=2,
+        init='pca',
+        random_state=0,
+        metric='jaccard',
+        perplexity=min(30, len(smiles) - 1),
+    )
     X = tsne.fit_transform(morgans)
     print(f'time = {time.time() - start:.2f} seconds')
 
@@ -80,7 +101,9 @@ def compare_datasets_tsne(args: Args):
 
     print('Plotting t-SNE')
     x_min, x_max = np.min(X, axis=0), np.max(X, axis=0)
-    X = (X - x_min) / (x_max - x_min)
+    span = x_max - x_min
+    span[span == 0] = 1
+    X = (X - x_min) / span
 
     makedirs(args.save_path, isfile=True)
 
@@ -116,6 +139,7 @@ def compare_datasets_tsne(args: Args):
 
     print('Saving t-SNE')
     plt.savefig(args.save_path)
+    plt.close(fig)
 
 
 if __name__ == '__main__':
