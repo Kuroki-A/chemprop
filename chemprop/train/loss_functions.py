@@ -105,8 +105,21 @@ def mcc_class_loss(
     FP = torch.sum((1 - targets) * predictions * data_weights * mask, axis=0)
     FN = torch.sum(targets * (1 - predictions) * data_weights * mask, axis=0)
     TN = torch.sum((1 - targets) * (1 - predictions) * data_weights * mask, axis=0)
-    loss = 1 - ((TP * TN - FP * FN) / torch.sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN)))
-    return loss
+    numerator = TP * TN - FP * FN
+    denominator_squared = (TP + FP) * (TP + FN) * (TN + FP) * (TN + FN)
+    # A task with no observed labels or only one represented class has an
+    # undefined MCC.  Returning the neutral MCC value (0, hence loss 1) keeps
+    # the other tasks trainable instead of contaminating the whole batch with
+    # NaNs. ``clamp`` only protects the unselected division branch.
+    denominator = torch.sqrt(
+        torch.clamp(denominator_squared, min=torch.finfo(predictions.dtype).tiny)
+    )
+    mcc = torch.where(
+        denominator_squared > 0,
+        numerator / denominator,
+        torch.zeros_like(numerator),
+    )
+    return 1 - mcc
 
 
 def mcc_multiclass_loss(
@@ -127,32 +140,36 @@ def mcc_multiclass_loss(
     torch_device = predictions.device
     mask = mask.unsqueeze(1)
 
-    bin_targets = torch.zeros_like(predictions, device=torch_device)
-    bin_targets[torch.arange(predictions.shape[0]), targets] = 1
-
-    pred_classes = predictions.argmax(dim=1)
-    bin_preds = torch.zeros_like(predictions, device=torch_device)
-    bin_preds[torch.arange(predictions.shape[0]), pred_classes] = 1
+    bin_targets = torch.nn.functional.one_hot(
+        targets.long(), num_classes=predictions.shape[1]
+    ).to(device=torch_device, dtype=predictions.dtype)
 
     masked_data_weights = data_weights * mask
 
     t_sum = torch.sum(bin_targets * masked_data_weights, axis=0)  # number of times each class truly occurred
-    p_sum = torch.sum(bin_preds * masked_data_weights, axis=0)  # number of times each class was predicted
+    # Use the predicted probabilities as a soft confusion matrix. The former
+    # argmax/one-hot conversion made the loss piecewise constant and produced
+    # exactly zero parameter gradients, so selecting MCC as the training loss
+    # could not train a multiclass model.
+    p_sum = torch.sum(predictions * masked_data_weights, axis=0)
 
-    n_correct = torch.sum(bin_preds * bin_targets * masked_data_weights)  # total number of samples correctly predicted
-    n_samples = torch.sum(predictions * masked_data_weights)  # total number of samples
+    n_correct = torch.sum(predictions * bin_targets * masked_data_weights)
+    n_samples = torch.sum(masked_data_weights)
 
     cov_ytyp = n_correct * n_samples - torch.dot(p_sum, t_sum)
     cov_ypyp = n_samples**2 - torch.dot(p_sum, p_sum)
     cov_ytyt = n_samples**2 - torch.dot(t_sum, t_sum)
 
-    if cov_ypyp * cov_ytyt == 0:
-        loss = torch.tensor(1.0, device=torch_device)
-    else:
-        mcc = cov_ytyp / torch.sqrt(cov_ytyt * cov_ypyp)
-        loss = 1 - mcc
-
-    return loss
+    denominator_squared = cov_ytyt * cov_ypyp
+    denominator = torch.sqrt(
+        torch.clamp(denominator_squared, min=torch.finfo(predictions.dtype).tiny)
+    )
+    mcc = torch.where(
+        denominator_squared > 0,
+        cov_ytyp / denominator,
+        torch.zeros_like(cov_ytyp),
+    )
+    return 1 - mcc
 
 
 def sid_loss(
@@ -170,21 +187,25 @@ def sid_loss(
     :param threshold: Loss function requires that values are positive and nonzero. Values below the threshold will be replaced with the threshold value.
     :return: A tensor containing loss values for the batch with shape (batch_size,spectrum_length).
     """
-    # Move new tensors to torch device
-    torch_device = model_spectra.device
-
     # Normalize the model spectra before comparison
-    zero_sub = torch.zeros_like(model_spectra, device=torch_device)
-    one_sub = torch.ones_like(model_spectra, device=torch_device)
+    zero_sub = torch.zeros_like(model_spectra)
+    one_sub = torch.ones_like(model_spectra)
+    minimum = torch.finfo(model_spectra.dtype).tiny
     if threshold is not None:
-        threshold_sub = torch.full(model_spectra.shape, threshold, device=torch_device)
-        model_spectra = torch.where(model_spectra < threshold, threshold_sub, model_spectra)
+        if threshold <= 0:
+            raise ValueError("SID threshold must be positive.")
+        minimum = max(minimum, threshold)
+    model_spectra = torch.clamp(model_spectra, min=minimum)
     model_spectra = torch.where(mask, model_spectra, zero_sub)
     sum_model_spectra = torch.sum(model_spectra, axis=1, keepdim=True)
-    model_spectra = torch.div(model_spectra, sum_model_spectra)
+    model_spectra = torch.div(
+        model_spectra, torch.clamp(sum_model_spectra, min=minimum)
+    )
 
     # Calculate loss value
-    target_spectra = torch.where(mask, target_spectra, one_sub)
+    target_spectra = torch.where(
+        mask, torch.clamp(target_spectra, min=minimum), one_sub
+    )
     model_spectra = torch.where(mask, model_spectra, one_sub)  # losses in excluded regions will be zero because log(1/1) = 0.
     loss = torch.mul(torch.log(torch.div(model_spectra, target_spectra)), model_spectra) + torch.mul(
         torch.log(torch.div(target_spectra, model_spectra)), target_spectra
@@ -208,17 +229,19 @@ def wasserstein_loss(
     :param threshold: Loss function requires that values are positive and nonzero. Values below the threshold will be replaced with the threshold value.
     :return: A tensor containing loss values for the batch with shape (batch_size,spectrum_length).
     """
-    # Move new tensors to torch device
-    torch_device = model_spectra.device
-
     # Normalize the model spectra before comparison
-    zero_sub = torch.zeros_like(model_spectra, device=torch_device)
+    zero_sub = torch.zeros_like(model_spectra)
+    minimum = torch.finfo(model_spectra.dtype).tiny
     if threshold is not None:
-        threshold_sub = torch.full(model_spectra.shape, threshold, device=torch_device)
-        model_spectra = torch.where(model_spectra < threshold, threshold_sub, model_spectra)
+        if threshold <= 0:
+            raise ValueError("Wasserstein threshold must be positive.")
+        minimum = max(minimum, threshold)
+    model_spectra = torch.clamp(model_spectra, min=minimum)
     model_spectra = torch.where(mask, model_spectra, zero_sub)
     sum_model_spectra = torch.sum(model_spectra, axis=1, keepdim=True)
-    model_spectra = torch.div(model_spectra, sum_model_spectra)
+    model_spectra = torch.div(
+        model_spectra, torch.clamp(sum_model_spectra, min=minimum)
+    )
 
     # Calculate loss value
     target_cum = torch.cumsum(target_spectra, axis=1)
@@ -239,6 +262,7 @@ def normal_mve(pred_values, targets):
     """
     # Unpack combined prediction values
     pred_means, pred_var = torch.split(pred_values, pred_values.shape[1] // 2, dim=1)
+    pred_var = torch.clamp(pred_var, min=torch.finfo(pred_var.dtype).eps)
 
     return torch.log(2 * np.pi * pred_var) / 2 + (pred_means - targets) ** 2 / (2 * pred_var)
 
@@ -346,7 +370,10 @@ def evidential_loss(pred_values, targets, lam: float = 0, epsilon: float = 1e-8,
     mu, v, alpha, beta = torch.split(pred_values, pred_values.shape[1] // 4, dim=1)
 
     # Calculate NLL loss
-    v = torch.clamp(v, v_min)
+    minimum = torch.finfo(pred_values.dtype).eps
+    v = torch.clamp(v, min=max(v_min, minimum))
+    alpha = torch.clamp(alpha, min=1 + minimum)
+    beta = torch.clamp(beta, min=minimum)
     twoBlambda = 2 * beta * (1 + v)
     nll = (
         0.5 * torch.log(np.pi / v)

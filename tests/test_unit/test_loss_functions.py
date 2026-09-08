@@ -10,9 +10,12 @@ from chemprop.train.loss_functions import (
     dirichlet_class_loss,
     evidential_loss,
     get_loss_func,
+    mcc_class_loss,
     mcc_multiclass_loss,
     normal_mve,
     quantile_loss,
+    sid_loss,
+    wasserstein_loss,
 )
 
 
@@ -85,6 +88,20 @@ def test_get_spectra_function(spectra_function):
         dataset_type="spectra",
     )
     assert get_loss_func(args)
+
+
+@pytest.mark.parametrize("loss_func", [sid_loss, wasserstein_loss])
+def test_spectra_losses_are_finite_for_zero_predictions_and_empty_masks(loss_func):
+    predictions = torch.zeros(2, 3, requires_grad=True)
+    targets = torch.tensor([[0.2, 0.3, 0.5], [0.0, 0.0, 0.0]])
+    mask = torch.tensor([[True, True, True], [False, False, False]])
+
+    loss = loss_func(predictions, targets, mask)
+    loss.sum().backward()
+
+    assert torch.isfinite(loss).all()
+    assert predictions.grad is not None
+    assert torch.isfinite(predictions.grad).all()
 
 
 def test_get_unsupported_function(dataset_type):
@@ -297,7 +314,54 @@ def test_quantile(preds, targets, quantiles, expected_loss):
 )
 def test_multiclass_mcc(predictions, targets, data_weights, mask, expected_loss):
     """
-    Test the multiclass MCC loss function by comparing to sklearn's results.
+    Test the multiclass MCC loss function on hard probabilities by comparing
+    to sklearn's results.
     """
-    loss = mcc_multiclass_loss(predictions, targets, data_weights, mask)
+    hard_predictions = torch.nn.functional.one_hot(
+        predictions.argmax(dim=1), num_classes=predictions.shape[1]
+    ).to(dtype=predictions.dtype)
+    loss = mcc_multiclass_loss(hard_predictions, targets, data_weights, mask)
     np.testing.assert_almost_equal(loss.item(), expected_loss)
+
+
+def test_multiclass_mcc_has_nonzero_gradient():
+    """The MCC training objective must be differentiable w.r.t. model logits."""
+    logits = torch.tensor(
+        [[1.2, -0.4, 0.1], [-0.3, 0.9, 0.2], [0.2, -0.5, 0.7], [0.6, 0.1, -0.2]],
+        requires_grad=True,
+    )
+    predictions = torch.softmax(logits, dim=1)
+    targets = torch.tensor([0, 2, 1, 0])
+    data_weights = torch.ones(4, 1)
+    mask = torch.ones(4, dtype=torch.bool)
+
+    loss = mcc_multiclass_loss(predictions, targets, data_weights, mask)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert torch.count_nonzero(logits.grad) > 0
+
+
+def test_mcc_losses_are_finite_for_degenerate_batches():
+    """Missing/single-class batches must not inject NaNs into other tasks."""
+    binary_predictions = torch.tensor([[0.2], [0.8]], requires_grad=True)
+    binary_loss = mcc_class_loss(
+        binary_predictions,
+        torch.zeros(2, 1),
+        torch.ones(2, 1),
+        torch.ones(2, 1, dtype=torch.bool),
+    )
+    assert torch.equal(binary_loss, torch.ones_like(binary_loss))
+    assert torch.isfinite(binary_loss).all()
+
+    multiclass_logits = torch.randn(2, 3, requires_grad=True)
+    multiclass_loss = mcc_multiclass_loss(
+        torch.softmax(multiclass_logits, dim=1),
+        torch.zeros(2, dtype=torch.long),
+        torch.ones(2, 1),
+        torch.zeros(2, dtype=torch.bool),
+    )
+    assert multiclass_loss.item() == pytest.approx(1.0)
+    assert torch.isfinite(multiclass_loss)

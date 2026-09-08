@@ -1,7 +1,6 @@
-import re
-
 from rdkit import Chem
 import numpy as np
+
 
 def make_mol(s: str, keep_h: bool, add_h: bool, keep_atom_map: bool):
     """

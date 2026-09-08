@@ -1,5 +1,4 @@
 from typing import List, Union, Tuple
-from functools import reduce
 
 import numpy as np
 from rdkit import Chem
@@ -28,9 +27,9 @@ class MPNEncoder(nn.Module):
         self.atom_fdim = atom_fdim
         self.bond_fdim = bond_fdim
         self.atom_messages = args.atom_messages
-        self.hidden_size = hidden_size or args.hidden_size
-        self.bias = bias or args.bias
-        self.depth = depth or args.depth
+        self.hidden_size = args.hidden_size if hidden_size is None else hidden_size
+        self.bias = args.bias if bias is None else bias
+        self.depth = args.depth if depth is None else depth
         self.layers_per_message = 1
         self.undirected = args.undirected
         self.device = args.device
@@ -85,25 +84,90 @@ class MPNEncoder(nn.Module):
         :param bond_descriptors_batch: A list of numpy arrays containing additional bond descriptors
         :return: A PyTorch tensor of shape :code:`(num_molecules, hidden_size)` containing the encoding of each molecule.
         """
-        if atom_descriptors_batch is not None:
-            atom_descriptors_batch = [np.zeros([1, atom_descriptors_batch[0].shape[1]])] + atom_descriptors_batch   # padding the first with 0 to match the atom_hiddens
-            atom_descriptors_batch = torch.from_numpy(np.concatenate(atom_descriptors_batch, axis=0)).float().to(self.device)
-
         f_atoms, f_bonds, a2b, b2a, b2revb, a_scope, b_scope = mol_graph.get_components(atom_messages=self.atom_messages)
         f_atoms, f_bonds, a2b, b2a, b2revb = f_atoms.to(self.device), f_bonds.to(self.device), a2b.to(self.device), b2a.to(self.device), b2revb.to(self.device)
+
+        if atom_descriptors_batch is not None:
+            if len(atom_descriptors_batch) != len(a_scope):
+                raise ValueError(
+                    'The number of atom descriptor arrays must match the number of molecules.'
+                )
+            atom_arrays = []
+            for index, (descriptors, (_, atom_count)) in enumerate(
+                zip(atom_descriptors_batch, a_scope)
+            ):
+                try:
+                    descriptors = np.asarray(descriptors, dtype=np.float32)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f'Atom descriptors for molecule {index} must be numeric.'
+                    ) from exc
+                if descriptors.shape != (atom_count, self.atom_descriptors_size):
+                    raise ValueError(
+                        f'Atom descriptors for molecule {index} have shape '
+                        f'{descriptors.shape}; expected '
+                        f'{(atom_count, self.atom_descriptors_size)}.'
+                    )
+                if not np.isfinite(descriptors).all():
+                    raise ValueError(
+                        f'Atom descriptors for molecule {index} contain NaN or infinity.'
+                    )
+                atom_arrays.append(descriptors)
+            padded_atom_descriptors = [
+                np.zeros((1, self.atom_descriptors_size), dtype=np.float32),
+                *atom_arrays,
+            ]
+            atom_descriptors_batch = torch.from_numpy(
+                np.concatenate(padded_atom_descriptors, axis=0)
+            ).to(self.device)
 
         if self.is_atom_bond_targets:
             b2br = mol_graph.get_b2br().to(self.device)
             if bond_descriptors_batch is not None:
-                forward_index = b2br[:, 0]
-                backward_index = b2br[:, 1]
-                descriptors_batch = np.concatenate(bond_descriptors_batch, axis=0)
-                bond_descriptors_batch = np.zeros([descriptors_batch.shape[0] * 2 + 1, descriptors_batch.shape[1]])
-                for i, fi in enumerate(forward_index):
-                    bond_descriptors_batch[fi] = descriptors_batch[i]
-                for i, fi in enumerate(backward_index):
-                    bond_descriptors_batch[fi] = descriptors_batch[i]
-                bond_descriptors_batch = torch.from_numpy(bond_descriptors_batch).float().to(self.device)
+                if len(bond_descriptors_batch) != len(b_scope):
+                    raise ValueError(
+                        'The number of bond descriptor arrays must match the number of molecules.'
+                    )
+                bond_arrays = []
+                for index, (descriptors, (_, directed_bond_count)) in enumerate(
+                    zip(bond_descriptors_batch, b_scope)
+                ):
+                    bond_count = directed_bond_count // 2
+                    try:
+                        descriptors = np.asarray(descriptors, dtype=np.float32)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f'Bond descriptors for molecule {index} must be numeric.'
+                        ) from exc
+                    if descriptors.shape != (bond_count, self.bond_descriptors_size):
+                        raise ValueError(
+                            f'Bond descriptors for molecule {index} have shape '
+                            f'{descriptors.shape}; expected '
+                            f'{(bond_count, self.bond_descriptors_size)}.'
+                        )
+                    if not np.isfinite(descriptors).all():
+                        raise ValueError(
+                            f'Bond descriptors for molecule {index} contain NaN or infinity.'
+                        )
+                    bond_arrays.append(descriptors)
+
+                descriptors_tensor = torch.from_numpy(
+                    np.concatenate(bond_arrays, axis=0)
+                    if bond_arrays
+                    else np.empty((0, self.bond_descriptors_size), dtype=np.float32)
+                ).to(self.device)
+                if len(descriptors_tensor) != len(b2br):
+                    raise ValueError(
+                        'The number of bond descriptor rows does not match the molecular graph.'
+                    )
+                # Keep both descriptor values and indices on the model device.
+                # Indexing a NumPy array with CUDA scalar tensors fails on GPU.
+                bond_descriptors_batch = descriptors_tensor.new_zeros(
+                    (len(f_bonds), self.bond_descriptors_size)
+                )
+                if len(b2br) > 0:
+                    bond_descriptors_batch[b2br[:, 0]] = descriptors_tensor
+                    bond_descriptors_batch[b2br[:, 1]] = descriptors_tensor
 
         if self.atom_messages:
             a2a = mol_graph.get_a2a().to(self.device)
@@ -231,6 +295,7 @@ class MPN(nn.Module):
         self.device = args.device
         self.atom_descriptors = args.atom_descriptors
         self.bond_descriptors = args.bond_descriptors
+        self.number_of_molecules = args.number_of_molecules
         self.overwrite_default_atom_features = args.overwrite_default_atom_features
         self.overwrite_default_bond_features = args.overwrite_default_bond_features
 
@@ -276,7 +341,21 @@ class MPN(nn.Module):
         :param bond_features_batch: A list of numpy arrays containing additional bond features.
         :return: A PyTorch tensor of shape :code:`(num_molecules, hidden_size)` containing the encoding of each molecule.
         """
-        if type(batch[0]) != BatchMolGraph:
+        if not isinstance(batch, (list, tuple)) or len(batch) == 0:
+            raise ValueError('MPN input batch must be a non-empty list or tuple.')
+
+        if not isinstance(batch[0], BatchMolGraph):
+            if not all(isinstance(mols, (list, tuple)) for mols in batch):
+                raise ValueError(
+                    'Each MPN datapoint must contain a list or tuple of molecules.'
+                )
+            molecule_counts = {len(mols) for mols in batch}
+            if molecule_counts != {self.number_of_molecules}:
+                raise ValueError(
+                    'Every MPN datapoint must contain exactly '
+                    f'{self.number_of_molecules} molecule(s); got counts '
+                    f'{sorted(molecule_counts)}.'
+                )
             # Group first molecules, second molecules, etc for mol2graph
             batch = [[mols[i] for mols in batch] for i in range(len(batch[0]))]
 
@@ -312,9 +391,26 @@ class MPN(nn.Module):
                 ]
             else:
                 batch = [mol2graph(b) for b in batch]
+        elif not all(isinstance(graph, BatchMolGraph) for graph in batch):
+            raise ValueError('MPN graph batches must contain only BatchMolGraph objects.')
 
         if self.use_input_features:
-            features_batch = torch.from_numpy(np.stack(features_batch)).float().to(self.device)
+            if features_batch is None:
+                raise ValueError('Input features are required when use_input_features is enabled.')
+            try:
+                feature_array = np.asarray(np.stack(features_batch), dtype=np.float32)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    'Input features must be a rectangular numeric matrix.'
+                ) from exc
+            if feature_array.ndim != 2 or feature_array.shape[0] == 0:
+                raise ValueError(
+                    f'Input features must be a non-empty 2D matrix; got shape '
+                    f'{feature_array.shape}.'
+                )
+            if not np.isfinite(feature_array).all():
+                raise ValueError('Input features contain NaN or infinity.')
+            features_batch = torch.from_numpy(feature_array).to(self.device)
 
             if self.features_only:
                 return features_batch
@@ -324,9 +420,19 @@ class MPN(nn.Module):
                 raise NotImplementedError('Atom descriptors are currently only supported with one molecule '
                                           'per input (i.e., number_of_molecules = 1).')
 
+            if len(self.encoder) != len(batch):
+                raise ValueError(
+                    f'Expected {len(self.encoder)} molecular graph batches but '
+                    f'received {len(batch)}.'
+                )
             encodings = [enc(ba, atom_descriptors_batch, bond_descriptors_batch) for enc, ba in zip(self.encoder, batch)]
         else:
             if not self.reaction_solvent:
+                if len(self.encoder) != len(batch):
+                    raise ValueError(
+                        f'Expected {len(self.encoder)} molecular graph batches but '
+                        f'received {len(batch)}.'
+                    )
                 encodings = [enc(ba) for enc, ba in zip(self.encoder, batch)]
             else:
                 encodings = []
@@ -341,6 +447,12 @@ class MPN(nn.Module):
         if self.use_input_features:
             if len(features_batch.shape) == 1:
                 features_batch = features_batch.view(1, -1)
+
+            if output.shape[0] != features_batch.shape[0]:
+                raise ValueError(
+                    f'Molecular encodings contain {output.shape[0]} rows but '
+                    f'input features contain {features_batch.shape[0]} rows.'
+                )
 
             output = torch.cat([output, features_batch], dim=1)
 

@@ -24,6 +24,8 @@ from chemprop.constants import TEST_SCORES_FILE_NAME, TRAIN_LOGGER_NAME
 from chemprop.data import get_data, get_task_names, load_selected_feature_columns, MoleculeDataset, validate_dataset_type
 from chemprop.utils import create_logger, makedirs, timeit, multitask_mean
 from chemprop.features import get_features_generator, get_features_generators_metadata, set_extra_atom_fdim, set_extra_bond_fdim, set_explicit_h, set_adding_hs, set_keeping_atom_map, set_reaction, reset_featurization_parameters
+from chemprop.features.utils import load_features
+from chemprop.rdkit import make_mol
 
 try:
     from importlib import metadata
@@ -31,7 +33,7 @@ except ImportError:  # Python 3.7
     metadata = None
 
 
-DATASET_CACHE_SCHEMA_VERSION = 2
+DATASET_CACHE_SCHEMA_VERSION = 3
 RESUME_MANIFEST_SCHEMA_VERSION = 3
 
 
@@ -185,6 +187,9 @@ def _dataset_cache_manifest(args: TrainArgs) -> Dict:
         'source_digests': {
             'get_data': _source_digest(get_data),
             'MoleculeDataset': _source_digest(MoleculeDataset),
+            'make_mol': _source_digest(make_mol),
+            'featurization': _source_digest(set_reaction),
+            'load_features': _source_digest(load_features),
             'feature_generators': generator_sources,
         },
         'features_generator_metadata': generator_metadata,
@@ -702,7 +707,11 @@ def cross_validate(args: TrainArgs,
             data_weights_path=args.data_weights_path
         )
     
-    validate_dataset_type(data, dataset_type=args.dataset_type)
+    validate_dataset_type(
+        data,
+        dataset_type=args.dataset_type,
+        multiclass_num_classes=args.multiclass_num_classes,
+    )
     args.features_size = data.features_size()
     # Preserve the concrete feature-source schema in checkpoints and in the
     # fold resume manifest. This distinguishes identically sized features that

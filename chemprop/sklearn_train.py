@@ -35,6 +35,22 @@ class SklearnModelBundle:
     version: int = SKLEARN_BUNDLE_VERSION
 
 
+def _validated_data_weights(data: MoleculeDataset) -> np.ndarray:
+    """Returns finite, non-negative row weights for sklearn estimators."""
+    if len(data) == 0:
+        raise ValueError('Sklearn training data is empty.')
+    weights = np.asarray(data.data_weights(), dtype=float)
+    if weights.shape != (len(data),):
+        raise ValueError('Sklearn data weights must contain one value per row.')
+    if not np.all(np.isfinite(weights)):
+        raise ValueError('Sklearn data weights must be finite.')
+    if np.any(weights < 0):
+        raise ValueError('Sklearn data weights must be non-negative.')
+    if float(weights.sum()) <= 0:
+        raise ValueError('At least one sklearn data weight must be positive.')
+    return weights
+
+
 def _positive_class_probabilities(model, features) -> np.ndarray:
     """Returns positive-class probabilities, including one-class RF models."""
     try:
@@ -151,20 +167,31 @@ def impute_sklearn(model: Union[RandomForestRegressor, RandomForestClassifier, S
         debug = print
         
     debug('Imputation')
+    data_weights = _validated_data_weights(train_data)
     
     for task_num in trange(num_tasks):
         impute_train_features = [features for features, targets in zip(train_data.features(), train_data.targets()) if targets[task_num] is None]
         if len(impute_train_features) > 0:
-            observed = [(features, targets[task_num])
-                        for features, targets in zip(train_data.features(), train_data.targets())
+            observed = [(features, targets[task_num], weight)
+                        for features, targets, weight in zip(
+                            train_data.features(), train_data.targets(), data_weights
+                        )
                         if targets[task_num] is not None]
             if not observed:
                 task_name = args.task_names[task_num]
                 raise ValueError(f'Sklearn task "{task_name}" has no training targets.')
-            train_features, train_targets = zip(*observed)
+            train_features, train_targets, train_weights = zip(*observed)
+            train_weights = np.asarray(train_weights, dtype=float)
+            if float(train_weights.sum()) <= 0:
+                raise ValueError(
+                    f'Sklearn task "{args.task_names[task_num]}" has no '
+                    'positive-weight training targets.'
+                )
             if args.impute_mode == 'single_task':
                 imputation_model = deepcopy(model)
-                imputation_model.fit(train_features, train_targets)
+                imputation_model.fit(
+                    train_features, train_targets, sample_weight=train_weights
+                )
                 impute_train_preds = predict(
                     model=imputation_model,
                     model_type=args.model_type,
@@ -173,19 +200,34 @@ def impute_sklearn(model: Union[RandomForestRegressor, RandomForestClassifier, S
                 )
                 impute_train_preds = [pred[0] for pred in impute_train_preds]
             elif args.impute_mode == 'median' and args.dataset_type == 'regression':
-                impute_train_preds = [np.median(train_targets)] * len(impute_train_features)
+                order = np.argsort(train_targets)
+                ordered_targets = np.asarray(train_targets, dtype=float)[order]
+                ordered_weights = train_weights[order]
+                weighted_median = ordered_targets[
+                    np.searchsorted(
+                        np.cumsum(ordered_weights), ordered_weights.sum() / 2,
+                        side='left',
+                    )
+                ]
+                impute_train_preds = [weighted_median] * len(impute_train_features)
             elif args.impute_mode == 'mean' and args.dataset_type == 'regression':
-                impute_train_preds = [np.mean(train_targets)] * len(impute_train_features)
+                impute_train_preds = [
+                    np.average(train_targets, weights=train_weights)
+                ] * len(impute_train_features)
             elif args.impute_mode == 'frequent' and args.dataset_type == 'classification':
                 integer_targets = np.asarray(train_targets, dtype=int)
                 impute_train_preds = [
-                    int(np.argmax(np.bincount(integer_targets)))
+                    int(np.argmax(np.bincount(integer_targets, weights=train_weights)))
                 ] * len(impute_train_features)
             elif args.impute_mode == 'linear' and args.dataset_type == 'regression':
-                reg = SGDRegressor(alpha=0.01, random_state=args.seed).fit(train_features, train_targets)
+                reg = SGDRegressor(alpha=0.01, random_state=args.seed).fit(
+                    train_features, train_targets, sample_weight=train_weights
+                )
                 impute_train_preds = reg.predict(impute_train_features)
             elif args.impute_mode == 'linear' and args.dataset_type == 'classification':
-                cls = SGDClassifier(random_state=args.seed).fit(train_features, train_targets)
+                cls = SGDClassifier(random_state=args.seed).fit(
+                    train_features, train_targets, sample_weight=train_weights
+                )
                 impute_train_preds = cls.predict(impute_train_features)
             else:
                 raise ValueError("Invalid combination of imputation mode and dataset type.")   
@@ -210,19 +252,29 @@ def _fit_single_task_models(
 ) -> List[Any]:
     """Fits exactly one independent estimator for each task."""
     models = []
+    data_weights = _validated_data_weights(train_data)
     for task_num in trange(train_data.num_tasks()):
         observed = [
-            (features, targets[task_num])
-            for features, targets in zip(train_data.features(), train_data.targets())
+            (features, targets[task_num], weight)
+            for features, targets, weight in zip(
+                train_data.features(), train_data.targets(), data_weights
+            )
             if targets[task_num] is not None
         ]
         if not observed:
             task_name = args.task_names[task_num]
             raise ValueError(f'Sklearn task "{task_name}" has no training targets.')
-        train_features, train_targets = zip(*observed)
+        train_features, train_targets, train_weights = zip(*observed)
+        if float(np.sum(train_weights)) <= 0:
+            raise ValueError(
+                f'Sklearn task "{args.task_names[task_num]}" has no '
+                'positive-weight training targets.'
+            )
         task_model = deepcopy(model)
         try:
-            task_model.fit(train_features, train_targets)
+            task_model.fit(
+                train_features, train_targets, sample_weight=train_weights
+            )
         except ValueError as error:
             task_name = args.task_names[task_num]
             raise ValueError(
@@ -292,7 +344,10 @@ def _fit_multi_task_model(
 
     if train_data.num_tasks() == 1:
         train_targets = [targets[0] for targets in train_targets]
-    model.fit(train_data.features(), train_targets)
+    train_weights = _validated_data_weights(train_data)
+    model.fit(
+        train_data.features(), train_targets, sample_weight=train_weights
+    )
     return model
 
 
@@ -459,8 +514,10 @@ def run_sklearn(args: SklearnTrainArgs,
                                      target_columns=args.target_columns,
                                      ignore_columns=args.ignore_columns)
 
-    if args.model_type == 'svm' and data.num_tasks() != 1:
-        raise ValueError(f'SVM can only handle single-task data but found {data.num_tasks()} tasks')
+    if args.model_type == 'svm' and data.num_tasks() != 1 and not args.single_task:
+        raise ValueError(
+            f'SVM requires --single_task for data with {data.num_tasks()} tasks'
+        )
 
     debug(f'Splitting data with seed {args.seed}')
     test_data = MoleculeDataset([])
@@ -534,6 +591,11 @@ def run_sklearn(args: SklearnTrainArgs,
             args=args,
             logger=logger,
         )
+
+    if len(train_data) == 0:
+        raise ValueError('The sklearn training data split is empty.')
+    if len(val_data) == 0:
+        raise ValueError('The sklearn validation data split is empty.')
 
     if skip_test_evaluation:
         test_data = MoleculeDataset([])

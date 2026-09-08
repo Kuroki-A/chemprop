@@ -18,7 +18,10 @@ from tqdm import tqdm
 
 from .evaluate import evaluate_predictions
 from .metrics import prc_auc
-from .run_training import validate_features_source_metadata
+from .run_training import (
+    _validate_primary_validation_score,
+    validate_features_source_metadata,
+)
 from chemprop.args import TrainArgs
 from chemprop.data import (
     MoleculeDataLoader,
@@ -70,6 +73,28 @@ def encode_lgbm_features(
     if len(data) == 0:
         return np.empty((0, 0), dtype=np.float32)
 
+    # MPN.forward returns molecule-level input features immediately in
+    # features-only mode. Avoid DataLoader collation, RDKit graph construction,
+    # device transfer, and a no-op model call for this recommended LightGBM
+    # configuration. The float32 cast exactly matches torch.Tensor.float().
+    if getattr(encoder.encoder, "features_only", False):
+        features = data.features()
+        if features is None:
+            raise ValueError(
+                "LightGBM features-only encoding requires molecular features."
+            )
+        try:
+            encoded = np.stack(features).astype(np.float32, copy=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "LightGBM molecular features must have a consistent numeric width."
+            ) from error
+        if encoded.ndim != 2 or encoded.shape[1] < 1:
+            raise ValueError(
+                "LightGBM molecular features must be a non-empty 2-D matrix."
+            )
+        return encoded
+
     data_loader = MoleculeDataLoader(
         dataset=data,
         batch_size=max(1, min(batch_size, len(data))),
@@ -99,14 +124,76 @@ def _targets_to_array(
     """Converts Chemprop targets (including ``None``) to a 2-D float array."""
     if len(targets) == 0:
         return np.empty((0, num_tasks), dtype=float)
-    target_array = np.asarray(targets, dtype=float)
+    try:
+        target_array = np.asarray(targets, dtype=float)
+    except (TypeError, ValueError) as error:
+        raise ValueError("LightGBM targets must form a rectangular numeric matrix.") from error
     if target_array.ndim == 1:
         target_array = target_array.reshape(-1, 1)
-    if target_array.shape[1] != num_tasks:
+    if target_array.ndim != 2 or target_array.shape[1] != num_tasks:
+        actual_columns = target_array.shape[1] if target_array.ndim == 2 else None
         raise ValueError(
-            f"Expected {num_tasks} LightGBM target columns, got {target_array.shape[1]}."
+            f"Expected {num_tasks} LightGBM target columns, got {actual_columns}."
         )
     return target_array
+
+
+def _validate_lgbm_targets(
+    targets: Sequence[Sequence[float]],
+    args: TrainArgs,
+    split_name: str,
+    require_each_task: bool = False,
+) -> np.ndarray:
+    """Validates target values before scaling or handing them to LightGBM."""
+    target_array = _targets_to_array(targets, args.num_tasks)
+    if np.any(np.isinf(target_array)):
+        raise ValueError(
+            f"LightGBM {split_name} targets contain an infinite value; "
+            "use a finite value or leave a missing target blank."
+        )
+
+    task_names = list(
+        getattr(args, "task_names", None)
+        or [f"task_{task_index}" for task_index in range(args.num_tasks)]
+    )
+    if len(task_names) != args.num_tasks:
+        raise ValueError("LightGBM task names do not match the target width.")
+    for task_index, task_name in enumerate(task_names):
+        present = np.isfinite(target_array[:, task_index])
+        if require_each_task and not np.any(present):
+            raise ValueError(
+                f'LightGBM task "{task_name}" has no {split_name} targets.'
+            )
+        if args.dataset_type == "classification" and np.any(present):
+            labels = set(target_array[present, task_index].tolist())
+            if not labels.issubset({0.0, 1.0}):
+                raise ValueError(
+                    f'LightGBM classification task "{task_name}" contains '
+                    f"{split_name} labels other than 0 and 1."
+                )
+    return target_array
+
+
+def _validate_lgbm_feature_matrices(
+    train_features: np.ndarray, val_features: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Validates the dense encoder matrices used to construct LightGBM datasets."""
+    train_features = np.asarray(train_features)
+    val_features = np.asarray(val_features)
+    if train_features.ndim != 2 or val_features.ndim != 2:
+        raise ValueError("LightGBM encoded features must be two-dimensional matrices.")
+    if train_features.shape[1] < 1:
+        raise ValueError("LightGBM training features contain no columns.")
+    if train_features.shape[1] != val_features.shape[1]:
+        raise ValueError(
+            "LightGBM training and validation feature widths do not match."
+        )
+    if not np.all(np.isfinite(train_features)) or not np.all(np.isfinite(val_features)):
+        raise ValueError(
+            "LightGBM encoded features contain NaN or infinite values. Check "
+            "external features/descriptors and their scaling settings."
+        )
+    return train_features, val_features
 
 
 def _lightgbm_metric(args: TrainArgs) -> str:
@@ -149,19 +236,24 @@ def _lightgbm_params(args: TrainArgs, seed: int) -> Dict[str, object]:
     bagging_freq = getattr(args, "lgbm_bagging_freq", 1)
     min_data_in_leaf = getattr(args, "lgbm_min_data_in_leaf", 20)
     num_threads = getattr(args, "lgbm_num_threads", None) or max(1, args.num_workers)
-    if learning_rate <= 0:
-        raise ValueError("lgbm_learning_rate must be greater than 0.")
-    if not isinstance(num_leaves, int) or num_leaves < 2:
+    finite_number = lambda value: (
+        isinstance(value, (int, float, np.integer, np.floating))
+        and not isinstance(value, (bool, np.bool_))
+        and bool(np.isfinite(value))
+    )
+    if not finite_number(learning_rate) or learning_rate <= 0:
+        raise ValueError("lgbm_learning_rate must be finite and greater than 0.")
+    if not isinstance(num_leaves, int) or isinstance(num_leaves, bool) or num_leaves < 2:
         raise ValueError("lgbm_num_leaves must be an integer of at least 2.")
-    if not 0 < feature_fraction <= 1:
-        raise ValueError("lgbm_feature_fraction must be in (0, 1].")
-    if not 0 < bagging_fraction <= 1:
-        raise ValueError("lgbm_bagging_fraction must be in (0, 1].")
-    if not isinstance(bagging_freq, int) or bagging_freq < 0:
+    if not finite_number(feature_fraction) or not 0 < feature_fraction <= 1:
+        raise ValueError("lgbm_feature_fraction must be finite and in (0, 1].")
+    if not finite_number(bagging_fraction) or not 0 < bagging_fraction <= 1:
+        raise ValueError("lgbm_bagging_fraction must be finite and in (0, 1].")
+    if not isinstance(bagging_freq, int) or isinstance(bagging_freq, bool) or bagging_freq < 0:
         raise ValueError("lgbm_bagging_freq must be a non-negative integer.")
-    if not isinstance(min_data_in_leaf, int) or min_data_in_leaf < 1:
+    if not isinstance(min_data_in_leaf, int) or isinstance(min_data_in_leaf, bool) or min_data_in_leaf < 1:
         raise ValueError("lgbm_min_data_in_leaf must be a positive integer.")
-    if not isinstance(num_threads, int) or num_threads < 1:
+    if not isinstance(num_threads, int) or isinstance(num_threads, bool) or num_threads < 1:
         raise ValueError("lgbm_num_threads must be a positive integer.")
 
     return {
@@ -200,6 +292,13 @@ def train_task_boosters(
         raise ValueError("lgbm_num_boost_round must be a positive integer.")
     if not isinstance(early_stopping_rounds, int) or early_stopping_rounds < 0:
         raise ValueError("lgbm_early_stopping_rounds must be a non-negative integer.")
+    train_features, val_features = _validate_lgbm_feature_matrices(
+        train_features, val_features
+    )
+    train_targets = _validate_lgbm_targets(
+        train_targets, args, "training", require_each_task=True
+    )
+    val_targets = _validate_lgbm_targets(val_targets, args, "validation")
     if train_features.shape[0] != train_targets.shape[0]:
         raise ValueError("LightGBM training features and targets have different lengths.")
     if val_features.shape[0] != val_targets.shape[0]:
@@ -212,23 +311,25 @@ def train_task_boosters(
     )
     if base_weights.shape != (train_features.shape[0],):
         raise ValueError("LightGBM data weights must contain one value per training row.")
+    if not np.all(np.isfinite(base_weights)):
+        raise ValueError("LightGBM data weights must be finite.")
+    if np.any(base_weights < 0):
+        raise ValueError("LightGBM data weights must be non-negative.")
+    if float(base_weights.sum()) <= 0:
+        raise ValueError("At least one LightGBM data weight must be positive.")
 
     boosters = []
     for task_index in range(args.num_tasks):
         train_mask = np.isfinite(train_targets[:, task_index])
-        if not np.any(train_mask):
-            task_name = args.task_names[task_index]
-            raise ValueError(f'LightGBM task "{task_name}" has no training targets.')
-
         task_labels = train_targets[train_mask, task_index]
         task_weights = base_weights[train_mask].copy()
+        if float(task_weights.sum()) <= 0:
+            raise ValueError(
+                f'LightGBM task "{args.task_names[task_index]}" has no '
+                "positive-weight training targets."
+            )
         if args.dataset_type == "classification":
             unique_labels = set(np.unique(task_labels).tolist())
-            if not unique_labels.issubset({0.0, 1.0}):
-                raise ValueError(
-                    f'LightGBM classification task "{args.task_names[task_index]}" '
-                    "contains labels other than 0 and 1."
-                )
             if args.class_balance and unique_labels == {0.0, 1.0}:
                 negative_count = np.count_nonzero(task_labels == 0)
                 positive_count = np.count_nonzero(task_labels == 1)
@@ -244,7 +345,18 @@ def train_task_boosters(
         val_mask = np.isfinite(val_targets[:, task_index])
         valid_sets = []
         callbacks = [lgb.log_evaluation(period=0)]
-        if np.any(val_mask):
+        # AUC and PRC-AUC are undefined for a single-class validation task.
+        # LightGBM reports a misleading native AUC of 1.0 in that situation,
+        # while a NaN custom PRC-AUC causes meaningless early stopping. Train
+        # the requested fixed number of rounds instead, matching Chemprop's
+        # post-training convention of reporting NaN for those task metrics.
+        rank_metric_without_both_classes = (
+            args.dataset_type == "classification"
+            and args.metric in {"auc", "prc-auc"}
+            and np.any(val_mask)
+            and len(np.unique(val_targets[val_mask, task_index])) < 2
+        )
+        if np.any(val_mask) and not rank_metric_without_both_classes:
             valid_sets.append(
                 lgb.Dataset(
                     val_features[val_mask],
@@ -280,8 +392,27 @@ def predict_task_boosters(
     boosters: Sequence[lgb.Booster], features: np.ndarray
 ) -> np.ndarray:
     """Predicts an ``(examples, tasks)`` matrix from per-task Boosters."""
+    features = np.asarray(features)
+    if features.ndim != 2:
+        raise ValueError("LightGBM prediction features must be a two-dimensional matrix.")
+    if not boosters:
+        raise ValueError("LightGBM prediction requires at least one task Booster.")
     if features.shape[0] == 0:
         return np.empty((0, len(boosters)), dtype=float)
+    try:
+        features_are_finite = np.all(np.isfinite(features))
+    except TypeError as error:
+        raise ValueError("LightGBM prediction features must be numeric.") from error
+    if not features_are_finite:
+        raise ValueError(
+            "LightGBM prediction features contain NaN or infinite values. Check "
+            "external features/descriptors and their scaling settings."
+        )
+    expected_widths = {booster.num_feature() for booster in boosters}
+    if expected_widths != {features.shape[1]}:
+        raise ValueError(
+            "LightGBM prediction feature width does not match the trained Booster."
+        )
     predictions = []
     for booster in boosters:
         best_iteration = booster.best_iteration if booster.best_iteration > 0 else None
@@ -308,7 +439,14 @@ def evaluate_lgbm_predictions(
     if predictions.shape[0] == 0:
         return {metric: [float("nan")] * args.num_tasks for metric in args.metrics}
 
-    target_array = _targets_to_array(targets, args.num_tasks)
+    target_array = _validate_lgbm_targets(targets, args, "evaluation")
+    predictions = np.asarray(predictions, dtype=float)
+    if predictions.shape != target_array.shape:
+        raise ValueError(
+            "LightGBM prediction and target matrices must have the same shape."
+        )
+    if not np.all(np.isfinite(predictions)):
+        raise ValueError("LightGBM predictions contain NaN or infinite values.")
     for task_index in range(args.num_tasks):
         task_targets = target_array[:, task_index]
         present = np.isfinite(task_targets)
@@ -432,6 +570,13 @@ def run_training_lgbm(
 
     if args.dataset_type not in {"classification", "regression"}:
         raise ValueError("LightGBM supports only classification and regression datasets.")
+    if not getattr(args, "features_only", False):
+        raise ValueError(
+            "LightGBM requires --features_only because its MPN encoder is not "
+            "trained. Provide deterministic molecular features, for example "
+            "--features_generator morgan --features_only, or use --features_path "
+            "together with --features_only."
+        )
     if args.is_atom_bond_targets:
         raise NotImplementedError("LightGBM does not support atom/bond target mode.")
 
@@ -484,6 +629,7 @@ def run_training_lgbm(
         )
 
     # Preserve unscaled evaluation targets before normalizing regression targets.
+    train_targets = train_data.targets()
     val_targets = val_data.targets()
     val_gt_targets, val_lt_targets = val_data.gt_targets(), val_data.lt_targets()
     if skip_test_evaluation:
@@ -492,6 +638,15 @@ def run_training_lgbm(
     else:
         test_targets = test_data.targets()
         test_gt_targets, test_lt_targets = test_data.gt_targets(), test_data.lt_targets()
+
+    # Check raw values before regression scaling can turn a single infinity
+    # into NaNs across an entire task column.
+    _validate_lgbm_targets(
+        train_targets, args, "training", require_each_task=True
+    )
+    _validate_lgbm_targets(val_targets, args, "validation")
+    if not skip_test_evaluation:
+        _validate_lgbm_targets(test_targets, args, "test")
 
     if args.features_scaling:
         features_scaler = train_data.normalize_features(replace_nan_token=0)
@@ -618,6 +773,8 @@ def run_training_lgbm(
             metric,
             ignore_nan_metrics=args.ignore_nan_metrics,
         )
+        if metric == args.metric:
+            _validate_primary_validation_score(metric, valid_mean)
         info(f"Ensemble validation {metric} = {valid_mean:.6f}")
         if not skip_test_evaluation:
             test_mean = multitask_mean(

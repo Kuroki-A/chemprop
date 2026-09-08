@@ -8,7 +8,12 @@ import os
 from tap import Tap  # pip install typed-argument-parser (https://github.com/swansonk14/typed-argument-parser)
 
 from chemprop.web.app import app, db
-from chemprop.web.utils import clear_temp_folder, set_root_folder, validate_web_security_config
+from chemprop.web.utils import (
+    clear_temp_folder,
+    set_root_folder,
+    validate_web_security_config,
+    validate_web_storage_config,
+)
 
 
 class WebArgs(Tap):
@@ -39,6 +44,8 @@ def run_web(args: WebArgs) -> None:
         create_folders=True
     )
     clear_temp_folder(app=app)
+    if args.allow_remote:
+        validate_web_storage_config(app)
 
     db.init_app(app)
 
@@ -47,7 +54,16 @@ def run_web(args: WebArgs) -> None:
             db.init_db()
             print("-- INITIALIZED DATABASE --")
 
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    # Training progress and per-user prediction paths are process-local legacy
+    # state.  Keep the development server single-threaded as documented for
+    # Gunicorn, and disable the debug reloader's second process.
+    app.run(
+        host=args.host,
+        port=args.port,
+        debug=args.debug,
+        threaded=False,
+        use_reloader=False,
+    )
 
 
 def chemprop_web() -> None:

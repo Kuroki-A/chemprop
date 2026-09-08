@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 import hashlib
-import sys
 import csv
 import ctypes
 from logging import Logger
@@ -36,10 +35,50 @@ def get_header(path: str) -> List[str]:
     :param path: Path to a CSV file.
     :return: A list of strings containing the strings in the comma-separated header.
     """
-    with open(path) as f:
-        header = next(csv.reader(f))
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        try:
+            header = next(csv.reader(f))
+        except StopIteration as error:
+            raise ValueError(
+                f'Data file {path} must contain a header row.'
+            ) from error
+
+    if not header:
+        raise ValueError(f'Data file {path} has an empty header row.')
+
+    blank_columns = [index + 1 for index, column in enumerate(header)
+                     if not column.strip()]
+    if blank_columns:
+        raise ValueError(
+            f'Data file {path} has blank header names at columns '
+            f'{blank_columns}.'
+        )
+
+    duplicate_columns = sorted({
+        column for column in header if header.count(column) > 1
+    })
+    if duplicate_columns:
+        raise ValueError(
+            f'Data file {path} has duplicate header names: '
+            f'{duplicate_columns}.'
+        )
 
     return header
+
+
+def _validate_csv_dict_row(row: dict, path: str, row_number: int) -> None:
+    """Rejects ragged CSV rows before ``DictReader`` can hide their shape."""
+    if None in row:
+        raise ValueError(
+            f'Data file {path} row {row_number} has more fields than its header.'
+        )
+
+    missing_columns = [column for column, value in row.items() if value is None]
+    if missing_columns:
+        raise ValueError(
+            f'Data file {path} row {row_number} is missing values for columns '
+            f'{missing_columns}.'
+        )
 
 
 _FEATURE_MANIFEST_SCHEMA_FIELDS = (
@@ -214,6 +253,13 @@ def _feature_manifest_schema(
     if manifest is None:
         return None
     manifest_path = f'{path}.manifest.json'
+
+    status = manifest.get('status')
+    if status is not None and status != 'complete':
+        raise ValueError(
+            f'Feature manifest {manifest_path} has status {status!r}; only '
+            'complete feature archives can be loaded.'
+        )
 
     recorded_dimension = _manifest_dimension(path, manifest)
     actual_dimension = int(array.shape[1])
@@ -481,6 +527,12 @@ def get_mixed_task_names(path: str,
     if isinstance(smiles_columns, str) or smiles_columns is None:
         smiles_columns = preprocess_smiles_columns(path=path, smiles_columns=smiles_columns)
 
+    if len(smiles_columns) != 1:
+        raise ValueError(
+            'Atomic/bond target schema inference requires exactly one SMILES '
+            'column.'
+        )
+
     ignore_columns = set(smiles_columns + ([] if ignore_columns is None else ignore_columns))
 
     if target_columns is not None:
@@ -488,54 +540,101 @@ def get_mixed_task_names(path: str,
     else:
         target_names = [column for column in columns if column not in ignore_columns]
 
-    with open(path) as f:
+    missing_columns = [column for column in target_names if column not in columns]
+    if missing_columns:
+        raise ValueError(
+            f'Data file {path} does not contain target columns '
+            f'{missing_columns!r}.'
+        )
+
+    task_kinds = {}
+    saw_valid_molecule = False
+    with open(path, newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            atom_target_names, bond_target_names, molecule_target_names = [], [], []
-            smiles = [row[c] for c in smiles_columns]
-            for s in smiles:
+        for row_number, row in enumerate(reader, start=2):
+            _validate_csv_dict_row(row, path, row_number)
+            smiles = row[smiles_columns[0]]
+            try:
                 if keep_atom_map:
-                    # When the original atom mapping is used, the explicit hydrogens specified in the input SMILES should be used
-                    # However, the explicit Hs can only be added for reactions with `--explicit_h` flag
-                    # To fix this, `keep_h` is set to True when `keep_atom_map` is also True
-                    mol = make_mol(s, keep_h=True, add_h=add_h, keep_atom_map=True)
+                    # Keeping atom maps requires retaining explicitly written H.
+                    mol = make_mol(
+                        smiles, keep_h=True, add_h=add_h, keep_atom_map=True,
+                    )
                 else:
-                    mol = make_mol(s, keep_h=keep_h, add_h=add_h, keep_atom_map=False)
-                if len(mol.GetAtoms()) != len(mol.GetBonds()):
-                    break
+                    mol = make_mol(
+                        smiles, keep_h=keep_h, add_h=add_h,
+                        keep_atom_map=False,
+                    )
+            except Exception:
+                mol = None
+            if mol is None:
+                continue
 
+            saw_valid_molecule = True
+            num_atoms = mol.GetNumAtoms()
+            num_bonds = mol.GetNumBonds()
             for column in target_names:
+                if column in task_kinds:
+                    continue
                 value = row[column]
-                value = value.replace('None', 'null')
-                target = np.array(json.loads(value))
+                if value in {'', 'nan', 'None', 'null'}:
+                    continue
+                try:
+                    target = np.asarray(json.loads(value.replace('None', 'null')))
+                except (json.JSONDecodeError, TypeError) as error:
+                    raise ValueError(
+                        f'Could not parse target column {column!r} at CSV row '
+                        f'{row_number} in {path}.'
+                    ) from error
 
-                is_atom_target, is_bond_target, is_molecule_target = False, False, False
-                if len(target.shape) == 0:
-                    is_molecule_target = True
-                elif len(target.shape) == 1:
-                    if len(target) == len(mol.GetAtoms()):  # Atom targets saved as 1D list
-                        is_atom_target = True
-                    elif len(target) == len(mol.GetBonds()):  # Bond targets saved as 1D list
-                        is_bond_target = True
-                    else:
-                        raise RuntimeError(f'Unrecognized targets of column {column} in {path}. '
-                                           'Expected targets should be either atomic or bond targets. '
-                                           'Please ensure the content is correct.')
-                elif len(target.shape) == 2:  # Bond targets saved as 2D list
-                    is_bond_target = True
+                if target.ndim == 0:
+                    if target.item() is None:
+                        continue
+                    kind = 'molecule'
+                elif target.ndim == 1:
+                    atom_match = len(target) == num_atoms
+                    bond_match = len(target) == num_bonds
+                    if atom_match == bond_match:
+                        if atom_match:
+                            # Cycles can have equal atom and bond counts. Seek a
+                            # later, unambiguous molecule before deciding.
+                            continue
+                        raise RuntimeError(
+                            f'Unrecognized targets of column {column} at CSV '
+                            f'row {row_number} in {path}: vector length '
+                            f'{len(target)} matches neither {num_atoms} atoms '
+                            f'nor {num_bonds} bonds.'
+                        )
+                    kind = 'atom' if atom_match else 'bond'
+                elif target.ndim == 2:
+                    kind = 'bond'
                 else:
-                    raise ValueError(f'Unrecognized targets of column {column} in {path}.')
-                
-                if is_atom_target:
-                    atom_target_names.append(column)
-                elif is_bond_target:
-                    bond_target_names.append(column)
-                elif is_molecule_target:
-                    molecule_target_names.append(column)
-            if len(atom_target_names) + len(bond_target_names) + len(molecule_target_names) == len(target_names):
+                    raise ValueError(
+                        f'Unrecognized {target.ndim}-D targets of column '
+                        f'{column} at CSV row {row_number} in {path}.'
+                    )
+                task_kinds[column] = kind
+
+            if len(task_kinds) == len(target_names):
                 break
 
-    return atom_target_names, bond_target_names, molecule_target_names
+    if not saw_valid_molecule:
+        raise ValueError(
+            f'Cannot infer atomic/bond target schema from {path}: no valid '
+            'SMILES rows were found.'
+        )
+    unresolved = [column for column in target_names if column not in task_kinds]
+    if unresolved:
+        raise ValueError(
+            f'Cannot unambiguously infer atomic/bond target type for columns '
+            f'{unresolved!r} in {path}.'
+        )
+
+    return (
+        [column for column in target_names if task_kinds[column] == 'atom'],
+        [column for column in target_names if task_kinds[column] == 'bond'],
+        [column for column in target_names if task_kinds[column] == 'molecule'],
+    )
 
 
 def get_data_weights(path: str) -> List[float]:
@@ -546,7 +645,7 @@ def get_data_weights(path: str) -> List[float]:
     :return: A list of floats containing the data weights.
     """
     weights = []
-    with open(path) as f:
+    with open(path, encoding='utf-8-sig') as f:
         reader = csv.reader(f)
         try:
             next(reader)  # skip header row
@@ -584,13 +683,38 @@ def get_constraints(path: str,
     :return: Lists of floats containing the data constraints.
     """
     constraints_data = []
+    # pandas renames duplicate CSV columns (for example ``task`` becomes
+    # ``task.1``), so inspect the raw header before pandas can hide ambiguity.
+    with open(path, newline='', encoding='utf-8-sig') as constraints_file:
+        header_reader = csv.reader(constraints_file)
+        try:
+            raw_header = next(header_reader)
+        except StopIteration as error:
+            raise ValueError(
+                f'Constraints file {path} must contain a header row.'
+            ) from error
+    if len(raw_header) != len(set(raw_header)):
+        raise ValueError(f'There are duplicate columns in {path}.')
+
     reader = pd.read_csv(path)
     reader_columns = reader.columns.tolist()
-    if len(reader_columns) != len(set(reader_columns)):
-        raise ValueError(f'There are duplicates in {path}.')
     for target in target_columns:
         if target in reader_columns:
-            constraints_data.append(reader[target].values)
+            try:
+                target_constraints = pd.to_numeric(
+                    reader[target], errors='raise'
+                ).to_numpy(dtype=float)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f'Constraints column {target!r} in {path} must contain '
+                    'only numeric finite values.'
+                ) from error
+            if not np.all(np.isfinite(target_constraints)):
+                raise ValueError(
+                    f'Constraints column {target!r} in {path} must contain '
+                    'only numeric finite values.'
+                )
+            constraints_data.append(target_constraints)
         else:
             constraints_data.append([None] * len(reader))
     constraints_data = np.transpose(constraints_data)  # each is num_data x num_targets
@@ -630,14 +754,35 @@ def get_smiles(path: str,
     if (isinstance(smiles_columns, str) or smiles_columns is None) and header:
         smiles_columns = preprocess_smiles_columns(path=path, smiles_columns=smiles_columns, number_of_molecules=number_of_molecules)
 
-    with open(path) as f:
+    with open(path, newline='', encoding='utf-8-sig') as f:
         if header:
+            file_header = get_header(path)
+            missing_columns = [
+                column for column in smiles_columns
+                if column not in file_header
+            ]
+            if missing_columns:
+                raise ValueError(
+                    f'Data file {path} does not contain SMILES columns '
+                    f'{missing_columns}.'
+                )
             reader = csv.DictReader(f)
+            smiles = []
+            for row_number, row in enumerate(reader, start=2):
+                _validate_csv_dict_row(row, path, row_number)
+                smiles.append([row[column] for column in smiles_columns])
         else:
             reader = csv.reader(f)
             smiles_columns = list(range(number_of_molecules))
-
-        smiles = [[row[c] for c in smiles_columns] for row in reader]
+            smiles = []
+            for row_number, row in enumerate(reader, start=1):
+                if len(row) < number_of_molecules:
+                    raise ValueError(
+                        f'Data file {path} row {row_number} contains '
+                        f'{len(row)} fields, but {number_of_molecules} SMILES '
+                        'columns were requested.'
+                    )
+                smiles.append([row[column] for column in smiles_columns])
 
     if flatten:
         smiles = [smile for smiles_list in smiles for smile in smiles_list]
@@ -705,6 +850,20 @@ def get_invalid_smiles_from_list(smiles: List[List[str]], reaction: bool = False
     :param reaction: Boolean whether the SMILES strings are to be treated as a reaction.
     :return: A list of lists of SMILES, for the invalid SMILES among the lists provided.
     """
+    if not smiles:
+        return []
+
+    number_of_molecules = len(smiles[0])
+    if number_of_molecules == 0:
+        raise ValueError('Each SMILES row must contain at least one molecule.')
+    for row_number, mol_smiles in enumerate(smiles, start=1):
+        if len(mol_smiles) != number_of_molecules:
+            raise ValueError(
+                'Every SMILES row must contain the same number of molecules; '
+                f'row {row_number} contains {len(mol_smiles)}, expected '
+                f'{number_of_molecules}.'
+            )
+
     invalid_smiles = []
 
     # If the first SMILES in the column is a molecule, the remaining SMILES in the same column should all be a molecule.
@@ -785,6 +944,7 @@ def get_data(path: str,
              with other info such as additional features when desired.
     """
     debug = logger.debug if logger is not None else print
+    file_header = get_header(path)
 
     if args is not None:
         # Prefer explicit function arguments but default to args if not provided
@@ -812,9 +972,24 @@ def get_data(path: str,
     if isinstance(smiles_columns, str) or smiles_columns is None:
         smiles_columns = preprocess_smiles_columns(path=path, smiles_columns=smiles_columns)
 
-    max_data_size = max_data_size or float('inf')
+    if max_data_size is not None:
+        if (
+            isinstance(max_data_size, bool)
+            or not isinstance(max_data_size, (int, np.integer))
+            or max_data_size < 0
+        ):
+            raise ValueError('max_data_size must be a non-negative integer or None.')
+        max_data_size = int(max_data_size)
+    else:
+        max_data_size = float('inf')
 
-    feature_paths = [] if features_path is None else features_path
+    feature_paths = (
+        [] if features_path is None
+        else [features_path] if isinstance(features_path, str)
+        else list(features_path)
+    )
+    if isinstance(features_generator, str):
+        features_generator = [features_generator]
     feature_manifests = [
         _load_feature_manifest(feature_path) for feature_path in feature_paths
     ]
@@ -828,18 +1003,33 @@ def get_data(path: str,
     # one ordered sequence per configured molecule column: save_features accepts
     # one SMILES column and its ``flatten=True`` result is exactly one of these
     # sequences, even for a multi-molecule Chemprop dataset.
+    descriptor_pickle_extensions = {'.pkl', '.pckl', '.pickle'}
+    needs_raw_descriptor_smiles = any(
+        descriptor_path is not None
+        and os.path.splitext(descriptor_path)[1].lower()
+        in descriptor_pickle_extensions
+        for descriptor_path in (atom_descriptors_path, bond_descriptors_path)
+    )
     ordered_smiles_columns = None
-    if any(manifest is not None for manifest in feature_manifests) \
-            or phase_features_manifest is not None:
+    raw_descriptor_smiles = None
+    if (
+        any(manifest is not None for manifest in feature_manifests)
+        or phase_features_manifest is not None
+        or needs_raw_descriptor_smiles
+    ):
         raw_smiles_rows = get_smiles(
             path=path,
             smiles_columns=smiles_columns,
             flatten=False,
         )
-        ordered_smiles_columns = [[] for _ in smiles_columns]
-        for smiles_row in raw_smiles_rows:
-            for column_index, smiles in enumerate(smiles_row):
-                ordered_smiles_columns[column_index].append(smiles)
+        if any(manifest is not None for manifest in feature_manifests) \
+                or phase_features_manifest is not None:
+            ordered_smiles_columns = [[] for _ in smiles_columns]
+            for smiles_row in raw_smiles_rows:
+                for column_index, smiles in enumerate(smiles_row):
+                    ordered_smiles_columns[column_index].append(smiles)
+        if needs_raw_descriptor_smiles:
+            raw_descriptor_smiles = [row[0] for row in raw_smiles_rows]
         raw_data_row_count = len(raw_smiles_rows)
     elif (
         feature_paths
@@ -855,7 +1045,7 @@ def get_data(path: str,
             and os.path.splitext(bond_descriptors_path)[1].lower() != '.sdf'
         )
     ):
-        with open(path) as raw_data_file:
+        with open(path, encoding='utf-8-sig') as raw_data_file:
             raw_data_row_count = sum(1 for _ in csv.DictReader(raw_data_file))
     else:
         raw_data_row_count = None
@@ -980,9 +1170,9 @@ def get_data(path: str,
         gt_targets, lt_targets = None, None
 
     # Load data
-    with open(path) as f:
+    with open(path, newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames
+        fieldnames = file_header
         if any([c not in fieldnames for c in smiles_columns]):
             raise ValueError(f'Data file did not contain all provided smiles columns: {smiles_columns}. Data file field names are: {fieldnames}')
         if any([c not in fieldnames for c in target_columns]):
@@ -990,6 +1180,9 @@ def get_data(path: str,
 
         all_smiles, all_targets, all_atom_targets, all_bond_targets, all_rows, all_features, all_phase_features, all_constraints_data, all_raw_constraints_data, all_weights, all_gt, all_lt, all_row_indices = [], [], [], [], [], [], [], [], [], [], [], [], []
         for i, row in enumerate(tqdm(reader)):
+            if len(all_smiles) >= max_data_size:
+                break
+            _validate_csv_dict_row(row, path, i + 2)
             smiles = [row[c] for c in smiles_columns]
 
             targets, atom_targets, bond_targets = [], [], []
@@ -1074,11 +1267,23 @@ def get_data(path: str,
         atom_features = None
         atom_descriptors = None
         if args is not None and args.atom_descriptors is not None:
+            atom_descriptor_extension = os.path.splitext(
+                atom_descriptors_path
+            )[1].lower()
+            descriptor_smiles = (
+                [x[0] for x in all_smiles]
+                if atom_descriptor_extension == '.sdf'
+                else raw_descriptor_smiles
+                if atom_descriptor_extension in descriptor_pickle_extensions
+                else [x[0] for x in all_smiles]
+            )
             try:
-                descriptors = load_valid_atom_or_bond_features(atom_descriptors_path, [x[0] for x in all_smiles])
+                descriptors = load_valid_atom_or_bond_features(
+                    atom_descriptors_path, descriptor_smiles,
+                )
             except Exception as e:
                 raise ValueError(f'Failed to load or validate custom atomic descriptors or features: {e}')
-            if os.path.splitext(atom_descriptors_path)[1].lower() != '.sdf':
+            if atom_descriptor_extension != '.sdf':
                 if len(descriptors) != raw_data_row_count:
                     raise ValueError(
                         f'Atom descriptor file {atom_descriptors_path} has '
@@ -1100,11 +1305,23 @@ def get_data(path: str,
         bond_features = None
         bond_descriptors = None
         if args is not None and args.bond_descriptors is not None:
+            bond_descriptor_extension = os.path.splitext(
+                bond_descriptors_path
+            )[1].lower()
+            descriptor_smiles = (
+                [x[0] for x in all_smiles]
+                if bond_descriptor_extension == '.sdf'
+                else raw_descriptor_smiles
+                if bond_descriptor_extension in descriptor_pickle_extensions
+                else [x[0] for x in all_smiles]
+            )
             try:
-                descriptors = load_valid_atom_or_bond_features(bond_descriptors_path, [x[0] for x in all_smiles])
+                descriptors = load_valid_atom_or_bond_features(
+                    bond_descriptors_path, descriptor_smiles,
+                )
             except Exception as e:
                 raise ValueError(f'Failed to load or validate custom bond descriptors or features: {e}')
-            if os.path.splitext(bond_descriptors_path)[1].lower() != '.sdf':
+            if bond_descriptor_extension != '.sdf':
                 if len(descriptors) != raw_data_row_count:
                     raise ValueError(
                         f'Bond descriptor file {bond_descriptors_path} has '
@@ -1310,9 +1527,11 @@ def get_inequality_targets(path: str, target_columns: List[str] = None) -> List[
     gt_targets = []
     lt_targets = []
 
-    with open(path) as f:
+    get_header(path)
+    with open(path, newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
-        for line in reader:
+        for row_number, line in enumerate(reader, start=2):
+            _validate_csv_dict_row(line, path, row_number)
             values = [line[col] for col in target_columns]
             gt_targets.append(['>' in val for val in values])
             lt_targets.append(['<' in val for val in values])
@@ -1520,7 +1739,7 @@ def get_class_sizes(data: MoleculeDataset, proportion: bool = True) -> List[List
         for task_num in range(len(targets[i])):
             if data.is_atom_bond_targets:
                 for target in targets[i][task_num]:
-                    if targets[i][task_num] is not None:
+                    if target is not None:
                         valid_targets[task_num].append(target)
             else:
                 if targets[i][task_num] is not None:
@@ -1528,8 +1747,8 @@ def get_class_sizes(data: MoleculeDataset, proportion: bool = True) -> List[List
 
     class_sizes = []
     for task_targets in valid_targets:
-        if set(np.unique(task_targets)) > {0, 1}:
-            raise ValueError('Classification dataset must only contains 0s and 1s.')
+        if not set(np.unique(task_targets)) <= {0, 1}:
+            raise ValueError('Classification dataset must only contain 0s and 1s.')
         if proportion:
             try:
                 ones = np.count_nonzero(task_targets) / len(task_targets)
@@ -1544,20 +1763,36 @@ def get_class_sizes(data: MoleculeDataset, proportion: bool = True) -> List[List
     return class_sizes
 
 
-#  TODO: Validate multiclass dataset type.
-def validate_dataset_type(data: MoleculeDataset, dataset_type: str) -> None:
+def validate_dataset_type(data: MoleculeDataset,
+                          dataset_type: str,
+                          multiclass_num_classes: int = None) -> None:
     """
     Validates the dataset type to ensure the data matches the provided type.
 
     :param data: A :class:`~chemprop.data.MoleculeDataset`.
     :param dataset_type: The dataset type to check.
+    :param multiclass_num_classes: Number of allowed classes for multiclass
+                                   targets, when known.
     """
     target_list = [target for targets in data.targets() for target in targets]
 
     if data.is_atom_bond_targets:
-        target_set = set(list(np.concatenate(target_list).flat)) - {None}
+        target_values = (
+            list(np.concatenate(target_list).flat) if target_list else []
+        )
     else:
-        target_set = set(target_list) - {None}
+        target_values = target_list
+
+    target_values = [target for target in target_values if target is not None]
+    if not target_values:
+        raise ValueError(
+            'Dataset must contain at least one observed target value for training.'
+        )
+    numeric_targets = np.asarray(target_values, dtype=float)
+    if not np.all(np.isfinite(numeric_targets)):
+        raise ValueError('Dataset targets must be finite numbers or missing values.')
+
+    target_set = set(numeric_targets.tolist())
     classification_target_set = {0, 1}
 
     if dataset_type == 'classification' and not (target_set <= classification_target_set):
@@ -1566,6 +1801,21 @@ def validate_dataset_type(data: MoleculeDataset, dataset_type: str) -> None:
     elif dataset_type == 'regression' and target_set <= classification_target_set:
         raise ValueError('Regression data targets must be more than just 0 or 1 (or None). '
                          'Please switch to classification.')
+    elif dataset_type == 'multiclass':
+        if multiclass_num_classes is not None and multiclass_num_classes < 2:
+            raise ValueError('multiclass_num_classes must be at least 2.')
+        if any(not float(target).is_integer() for target in numeric_targets):
+            raise ValueError('Multiclass data targets must be integer class indices.')
+        if any(target < 0 for target in numeric_targets):
+            raise ValueError('Multiclass data targets must be non-negative class indices.')
+        if (
+            multiclass_num_classes is not None
+            and any(target >= multiclass_num_classes for target in numeric_targets)
+        ):
+            raise ValueError(
+                'Multiclass data targets must be smaller than '
+                f'multiclass_num_classes ({multiclass_num_classes}).'
+            )
 
 
 def validate_data(data_path: str) -> Set[str]:
@@ -1577,14 +1827,22 @@ def validate_data(data_path: str) -> Set[str]:
     """
     errors = set()
 
-    header = get_header(data_path)
+    try:
+        header = get_header(data_path)
+    except ValueError as error:
+        return {str(error)}
 
-    with open(data_path) as f:
+    with open(data_path, newline='', encoding='utf-8-sig') as f:
         reader = csv.reader(f)
         next(reader)  # Skip header
 
         smiles, targets = [], []
-        for line in reader:
+        for row_number, line in enumerate(reader, start=2):
+            if not line:
+                errors.add(f'Row {row_number} is empty.')
+                continue
+            if len(line) != len(header):
+                errors.add('Inconsistent number of tasks for each molecule.')
             smiles.append(line[0])
             targets.append(line[1:])
 

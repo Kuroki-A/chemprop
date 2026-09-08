@@ -83,6 +83,38 @@ class TestRDKitFeatureGenerators(unittest.TestCase):
             generators.erg_float_features_generator(self.mol),
         ))
 
+    def test_fixed_fingerprints_honor_selected_columns(self):
+        cases = {
+            "morgan": ("bit", [17, 3, 17]),
+            "morgan_count": ("count", [17, 3, 17]),
+            "maccs": ("bit", [17, 3, 17]),
+            "rdkit": ("bit", [17, 3, 17]),
+            "avalon": ("bit", [17, 3, 17]),
+            "atompair": ("bit", [17, 3, 17]),
+            "erg": ("erg", [17, 3, 17]),
+            "erg_float": ("erg", [17, 3, 17]),
+        }
+        for name, (prefix, indices) in cases.items():
+            with self.subTest(generator=name):
+                generator = generators.get_features_generator(name)
+                full = generator(self.mol)
+                selected = [f"{prefix}_{index}" for index in indices]
+                subset = generator(
+                    self.mol, selected_feature_columns=selected,
+                )
+                np.testing.assert_array_equal(subset, full[indices])
+                schema = generators.get_features_generator_schema(
+                    name, subset, selected_feature_columns=selected,
+                )
+                self.assertEqual(schema["dimension"], len(selected))
+                self.assertEqual(schema["feature_names"], selected)
+
+                with self.assertRaisesRegex(KeyError, "not_a_feature"):
+                    generator(
+                        self.mol,
+                        selected_feature_columns=["not_a_feature"],
+                    )
+
     def test_checkpoint_metadata_preserves_generator_and_selected_column_order(self):
         first = generators.get_features_generators_metadata(
             ["rdkit_2d_208"],
@@ -386,6 +418,23 @@ class TestBatchCacheAndSchema(unittest.TestCase):
             self.assertEqual(len(constructions), 1)
             self.assertEqual(calls[-2:], [["CC"], ["CCC"]])
 
+            selected = ["embedding_1", "embedding_0", "embedding_1"]
+            np.testing.assert_array_equal(generator("CC", selected), [3.0, 2.0, 3.0])
+            selected_batch = generators.generate_features_batch(
+                "MolT5", ["CC", "CCC"], selected, batch_size=2,
+            )
+            np.testing.assert_array_equal(
+                selected_batch,
+                [[3.0, 2.0, 3.0], [4.0, 3.0, 4.0]],
+            )
+            selected_schema = generators.get_features_generator_schema(
+                "MolT5", selected_feature_columns=selected,
+            )
+            self.assertEqual(selected_schema["feature_names"], selected)
+            self.assertEqual(selected_schema["dimension"], 3)
+            with self.assertRaisesRegex(KeyError, "embedding_2"):
+                generator("CC", ["embedding_2"])
+
             generators.clear_pretrained_transformer_cache()
             generator("C")
             self.assertEqual(len(constructions), 2)
@@ -413,13 +462,14 @@ class TestBatchCacheAndSchema(unittest.TestCase):
             },
         )
 
-        # Legacy fingerprint generators accept selected columns but have
-        # always ignored them; the manifest must still describe all bits.
-        selected_schema = generators.get_features_generator_schema(
-            "morgan", vector, selected_feature_columns=["bit_0"],
+        selected_vector = generators.morgan_binary_features_generator(
+            "CCO", selected_feature_columns=["bit_0"],
         )
-        self.assertEqual(selected_schema["dimension"], 2048)
-        self.assertEqual(len(selected_schema["feature_names"]), 2048)
+        selected_schema = generators.get_features_generator_schema(
+            "morgan", selected_vector, selected_feature_columns=["bit_0"],
+        )
+        self.assertEqual(selected_schema["dimension"], 1)
+        self.assertEqual(selected_schema["feature_names"], ["bit_0"])
 
     def test_batch_api_preserves_order_and_selected_columns(self):
         rows = generators.generate_features_batch(
@@ -444,9 +494,30 @@ class TestBatchCacheAndSchema(unittest.TestCase):
         with mock.patch.object(
             generators, "_load_padel_from_smiles", return_value=mock.Mock(side_effect=RuntimeError("Java")),
         ):
-            with self.assertWarnsRegex(RuntimeWarning, "Java"):
-                output = generators.padelpy_features_generator("CCC")
-        np.testing.assert_array_equal(output, np.zeros(1444))
+            with self.assertRaisesRegex(
+                RuntimeError, "PaDEL failed.*SMILES 'CCC'.*Java",
+            ):
+                generators.padelpy_features_generator("CCC")
+
+    def test_padel_batch_failure_reports_row_smiles_and_cause(self):
+        row = OrderedDict((f"padel_{index}", str(index)) for index in range(1444))
+
+        def fake_from_smiles(value):
+            if isinstance(value, list):
+                raise RuntimeError("batch Java failure")
+            if value == "CCC":
+                raise RuntimeError("molecule Java failure")
+            return row
+
+        with mock.patch.object(
+            generators, "_load_padel_from_smiles", return_value=fake_from_smiles,
+        ):
+            with self.assertWarnsRegex(RuntimeWarning, "retrying 2 molecules"):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "batch row 1.*SMILES 'CCC'.*molecule Java failure",
+                ):
+                    generators.padelpy_batch_features_generator(["CC", "CCC"])
 
     @unittest.skipUnless(importlib.util.find_spec("molfeat"), "molfeat is optional")
     def test_molfeat_011_generators_are_deterministic_and_batch_equivalent(self):

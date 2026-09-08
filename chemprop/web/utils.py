@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import stat
 from typing import Any
 
 from flask import Flask
@@ -46,6 +47,34 @@ def validate_web_security_config(app: Flask, allow_remote: bool, debug: bool = F
         )
 
 
+def validate_web_storage_config(app: Flask) -> None:
+    """Requires private, user-owned state directories for remote serving.
+
+    Chemprop v1 checkpoints are pickle-based, and the SQLite database selects
+    which checkpoint will be loaded. A different local account must therefore
+    not be able to replace either the files or their parent directories while
+    an authenticated Web service is running.
+    """
+    if os.name != 'posix':
+        raise ValueError('Remote Web serving is supported only on POSIX systems.')
+
+    for config_name in ('ROOT_FOLDER', 'DATA_FOLDER', 'CHECKPOINT_FOLDER', 'TEMP_FOLDER'):
+        path = os.path.abspath(app.config[config_name])
+        if os.path.islink(path):
+            raise ValueError(f'Remote Web storage {path} must not be a symbolic link.')
+
+        path_stat = os.stat(path)
+        if not stat.S_ISDIR(path_stat.st_mode):
+            raise ValueError(f'Remote Web storage {path} must be a directory.')
+        if path_stat.st_uid != os.geteuid():
+            raise ValueError(f'Remote Web storage {path} must be owned by the service user.')
+        if stat.S_IMODE(path_stat.st_mode) & 0o077:
+            raise ValueError(
+                f'Remote Web storage {path} must be private (mode 0700); '
+                f'found {stat.S_IMODE(path_stat.st_mode):04o}.'
+            )
+
+
 def set_root_folder(app: Flask, root_folder: str = None, create_folders: bool = True) -> None:
     """
     Sets the root folder for the config along with subfolders like the data and checkpoint folders.
@@ -64,15 +93,20 @@ def set_root_folder(app: Flask, root_folder: str = None, create_folders: bool = 
 
     # Create folders
     if create_folders:
-        if not os.access(os.path.dirname(app.config['ROOT_FOLDER']), os.W_OK):
-            raise ValueError(f'You do not have write permissions on the root_folder: {app.config["ROOT_FOLDER"]}\n'
-                             f'Please specify a different root_folder while starting the web app.')
-
         for folder_name in ['ROOT_FOLDER', 'DATA_FOLDER', 'CHECKPOINT_FOLDER', 'TEMP_FOLDER']:
-            os.makedirs(app.config[folder_name], exist_ok=True)
+            try:
+                os.makedirs(app.config[folder_name], mode=0o700, exist_ok=True)
+            except OSError as error:
+                raise ValueError(
+                    f'Unable to create Web storage directory '
+                    f'{app.config[folder_name]}: {error}'
+                ) from error
 
 
 def clear_temp_folder(app: Flask) -> None:
     """Clears the temporary folder."""
-    shutil.rmtree(app.config['TEMP_FOLDER'])
-    os.makedirs(app.config['TEMP_FOLDER'], exist_ok=True)
+    path = app.config['TEMP_FOLDER']
+    if os.path.islink(path):
+        raise ValueError(f'Refusing to clear symbolic-link temporary directory: {path}')
+    shutil.rmtree(path)
+    os.makedirs(path, mode=0o700)

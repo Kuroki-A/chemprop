@@ -8,7 +8,6 @@ import shutil
 import sys
 import tempfile
 from typing import Callable, Iterable, Iterator, List, Sequence, Tuple
-import warnings
 import zipfile
 
 import numpy as np
@@ -21,32 +20,41 @@ from tap import Tap  # pip install typed-argument-parser (https://github.com/swa
 # imported accidentally.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-from chemprop.data import get_smiles
+from chemprop.data import get_smiles, load_selected_feature_columns
 from chemprop.features import get_available_features_generators, get_features_generator, load_features, save_features
 from chemprop.features.features_generators import get_features_generator_schema
 from chemprop.utils import makedirs
 
 
 _FEATURES_WORKER = None
+_FEATURES_WORKER_SELECTED_COLUMNS = None
 
 
-def _initialize_features_worker(features_generator_name: str) -> None:
+def _initialize_features_worker(
+    features_generator_name: str,
+    selected_feature_columns: Sequence[str] = None,
+) -> None:
     """Initializes one generator per worker process."""
-    global _FEATURES_WORKER
+    global _FEATURES_WORKER, _FEATURES_WORKER_SELECTED_COLUMNS
     _FEATURES_WORKER = get_features_generator(features_generator_name)
+    _FEATURES_WORKER_SELECTED_COLUMNS = selected_feature_columns
 
 
 def _generate_features_worker(smiles: str):
     """Generates one row through the process-local registry function."""
     if _FEATURES_WORKER is None:
         raise RuntimeError("Feature worker was not initialized.")
-    return _FEATURES_WORKER(smiles)
+    return _FEATURES_WORKER(
+        smiles,
+        selected_feature_columns=_FEATURES_WORKER_SELECTED_COLUMNS,
+    )
 
 
 class Args(Tap):
     data_path: str  # Path to data CSV
     smiles_column: str = None  # Name of the column containing SMILES strings. By default, uses the first column.
     features_generator: str = 'rdkit_2d_normalized'  # Type of features to generate
+    selected_features_path: str = None  # Optional CSV of ordered generator feature names to retain
     save_path: str  # Path to .npz file where features will be saved as a compressed numpy archive
     save_frequency: int = 10000  # Frequency with which to save the features
     restart: bool = False  # Whether to not load partially complete featurization and instead start from scratch
@@ -256,7 +264,7 @@ def _iter_batched_features(
 def _default_num_workers() -> int:
     try:
         cpu_count = len(os.sched_getaffinity(0))
-    except AttributeError:
+    except (AttributeError, NotImplementedError, OSError):
         cpu_count = os.cpu_count() or 1
     # Descriptor calculators and model backends can be memory intensive.
     return max(1, min(cpu_count, 8))
@@ -344,6 +352,10 @@ def _validate_resume_manifest(path: str, expected_schema: dict, expected_input: 
             manifest.get('input', {}).get('ordered_smiles_sha256'),
             expected_input['ordered_smiles_sha256'],
         ),
+        'ordered_smiles_encoding': (
+            manifest.get('input', {}).get('ordered_smiles_encoding'),
+            expected_input['ordered_smiles_encoding'],
+        ),
         'num_smiles': (
             manifest.get('input', {}).get('num_smiles'), expected_input['num_smiles'],
         ),
@@ -351,6 +363,10 @@ def _validate_resume_manifest(path: str, expected_schema: dict, expected_input: 
     for field in ('dimension', 'dtype'):
         if expected_schema.get(field) is not None:
             comparisons[field] = (manifest.get(field), expected_schema.get(field))
+    if expected_schema.get('dimension') is not None:
+        comparisons['feature_names'] = (
+            manifest.get('feature_names'), expected_schema.get('feature_names'),
+        )
     mismatches = [name for name, (actual, expected) in comparisons.items() if actual != expected]
     if mismatches:
         raise ValueError(
@@ -371,13 +387,16 @@ def _save_manifest(
     prior_schema: dict = None,
     feature_vector=None,
     num_molecules_completed: int = None,
+    selected_feature_columns: Sequence[str] = None,
 ) -> dict:
     if feature_vector is None and len(features):
         feature_vector = features[0]
     if num_molecules_completed is None:
         num_molecules_completed = len(features)
     manifest = get_features_generator_schema(
-        args.features_generator, feature_vector=feature_vector,
+        args.features_generator,
+        feature_vector=feature_vector,
+        selected_feature_columns=selected_feature_columns,
     )
     if prior_schema is not None and manifest['dimension'] is not None:
         generic_names = [f'feature_{index}' for index in range(manifest['dimension'])]
@@ -422,10 +441,21 @@ def generate_and_save_features(args: Args):
     # Get data and features function
     all_smiles = get_smiles(path=args.data_path, smiles_columns=args.smiles_column, flatten=True)
     features_generator = get_features_generator(args.features_generator)
+    selected_features_path = getattr(args, 'selected_features_path', None)
+    selected_feature_columns = (
+        load_selected_feature_columns(selected_features_path).get(
+            args.features_generator
+        )
+        if selected_features_path is not None
+        else None
+    )
     temp_save_dir = args.save_path + '_temp'
     manifest_path = args.save_path + '.manifest.json'
     input_identity = _input_identity(args.data_path, all_smiles)
-    expected_schema = get_features_generator_schema(args.features_generator)
+    expected_schema = get_features_generator_schema(
+        args.features_generator,
+        selected_feature_columns=selected_feature_columns,
+    )
     resume_manifest = None
     feature_vector = None
     dimension = expected_schema.get('dimension')
@@ -449,9 +479,10 @@ def generate_and_save_features(args: Args):
                     manifest_path, expected_schema, input_identity,
                 )
             else:
-                warnings.warn(
-                    "Resuming a legacy temporary feature directory without a manifest; "
-                    "its input and generator identity cannot be verified.", RuntimeWarning,
+                raise ValueError(
+                    "Cannot safely resume a temporary feature directory without "
+                    "its manifest because the input and generator identity cannot "
+                    "be verified. Use --restart to discard it."
                 )
 
     if not os.path.exists(temp_save_dir):
@@ -488,9 +519,14 @@ def generate_and_save_features(args: Args):
             )
         if feature_vector is not None:
             resumed_schema = get_features_generator_schema(
-                args.features_generator, feature_vector=feature_vector,
+                args.features_generator,
+                feature_vector=feature_vector,
+                selected_feature_columns=selected_feature_columns,
             )
-            for key in ('dimension', 'dtype'):
+            schema_fields = ['dimension', 'dtype']
+            if expected_schema.get('dimension') is not None:
+                schema_fields.append('feature_names')
+            for key in schema_fields:
                 recorded = resume_manifest.get(key)
                 if recorded is not None and recorded != resumed_schema[key]:
                     raise ValueError(
@@ -504,6 +540,7 @@ def generate_and_save_features(args: Args):
         prior_schema=resume_manifest,
         feature_vector=feature_vector,
         num_molecules_completed=completed,
+        selected_feature_columns=selected_feature_columns,
     )
 
     # Build features map function
@@ -536,24 +573,47 @@ def generate_and_save_features(args: Args):
                     prior_schema=current_manifest,
                     feature_vector=feature_vector,
                     num_molecules_completed=completed,
+                    selected_feature_columns=selected_feature_columns,
                 )
 
     batch_transform = getattr(features_generator, 'batch_transform', None)
     use_requested_process_pool = _prefer_requested_process_pool(
         args, features_generator,
     )
-    if batch_transform is not None and not use_requested_process_pool:
+    batch_supports_selection = (
+        selected_feature_columns is None
+        or getattr(features_generator, 'batch_supports_selected_columns', False)
+    )
+    if (
+        batch_transform is not None
+        and batch_supports_selection
+        and not use_requested_process_pool
+    ):
         effective_batch_size = args.batch_size or getattr(features_generator, 'preferred_batch_size', 256)
-        consume(_iter_batched_features(smiles, batch_transform, effective_batch_size))
+        if selected_feature_columns is None:
+            selected_batch_transform = batch_transform
+        else:
+            selected_batch_transform = lambda batch: batch_transform(
+                batch, selected_feature_columns=selected_feature_columns,
+            )
+        consume(_iter_batched_features(
+            smiles, selected_batch_transform, effective_batch_size,
+        ))
     elif args.sequential:
-        consume(map(features_generator, smiles))
+        if selected_feature_columns is None:
+            selected_generator = features_generator
+        else:
+            selected_generator = lambda value: features_generator(
+                value, selected_feature_columns=selected_feature_columns,
+            )
+        consume(map(selected_generator, smiles))
     else:
         worker_count = args.num_workers or _default_num_workers()
         context = get_context()
         with context.Pool(
             processes=worker_count,
             initializer=_initialize_features_worker,
-            initargs=(args.features_generator,),
+            initargs=(args.features_generator, selected_feature_columns),
         ) as pool:
             consume(pool.imap(_generate_features_worker, smiles, chunksize=args.chunksize))
 
@@ -579,6 +639,7 @@ def generate_and_save_features(args: Args):
             prior_schema=current_manifest,
             feature_vector=feature_vector,
             num_molecules_completed=completed,
+            selected_feature_columns=selected_feature_columns,
         )
 
         # Remove temporary features
@@ -590,6 +651,7 @@ def generate_and_save_features(args: Args):
             prior_schema=current_manifest,
             feature_vector=feature_vector,
             num_molecules_completed=completed,
+            selected_feature_columns=selected_feature_columns,
         )
         print('Features array is too large to save as a single file. Instead keeping features as a directory of files.')
 

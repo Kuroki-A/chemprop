@@ -78,10 +78,17 @@ LightGBM Heads
 ^^^^^^^^^^^^^^
 
 For regression and binary classification, :code:`--model_type lgbm` trains
-one LightGBM head per task and stores each ensemble member together with its
-exact frozen encoder and feature scalers in a versioned :code:`.pkl` bundle.
-Missing multitask targets are supported. For a descriptor-only baseline, a
-deterministic fingerprint is recommended:
+one LightGBM head per task. LightGBM does not optimize the neural MPN encoder,
+so this backend **requires** :code:`--features_only` together with a
+deterministic :code:`--features_generator` (for example, Morgan) or a matching
+external :code:`--features_path`. An untrained random MPN representation is
+seed-dependent and is rejected. Feature scalers, boosters, and metadata are
+stored in versioned :code:`.pkl` bundles. Missing multitask targets are
+supported.
+
+Prediction also refuses earlier versioned bundles whose recorded training
+arguments used :code:`features_only=False`; retrain those models with this
+release and a deterministic feature source.
 
 .. code-block::
 
@@ -167,6 +174,24 @@ chunks, disk-backed consolidation, and a schema/hash manifest next to its
 :code:`.npz` output. The conda environment supplies OpenJDK 17 for the
 :code:`padelpy` backend.
 
+PaDEL calculation or numeric-conversion failures stop feature generation and
+report the affected batch row, SMILES, and underlying cause. A failed molecule
+is never replaced with an all-zero descriptor row, because that would silently
+change model inputs.
+
+:code:`--selected_features_path` accepts a CSV with generator names as columns
+and the ordered feature names to retain as values. Fixed fingerprints use
+:code:`bit_N` (:code:`morgan`, :code:`maccs`, :code:`rdkit`, :code:`avalon`,
+:code:`atompair`), :code:`count_N` (:code:`morgan_count`), :code:`erg_N`
+(:code:`erg`, :code:`erg_float`), or :code:`fp_N` (:code:`map4`,
+:code:`map4_v1_1`) labels. Repeated names intentionally repeat output columns.
+
+.. warning::
+   This maintenance version fixes fixed-fingerprint and pretrained-Molfeat
+   generators that previously accepted selected columns but silently returned
+   full vectors. Checkpoints trained with that old behavior and a selected
+   feature CSV should be retrained if their input width no longer matches.
+
 :code:`map4` is the canonicalized, folded 2,048-bit MAP4 v1.0 definition
 expected by Molfeat 0.11. :code:`map4_v1_1` is the canonicalized native
 :code:`map4` 1.1.3 definition. They are not bit-compatible, so training and
@@ -183,6 +208,16 @@ offline-generation commands are documented in :ref:`features`.
 Molecule-Level Custom Features
 """"""""""""""""""""""""""""""
 
+.. warning::
+   Python pickle inputs (``.pkl``, ``.pckl``, and ``.pickle``, including
+   pandas pickle files) can execute arbitrary code while loading. Open them
+   only when they were created by you or another fully trusted source. Prefer
+   ``.npz``, ``.npy``, or ``.csv`` for ``--features_path``,
+   ``--atom_descriptors_path``, and ``--bond_descriptors_path`` whenever
+   possible. Model checkpoints and the optional dataset cache have the same
+   trust requirement, as do cross-validation split/index pickle files and
+   Hyperopt trial checkpoint directories.
+
 If you install from source, you can modify the code to load custom features as follows:
 
 1. **Generate features:** If you want to generate features in code, you can write a custom features generator function in :code:`chemprop/features/features_generators.py`. Scroll down to the bottom of that file to see a features generator code template.
@@ -196,6 +231,11 @@ Similar to the additional molecular features described above, you can also provi
 * :code:`.npz` file, where descriptors are saved as 2D array for each molecule in the exact same order as the SMILES strings in your data file.
 * :code:`.pkl` / :code:`.pckl` / :code:`.pickle` containing a pandas dataframe with smiles as index and numpy array of descriptors as columns.
 * :code:`.sdf` containing all mol blocks with descriptors as entries.
+
+Pickle rows are validated and reordered using the SMILES index before rows with
+missing targets are filtered. Every raw CSV row must have one corresponding
+pickle row. Duplicate SMILES are accepted only when both inputs already have
+exactly the same order; reordered duplicates are rejected as ambiguous.
 
 The order of the descriptors for each atom per molecule must match the ordering of atoms in the RDKit molecule object. Further information on supplying atomic descriptors can be found `here <https://github.com/chemprop/chemprop/releases/tag/v1.1.0>`_.
 

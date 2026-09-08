@@ -1,0 +1,5 @@
+# Documentation builds do not need the multi-gigabyte CUDA runtime. Install
+# the matching official CPU wheel first; it satisfies setup.py's torch range.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
+-e .[docs]

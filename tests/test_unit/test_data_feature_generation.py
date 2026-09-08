@@ -14,6 +14,7 @@ from chemprop.data import (
     empty_cache,
     get_data,
     get_data_from_smiles,
+    load_selected_feature_columns,
 )
 from chemprop.data.data import (
     SMILES_TO_GRAPH,
@@ -112,6 +113,102 @@ def test_selected_feature_csv_is_loaded_once(monkeypatch, tmp_path):
         assert datapoint.features.shape == (2,)
 
     assert reads == 1
+
+
+def test_selected_feature_cache_is_not_mutable_by_callers(tmp_path):
+    empty_cache()
+    path = _selected_features_csv(tmp_path)
+
+    first = load_selected_feature_columns(path)
+    first['_test_selected_features'] = ('changed',)
+    first['new_generator'] = ('unexpected',)
+
+    second = load_selected_feature_columns(path)
+    assert second == {'_test_selected_features': ('f0', 'f1')}
+
+
+@pytest.mark.parametrize('prefix', ['', '\ufeff'])
+def test_selected_feature_csv_rejects_duplicate_generator_columns(tmp_path, prefix):
+    path = tmp_path / 'duplicate_selected_features.csv'
+    path.write_text(f'{prefix}morgan,morgan\nbit_1,bit_2\n', encoding='utf-8')
+
+    with pytest.raises(ValueError, match='duplicate generator columns'):
+        load_selected_feature_columns(str(path))
+
+
+@pytest.mark.parametrize('header', ['', 'morgan,', ' ,rdkit'])
+def test_selected_feature_csv_rejects_blank_generator_columns(tmp_path, header):
+    path = tmp_path / 'blank_selected_features.csv'
+    path.write_text(f'{header}\nbit_1,bit_2\n', encoding='utf-8')
+
+    with pytest.raises(ValueError, match='non-blank generator names'):
+        load_selected_feature_columns(str(path))
+
+
+def test_empty_dataset_is_not_an_atom_or_bond_target_dataset():
+    dataset = MoleculeDataset([])
+    assert dataset.is_atom_bond_targets is False
+    assert dataset.batch_graph() == []
+    assert dataset.data_weights() == []
+    assert dataset.atom_bond_data_weights() == []
+    assert dataset.gt_targets() is None
+    assert dataset.lt_targets() is None
+
+
+@pytest.mark.parametrize(
+    ('argument', 'label'),
+    [
+        ('features', 'Molecular features'),
+        ('atom_features', 'Atom features'),
+        ('atom_descriptors', 'Atom descriptors'),
+        ('bond_features', 'Bond features'),
+        ('bond_descriptors', 'Bond descriptors'),
+    ],
+)
+def test_datapoint_rejects_infinite_feature_inputs(argument, label):
+    value = (
+        np.array([np.inf, 1.0])
+        if argument == 'features'
+        else np.array([[np.inf], [1.0]])
+    )
+
+    with pytest.raises(ValueError, match=rf'{label} contains an infinite value'):
+        MoleculeDatapoint(['CC'], **{argument: value})
+
+
+def test_datapoint_replaces_nan_in_every_feature_input():
+    datapoint = MoleculeDatapoint(
+        ['CC'],
+        features=np.array([np.nan, 1.0]),
+        atom_features=np.array([[np.nan], [1.0]]),
+        atom_descriptors=np.array([[np.nan], [1.0]]),
+        bond_features=np.array([[np.nan]]),
+        bond_descriptors=np.array([[np.nan]]),
+    )
+
+    assert datapoint.features[0] == 0
+    assert datapoint.atom_features[0, 0] == 0
+    assert datapoint.atom_descriptors[0, 0] == 0
+    assert datapoint.bond_features[0, 0] == 0
+    assert datapoint.bond_descriptors[0, 0] == 0
+
+
+def test_datapoint_rejects_non_numeric_feature_inputs():
+    with pytest.raises(ValueError, match='real-valued numeric array'):
+        MoleculeDatapoint(['CC'], features=np.array(['not-a-number']))
+
+
+def test_zero_bond_feature_matrices_retain_their_feature_width():
+    dataset = MoleculeDataset([
+        MoleculeDatapoint(
+            ['C'],
+            bond_features=np.empty((0, 3)),
+            bond_descriptors=np.empty((0, 4)),
+        )
+    ])
+
+    assert dataset.bond_features_size() == 3
+    assert dataset.bond_descriptors_size() == 4
 
 
 def test_reaction_honors_selected_feature_columns(tmp_path):
@@ -830,3 +927,78 @@ def test_ordered_atom_features_follow_rows_skipped_for_missing_targets(tmp_path)
     assert len(data) == 2
     np.testing.assert_array_equal(data[0].atom_features, np.full((2, 1), 10.0))
     np.testing.assert_array_equal(data[1].atom_features, np.full((2, 1), 30.0))
+
+
+def test_pickle_atom_features_align_before_skipping_missing_targets(tmp_path):
+    data_path = tmp_path / 'atom_features.csv'
+    data_path.write_text('smiles,target\nCC,1\nCCC,\nCO,3\n')
+    atom_features_path = tmp_path / 'atom_features.pkl'
+    pd.DataFrame(
+        {
+            'descriptor': [
+                np.full(2, 30.0),
+                np.full(2, 10.0),
+                np.full(3, 20.0),
+            ]
+        },
+        index=['CO', 'CC', 'CCC'],
+    ).to_pickle(atom_features_path)
+    args = TrainArgs().parse_args(
+        [
+            '--data_path', str(data_path),
+            '--dataset_type', 'regression',
+            '--atom_descriptors', 'feature',
+            '--atom_descriptors_path', str(atom_features_path),
+            '--no_cuda',
+        ]
+    )
+
+    data = get_data(path=str(data_path), args=args, skip_none_targets=True)
+
+    assert len(data) == 2
+    np.testing.assert_array_equal(data[0].atom_features, np.full((2, 1), 10.0))
+    np.testing.assert_array_equal(data[1].atom_features, np.full((2, 1), 30.0))
+
+
+def test_get_data_normalizes_single_feature_path_and_generator_strings(tmp_path):
+    data_path = tmp_path / 'data.csv'
+    data_path.write_text('smiles,target\nCC,1\nCCC,2\n')
+    feature_path = tmp_path / 'features.npz'
+    np.savez_compressed(feature_path, features=np.array([[10.0], [20.0]]))
+
+    data = get_data(
+        path=str(data_path),
+        features_path=str(feature_path),
+        features_generator='morgan',
+    )
+
+    assert len(data) == 2
+    assert data[0].features.shape == (2049,)
+    assert data[0].features[0] == 10
+    assert data[1].features[0] == 20
+
+
+def test_get_data_honors_zero_and_rejects_invalid_max_data_size(tmp_path):
+    data_path = tmp_path / 'data.csv'
+    data_path.write_text('smiles,target\nCC,1\nCCC,2\n')
+
+    assert len(get_data(path=str(data_path), max_data_size=0)) == 0
+    for invalid in (-1, 1.5, True):
+        with pytest.raises(ValueError, match='max_data_size'):
+            get_data(path=str(data_path), max_data_size=invalid)
+
+
+def test_get_data_rejects_an_incomplete_external_feature_manifest(tmp_path):
+    data_path = tmp_path / 'data.csv'
+    data_path.write_text('smiles,target\nCC,1\nCCC,2\n')
+    feature_path = tmp_path / 'features.npz'
+    np.savez_compressed(feature_path, features=np.array([[10.0], [20.0]]))
+    payload = _write_feature_manifest(
+        feature_path, ['CC', 'CCC'], dimension=1,
+    )
+    payload['status'] = 'in_progress'
+    manifest_path = feature_path.with_name(feature_path.name + '.manifest.json')
+    manifest_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match='only complete feature archives'):
+        get_data(path=str(data_path), features_path=[str(feature_path)])

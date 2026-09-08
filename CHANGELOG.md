@@ -1,5 +1,139 @@
 # Changelog
 
+## 1.7.1+kuroki.2 — 2026-09-08
+
+This maintenance release follows a second end-to-end correctness, security,
+packaging, and CI audit of the Kuroki Chemprop v1 fork.
+
+### Highlights
+
+- Corrected legacy Web prediction handling for empty and partially invalid
+  SMILES input, removed stale/colliding uploaded prediction files, validated
+  GPU and form values, and prevented failed training runs from leaving empty
+  checkpoint records.
+- Closed an external-referrer redirect and made uploaded status messages robust
+  to malformed query data. Database name collision retries now propagate
+  foreign-key and other non-unique integrity failures instead of looping.
+- Fixed invalid Web template markup and stale local/SSH startup instructions.
+- Repaired the Docker build order for the editable install, updated micromamba,
+  and reduced accidental build-context inclusion of local artifacts.
+- Migrated CodeQL from the unsupported v2 action to v4, updated the official
+  checkout/setup-python actions, applied least-privilege checkout credentials,
+  and added documentation and source-distribution checks to CI. Push/PR CI now
+  runs the full unit suite and a bounded real train/predict smoke test instead
+  of an unbounded collection of multi-fold and Hyperopt integration studies.
+- Resolved all findings from the pull-request CodeQL quality gate, including
+  request-derived redirect data, explicit control-flow initialization, and
+  nested-loop variable shadowing.
+- Added packaging and lint tooling to the reproducible development environment.
+- Documented the 2026-10-04 Python 3.10 end-of-life boundary while retaining
+  the agreed closed environment for reproducibility.
+- Replaced quadratic all-atom-pair bond traversal with sparse RDKit bond
+  traversal, reducing graph-featurization work from `O(V^2)` to
+  `O(V + E log E)` while preserving the legacy directed-bond order.
+  Molfeat and fixed-fingerprint selected-column handling, deterministic MAP4
+  seeding, and MAP4 intermediate-memory use were also corrected.
+- PaDEL failures now stop feature generation with the row, SMILES, and root
+  cause instead of silently inserting an all-zero descriptor vector.
+- Hardened external feature/descriptor alignment and validation: pickle
+  atom/bond descriptors are reindexed by unambiguous SMILES, SDF descriptor
+  columns are detected across all rows, non-finite inputs are rejected or
+  normalized as documented, and constraint CSVs reject duplicate headers and
+  non-numeric/non-finite values.
+- Feature-generation resume now rejects legacy temporary directories without
+  an identity manifest and compares the ordered-SMILES encoding as well as its
+  digest before reusing chunks.
+- Documented the arbitrary-code-execution risk of pickle-based external
+  feature and atom/bond descriptor inputs, split indices, Hyperopt trials, and
+  the safer NumPy/CSV formats.
+- Remote Web state must now be user-owned and private (mode `0700`), and the
+  deployment guide explicitly requires a single worker/thread for its
+  process-local progress and prediction state. The built-in development server
+  likewise disables threading and the debug reloader.
+- LightGBM training now requires ``--features_only`` with deterministic
+  generated or external features; this prevents silently fitting boosters to
+  an untrained random MPN representation. Prediction also rejects existing
+  versioned bundles recorded with ``features_only=False`` and requires them to
+  be retrained.
+- Hardened uncertainty prediction and calibration: ensemble model/scaler count
+  mismatches are rejected, MC dropout no longer mutates models permanently,
+  invalid calibration option combinations fail fast, small/missing conformal
+  samples are handled explicitly, and regression/multiclass/spectral
+  uncertainty metrics use the correct masks and finite arithmetic.
+- Corrected T-scaling to pass a standard deviation (not a variance) to the
+  Student-t likelihood, and corrected MVE weighting to apply weights on the
+  task axis and reshape predictions against the prediction dataset. Z-, T-,
+  and Zelikman scaling now reject unobserved tasks and non-positive or
+  non-finite variances instead of persisting a NaN calibration factor.
+- Made uncertainty calibration/evaluation work with variable-length atom and
+  bond targets under NumPy 2. Task counts, masks, model axes, and every
+  per-molecule boundary are now checked, including conformal and Platt paths.
+- Applied dtype-aware positive floors to MVE variance and evidential
+  lambda/alpha/beta parameters, preventing extreme negative logits from
+  producing zero denominators or non-finite losses and uncertainty values.
+- Made the Noam scheduler finite for zero warmup, zero-epoch evaluation, and
+  short runs whose requested warmup is longer than training; malformed epoch,
+  step, and learning-rate settings now fail early.
+- Added argument validation for neural hidden sizes/depths, FFN layers,
+  dropout, learning rates, gradient clipping, cache thresholds, loss
+  coefficients, and split indices. ``--test`` now requires an existing
+  checkpoint source while explicit ``--epochs 0`` compatibility is retained.
+- Configuration-file overrides are now applied before derived argument state
+  is computed, and malformed top-level JSON, unknown/internal keys, and
+  attempts to replace ``config_path`` are rejected instead of being silently
+  accepted. Config values can no longer bypass CLI types, enumerated choices,
+  feature-generator names, or GPU selection. Interpret, Hyperopt, and sklearn
+  estimator bounds and counts are also validated.
+- StandardScaler now rejects ragged, width-mismatched, infinite, or invalid
+  checkpoint state and handles entirely missing feature columns without
+  emitting NumPy warnings.
+- FFN training now rejects empty training/validation splits, tasks with no
+  observed training labels, and invalid class-balanced splits, and fails fast
+  when its primary validation metric or mini-batch loss is non-finite.
+- Replaced the non-differentiable multiclass MCC ``argmax`` loss with a soft
+  confusion-matrix formulation and made degenerate MCC scoring return a finite
+  result instead of ``NaN``.
+- Tightened dataset target validation for multiclass/non-finite values, fixed
+  missing-label handling for atom-level class sizes, and made ordinary FFN
+  checkpoint loading reject missing or shape-mismatched weights unless partial
+  loading is explicitly requested.
+- Fixed GPU bond-descriptor placement so CUDA tensor indices are never used to
+  index NumPy arrays, preserved `bias=False` for the solvent MPN, and validated
+  molecule/descriptor scopes before MPN and constrained-FFN computation.
+  Empty-bond molecules and inconsistent atom/bond output shapes now fail with
+  a targeted error rather than being truncated or misassigned.
+- CSV readers now reject empty/blank/duplicate headers and short or overlong
+  rows before `DictReader` or pandas can hide them, handle UTF-8 BOMs, and
+  validate SMILES row width. Empty invalid-SMILES inputs are handled safely;
+  selected-feature CSVs likewise reject blank or duplicate generator names.
+- Corrected scaffold/time-window split index spaces and output locations,
+  overlap detection for multiple SMILES columns, paired Wilcoxon aggregation,
+  Welch one-sided direction, HDF5 resource handling, and several script CSV
+  alignment/empty-input cases. Morgan similarity now computes each fingerprint
+  once and uses RDKit bulk Tanimoto operations.
+- Restored collection of a silently overwritten data-feature unit test,
+  exported `model_fingerprint` through the public train API, and removed
+  remaining meaningful undefined/unused/redefinition static-analysis findings.
+- Refreshed the corrected T-scaling and current-stack reaction/solvent
+  integration baselines, fixed a misleading atom/bond test label, and made
+  prediction integration tests deterministic on restricted runners by using
+  zero multiprocessing workers.
+
+### Compatibility notes
+
+- Corrected T-scaling, MVE weighting, atom/bond uncertainty, statistical-test,
+  and time-window split behavior can change numerical outputs. Re-run affected
+  uncertainty reports, statistical comparisons, and generated split files.
+- CSV files with duplicate/blank headers or ragged rows that were previously
+  interpreted by truncation or pandas column rewriting are now rejected and
+  must be corrected at the source.
+- A task with no calibration observations, or an uncertainty source with
+  non-positive/non-finite variance, cannot be multiplicatively calibrated and
+  now raises `ValueError` instead of producing a non-finite scaler.
+- Class-balanced mini-batch sampling is explicitly limited to a single binary
+  target with at least one observed member of each class; the former
+  any-positive multitask grouping was ambiguous and is no longer accepted.
+
 ## 1.7.1+kuroki.1 — 2026-08-20
 
 This is the first explicitly versioned release of the Kuroki-maintained

@@ -1,3 +1,4 @@
+import csv
 import os
 import threading
 from collections import OrderedDict
@@ -37,7 +38,7 @@ FEATURES_CACHE_LOCK = threading.Lock()
 
 # Parsed selected-feature files are shared by all datapoints. The file metadata
 # is part of the key so editing a CSV invalidates the cached mapping.
-SELECTED_FEATURES_CACHE: Dict[Tuple[str, int, int], Dict[str, Tuple[str, ...]]] = {}
+SELECTED_FEATURES_CACHE: Dict[Tuple[object, ...], Dict[str, Tuple[str, ...]]] = {}
 SELECTED_FEATURES_CACHE_LOCK = threading.Lock()
 
 
@@ -60,14 +61,41 @@ def load_selected_feature_columns(path: str) -> Dict[str, Tuple[str, ...]]:
     """Loads a selected-feature CSV once and returns generator-to-column mappings."""
     resolved_path = os.path.abspath(os.path.expanduser(path))
     stat = os.stat(resolved_path)
-    cache_key = (resolved_path, stat.st_mtime_ns, stat.st_size)
+    cache_key = (
+        resolved_path,
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
 
     with SELECTED_FEATURES_CACHE_LOCK:
         cached = SELECTED_FEATURES_CACHE.get(cache_key)
         if cached is not None:
-            return cached
+            # Never expose the cache's mutable dictionary to callers. Values
+            # are tuples, so a shallow copy is sufficient.
+            return dict(cached)
 
-    selected_features_df = pd.read_csv(resolved_path)
+    with open(
+        resolved_path, newline='', encoding='utf-8-sig',
+    ) as selected_features_file:
+        try:
+            raw_header = next(csv.reader(selected_features_file))
+        except StopIteration as error:
+            raise ValueError(
+                'Selected-feature CSV must contain a header row.'
+            ) from error
+    if not raw_header or any(not column.strip() for column in raw_header):
+        raise ValueError(
+            'Selected-feature CSV must contain non-blank generator names.'
+        )
+    if len(raw_header) != len(set(raw_header)):
+        raise ValueError(
+            'Selected-feature CSV contains duplicate generator columns.'
+        )
+
+    selected_features_df = pd.read_csv(resolved_path, encoding='utf-8-sig')
     mapping = {
         column: tuple(str(value) for value in selected_features_df[column].dropna().values)
         for column in selected_features_df.columns
@@ -80,7 +108,7 @@ def load_selected_feature_columns(path: str) -> Dict[str, Tuple[str, ...]]:
             SELECTED_FEATURES_CACHE.pop(key, None)
         SELECTED_FEATURES_CACHE[cache_key] = mapping
 
-    return mapping
+    return dict(mapping)
 
 
 def _feature_cache_key(features_generator: str,
@@ -304,6 +332,30 @@ def set_cache_mol(cache_mol: bool) -> None:
     CACHE_MOL = cache_mol
 
 
+def _sanitize_feature_array(
+    values: np.ndarray,
+    name: str,
+    expected_ndim: int,
+) -> np.ndarray:
+    """Returns a numeric feature array with NaNs replaced and no infinities."""
+    array = np.asarray(values)
+    if (
+        not np.issubdtype(array.dtype, np.number)
+        or np.issubdtype(array.dtype, np.complexfloating)
+    ):
+        raise ValueError(f'{name} must be a real-valued numeric array.')
+    if array.ndim != expected_ndim:
+        raise ValueError(
+            f'{name} must be a {expected_ndim}-D numeric array, got shape '
+            f'{array.shape}.'
+        )
+    if np.any(np.isinf(array)):
+        raise ValueError(f'{name} contains an infinite value.')
+
+    # Preserve the historical behavior of treating missing descriptors as 0.
+    return np.where(np.isnan(array), 0, array)
+
+
 class MoleculeDatapoint:
     """A :class:`MoleculeDatapoint` contains a single molecule and its associated features and targets."""
 
@@ -420,26 +472,34 @@ class MoleculeDatapoint:
 
             self.features = np.array(self.features)
 
-        # Fix nans in features
-        replace_token = 0
+        # Validate user/generated feature arrays before they reach scaling or
+        # a neural-network layer. NaNs retain the historical zero replacement,
+        # while infinities are rejected because they irreversibly poison model
+        # activations and fitted scalers.
         if self.features is not None:
-            self.features = np.where(np.isnan(self.features), replace_token, self.features)
+            self.features = _sanitize_feature_array(
+                self.features, 'Molecular features', expected_ndim=1,
+            )
 
-        # Fix nans in atom_descriptors
         if self.atom_descriptors is not None:
-            self.atom_descriptors = np.where(np.isnan(self.atom_descriptors), replace_token, self.atom_descriptors)
+            self.atom_descriptors = _sanitize_feature_array(
+                self.atom_descriptors, 'Atom descriptors', expected_ndim=2,
+            )
 
-        # Fix nans in atom_features
         if self.atom_features is not None:
-            self.atom_features = np.where(np.isnan(self.atom_features), replace_token, self.atom_features)
+            self.atom_features = _sanitize_feature_array(
+                self.atom_features, 'Atom features', expected_ndim=2,
+            )
 
-        # Fix nans in bond_descriptors
         if self.bond_descriptors is not None:
-            self.bond_descriptors = np.where(np.isnan(self.bond_descriptors), replace_token, self.bond_descriptors)
+            self.bond_descriptors = _sanitize_feature_array(
+                self.bond_descriptors, 'Bond descriptors', expected_ndim=2,
+            )
 
-        # Fix nans in bond_features
         if self.bond_features is not None:
-            self.bond_features = np.where(np.isnan(self.bond_features), replace_token, self.bond_features)
+            self.bond_features = _sanitize_feature_array(
+                self.bond_features, 'Bond features', expected_ndim=2,
+            )
 
         # Save a copy of the raw features and targets to enable different scaling later on
         self.raw_features, self.raw_targets, self.raw_atom_targets, self.raw_bond_targets = \
@@ -517,7 +577,9 @@ class MoleculeDatapoint:
 
         :param features: A 1D numpy array of features for the molecule.
         """
-        self.features = features
+        self.features = _sanitize_feature_array(
+            features, 'Molecular features', expected_ndim=1,
+        )
 
     def set_atom_descriptors(self, atom_descriptors: np.ndarray) -> None:
         """
@@ -525,7 +587,9 @@ class MoleculeDatapoint:
 
         :param atom_descriptors: A 1D numpy array of atom descriptors for the molecule.
         """
-        self.atom_descriptors = atom_descriptors
+        self.atom_descriptors = _sanitize_feature_array(
+            atom_descriptors, 'Atom descriptors', expected_ndim=2,
+        )
 
     def set_atom_features(self, atom_features: np.ndarray) -> None:
         """
@@ -533,7 +597,9 @@ class MoleculeDatapoint:
 
         :param atom_features: A 1D numpy array of atom features for the molecule.
         """
-        self.atom_features = atom_features
+        self.atom_features = _sanitize_feature_array(
+            atom_features, 'Atom features', expected_ndim=2,
+        )
 
     def set_bond_descriptors(self, bond_descriptors: np.ndarray) -> None:
         """
@@ -541,7 +607,9 @@ class MoleculeDatapoint:
 
         :param bond_descriptors: A 1D numpy array of bond descriptors for the molecule.
         """
-        self.bond_descriptors = bond_descriptors
+        self.bond_descriptors = _sanitize_feature_array(
+            bond_descriptors, 'Bond descriptors', expected_ndim=2,
+        )
 
     def set_bond_features(self, bond_features: np.ndarray) -> None:
         """
@@ -549,7 +617,9 @@ class MoleculeDatapoint:
 
         :param bond_features: A 1D numpy array of bond features for the molecule.
         """
-        self.bond_features = bond_features
+        self.bond_features = _sanitize_feature_array(
+            bond_features, 'Bond features', expected_ndim=2,
+        )
 
     def extend_features(self, features: np.ndarray) -> None:
         """
@@ -557,7 +627,14 @@ class MoleculeDatapoint:
 
         :param features: A 1D numpy array of extra features for the molecule.
         """
-        self.features = np.append(self.features, features) if self.features is not None else features
+        combined = (
+            np.append(self.features, features)
+            if self.features is not None
+            else features
+        )
+        self.features = _sanitize_feature_array(
+            combined, 'Molecular features', expected_ndim=1,
+        )
 
     def num_tasks(self) -> int:
         """
@@ -661,6 +738,8 @@ class MoleculeDataset(Dataset):
 
         :return: A Boolean value.
         """
+        if not self._data:
+            return False
         if self._data[0].atom_targets is None and self._data[0].bond_targets is None:
             return False
         else:
@@ -681,6 +760,8 @@ class MoleculeDataset(Dataset):
         """
         if self._batch_graph is None:
             self._batch_graph = []
+            if not self._data:
+                return self._batch_graph
 
             mol_graphs = []
             for d in self._data:
@@ -808,6 +889,8 @@ class MoleculeDataset(Dataset):
         """
         Returns the loss weighting associated with each datapoint.
         """
+        if not self._data:
+            return []
         if not hasattr(self._data[0], 'data_weight'):
             return [1. for d in self._data]
 
@@ -818,6 +901,8 @@ class MoleculeDataset(Dataset):
         Returns the loss weighting associated with each datapoint for atomic/bond properties prediction.
         """
         targets = self.targets()
+        if not targets:
+            return []
         data_weights = self.data_weights()
         atom_bond_data_weights = [[] for _ in targets[0]]
         for i, tb in enumerate(targets):
@@ -858,7 +943,7 @@ class MoleculeDataset(Dataset):
         
         :return: A list of lists of booleans indicating whether the targets in those positions are greater-than inequality targets.
         """
-        if not hasattr(self._data[0], 'gt_targets'):
+        if not self._data or not hasattr(self._data[0], 'gt_targets'):
             return None
 
         return [d.gt_targets for d in self._data]
@@ -869,7 +954,7 @@ class MoleculeDataset(Dataset):
         
         :return: A list of lists of booleans indicating whether the targets in those positions are less-than inequality targets.
         """
-        if not hasattr(self._data[0], 'lt_targets'):
+        if not self._data or not hasattr(self._data[0], 'lt_targets'):
             return None
 
         return [d.lt_targets for d in self._data]
@@ -896,7 +981,7 @@ class MoleculeDataset(Dataset):
 
         :return: The size of the additional atom descriptor vector.
         """
-        return len(self._data[0].atom_descriptors[0]) \
+        return int(self._data[0].atom_descriptors.shape[1]) \
             if len(self._data) > 0 and self._data[0].atom_descriptors is not None else None
 
     def atom_features_size(self) -> int:
@@ -905,7 +990,7 @@ class MoleculeDataset(Dataset):
 
         :return: The size of the additional atom feature vector.
         """
-        return len(self._data[0].atom_features[0]) \
+        return int(self._data[0].atom_features.shape[1]) \
             if len(self._data) > 0 and self._data[0].atom_features is not None else None
 
     def bond_descriptors_size(self) -> int:
@@ -914,7 +999,7 @@ class MoleculeDataset(Dataset):
 
         :return: The size of the additional bond descriptor vector.
         """
-        return len(self._data[0].bond_descriptors[0]) \
+        return int(self._data[0].bond_descriptors.shape[1]) \
             if len(self._data) > 0 and self._data[0].bond_descriptors is not None else None
 
     def bond_features_size(self) -> int:
@@ -923,7 +1008,7 @@ class MoleculeDataset(Dataset):
 
         :return: The size of the additional bond feature vector.
         """
-        return len(self._data[0].bond_features[0]) \
+        return int(self._data[0].bond_features.shape[1]) \
             if len(self._data) > 0 and self._data[0].bond_features is not None else None
 
     def normalize_features(self, scaler: StandardScaler = None, replace_nan_token: int = 0,
@@ -1095,11 +1180,35 @@ class MoleculeSampler(Sampler):
         self._random = Random(seed)
 
         if self.class_balance:
-            indices = np.arange(len(dataset))
-            has_active = np.array([any(target == 1 for target in datapoint.targets) for datapoint in dataset])
+            self.positive_indices = []
+            self.negative_indices = []
+            for index, datapoint in enumerate(dataset):
+                if datapoint.targets is None or len(datapoint.targets) != 1:
+                    raise ValueError(
+                        'Class-balanced sampling supports only single-task '
+                        'binary targets.'
+                    )
+                target = datapoint.targets[0]
+                if target is None:
+                    # Missing labels are neither negative nor positive and
+                    # must not influence the balancing ratio.
+                    continue
+                target_array = np.asarray(target)
+                if target_array.ndim != 0 or target_array.item() not in (0, 1):
+                    raise ValueError(
+                        'Class-balanced sampling requires observed targets to '
+                        'be binary values 0 or 1.'
+                    )
+                if target_array.item() == 1:
+                    self.positive_indices.append(index)
+                else:
+                    self.negative_indices.append(index)
 
-            self.positive_indices = indices[has_active].tolist()
-            self.negative_indices = indices[~has_active].tolist()
+            if not self.positive_indices or not self.negative_indices:
+                raise ValueError(
+                    'Class-balanced sampling requires at least one observed '
+                    'target from each binary class.'
+                )
 
             self.length = 2 * min(len(self.positive_indices), len(self.negative_indices))
         else:
@@ -1217,7 +1326,7 @@ class MoleculeDataLoader(DataLoader):
         if self._class_balance or self._shuffle:
             raise ValueError('Cannot safely extract targets when class balance or shuffle are enabled.')
         
-        if not hasattr(self._dataset[0],'gt_targets'):
+        if not self._dataset or not hasattr(self._dataset[0], 'gt_targets'):
             return None
 
         return [self._dataset[index].gt_targets for index in self._sampler]
@@ -1232,7 +1341,7 @@ class MoleculeDataLoader(DataLoader):
         if self._class_balance or self._shuffle:
             raise ValueError('Cannot safely extract targets when class balance or shuffle are enabled.')
 
-        if not hasattr(self._dataset[0],'lt_targets'):
+        if not self._dataset or not hasattr(self._dataset[0], 'lt_targets'):
             return None
 
         return [self._dataset[index].lt_targets for index in self._sampler]

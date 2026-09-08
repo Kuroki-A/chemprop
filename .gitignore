@@ -10,6 +10,7 @@ chemprop/features/_features_generators.py
 *.pt
 *.json
 *.sqlite3
-chemprop.egg-info
-docs/build
-dist/*
+chemprop.egg-info/
+build/
+docs/build/
+dist/

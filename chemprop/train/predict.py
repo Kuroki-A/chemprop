@@ -9,7 +9,7 @@ from chemprop.models import MoleculeModel
 from chemprop.nn_utils import activate_dropout
 
 
-def predict(
+def _predict(
     model: MoleculeModel,
     data_loader: MoleculeDataLoader,
     disable_progress_bar: bool = False,
@@ -226,3 +226,43 @@ def predict(
             return preds, lambdas, alphas, betas
 
     return preds
+
+
+def predict(
+    model: MoleculeModel,
+    data_loader: MoleculeDataLoader,
+    disable_progress_bar: bool = False,
+    scaler: StandardScaler = None,
+    atom_bond_scaler: AtomBondScaler = None,
+    return_unc_parameters: bool = False,
+    dropout_prob: float = 0.0,
+) -> List[List[float]]:
+    """Makes predictions without permanently changing model dropout layers."""
+    if (
+        not isinstance(dropout_prob, (int, float, np.integer, np.floating))
+        or isinstance(dropout_prob, (bool, np.bool_))
+        or not np.isfinite(dropout_prob)
+        or not 0 <= dropout_prob < 1
+    ):
+        raise ValueError('dropout_prob must be finite and in the range [0, 1).')
+
+    dropout_layers = [
+        module for module in model.modules() if isinstance(module, torch.nn.Dropout)
+    ]
+    original_dropout_probabilities = [module.p for module in dropout_layers]
+    try:
+        return _predict(
+            model=model,
+            data_loader=data_loader,
+            disable_progress_bar=disable_progress_bar,
+            scaler=scaler,
+            atom_bond_scaler=atom_bond_scaler,
+            return_unc_parameters=return_unc_parameters,
+            dropout_prob=dropout_prob,
+        )
+    finally:
+        for module, probability in zip(
+            dropout_layers, original_dropout_probabilities
+        ):
+            module.p = probability
+            module.eval()

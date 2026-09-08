@@ -1,7 +1,7 @@
 ![ChemProp Logo](logo/chemprop_logo.svg)
 # Chemprop
 
-[![Version](https://img.shields.io/badge/version-1.7.1%2Bkuroki.1-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/github/v/tag/Kuroki-A/chemprop?label=version)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.10-blue)](setup.py)
 [![Build Status](https://github.com/Kuroki-A/chemprop/workflows/tests/badge.svg)](https://github.com/Kuroki-A/chemprop/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -9,7 +9,7 @@
 Chemprop is a repository containing message passing neural networks for molecular property prediction.
 
 > [!IMPORTANT]
-> This repository is the Kuroki-maintained Chemprop v1 line (`1.7.1+kuroki.1`).
+> This repository is the Kuroki-maintained Chemprop v1 line (`1.7.1+kuroki.2`).
 > It intentionally retains the v1 command line and checkpoint interfaces while
 > carrying local correctness, LightGBM, security, dependency, and feature-generation
 > fixes. Install this fork from source; the `chemprop` package on PyPI is the
@@ -165,6 +165,11 @@ report fork-specific regressions through the
 The upstream [`v1-wontfix`](https://github.com/chemprop/chemprop/issues?q=label%3Av1-wontfix+)
 list remains useful historical context.
 
+Python 3.10 reaches upstream end of life on 2026-10-04. This release keeps the
+agreed, closed `chemprop310-cu124` environment for reproducibility, but it
+should not be treated as a basis for an internet-facing long-lived service;
+validate a Python 3.11/3.12 migration before resuming dependency upgrades.
+
 ## Web Interface
 
 For those less familiar with the command line, Chemprop also includes a web interface which allows for basic training and predicting. You can start the web interface on your local machine in two ways. Flask is used for development mode while gunicorn is used for production mode.
@@ -182,6 +187,10 @@ and `CHEMPROP_WEB_SECRET_KEY` to at least 32 bytes, and terminate HTTPS in a
 reverse proxy. Remote mode rejects debug mode and checkpoint upload. Generate
 independent random values with, for example,
 `python -c "import secrets; print(secrets.token_hex(32))"`.
+Its state directory must be owned by the service account and have mode `0700`,
+because it contains the checkpoint-selection database and pickle-based model
+files. The legacy progress and prediction state is process-local, so run
+exactly one Gunicorn worker and one thread.
 
 ### Gunicorn
 
@@ -192,14 +201,16 @@ pip install gunicorn
 ```
 
 For local use, bind explicitly to loopback with
-`gunicorn --bind 127.0.0.1:5000 'chemprop.web.wsgi:build_app()'`. For an HTTPS
-reverse proxy, use
-`'chemprop.web.wsgi:build_app(allow_remote=True)'` with the two security
-environment variables above. Never publish the local/default-mode socket
-through a reverse proxy because the proxy itself appears as a loopback client.
+`gunicorn --workers 1 --threads 1 --bind 127.0.0.1:5000 'chemprop.web.wsgi:build_app()'`.
+For an HTTPS reverse proxy, first create a private state directory, for example
+`install -d -m 700 "$HOME/.local/share/chemprop-web"`, then use
+`"chemprop.web.wsgi:build_app(allow_remote=True, root_folder='$HOME/.local/share/chemprop-web')"`
+with the two security environment variables above and the same one-worker,
+one-thread options. Never publish the local/default-mode socket through a
+reverse proxy because the proxy itself appears as a loopback client.
    * To run this server in the background, add the `--daemon` flag.
-   * Arguments including `init_db` and `demo` can be passed with this pattern: `'wsgi:build_app(init_db=True, demo=True)'` 
-   * Gunicorn documentation can be found [here](http://docs.gunicorn.org/en/stable/index.html).
+   * Arguments including `init_db` and `demo` can be passed with this pattern: `'chemprop.web.wsgi:build_app(init_db=True, demo=True)'`
+   * See the [Gunicorn documentation](https://docs.gunicorn.org/en/stable/).
 
 ## Within Python
 
@@ -256,13 +267,18 @@ Notes:
 ### LightGBM Heads
 
 For regression and binary classification, `--model_type lgbm` trains one
-LightGBM booster per task on a frozen molecular encoder. The exact encoder,
-feature scalers, task boosters, and training metadata are stored together in
-versioned `.pkl` bundles, so prediction uses the same feature space as training.
-Missing multitask labels and ensembles are supported.
+LightGBM booster per task. LightGBM training does not optimize the neural MPN
+encoder, so this backend **requires `--features_only`** together with a
+deterministic `--features_generator` (for example, Morgan) or a matching
+external `--features_path`. Running it on an untrained random MPN embedding
+would make model quality seed-dependent and is rejected. Feature scalers, task
+boosters, and training metadata are stored together in versioned `.pkl`
+bundles. Missing multitask labels and ensembles are supported.
 
-For a deterministic descriptor-only baseline, using a fingerprint as the
-encoder input is recommended:
+Prediction also rejects earlier versioned bundles whose recorded training
+arguments used `features_only=False`, because those models were fitted to an
+untrained random MPN representation. Retrain them with this release using
+Morgan or another deterministic feature source.
 
 ```bash
 chemprop_train --data_path data.csv --dataset_type regression \
@@ -334,6 +350,16 @@ By default, the atom-level representations from the message passing network are 
 
 While the model works very well on its own, especially after hyperparameter optimization, we have seen that additional features can further improve performance on certain datasets. The additional features can be added at the atom-, bond, or molecule-level. Molecule-level features can be either automatically generated by RDKit or custom features provided by the user.
 
+> [!WARNING]
+> Python pickle inputs (`.pkl`, `.pckl`, and `.pickle`, including pandas pickle
+> files) can execute arbitrary code while loading. Use them only when they were
+> created by you or another fully trusted source. Prefer `.npz`, `.npy`, or
+> `.csv` for `--features_path`, `--atom_descriptors_path`, and
+> `--bond_descriptors_path` whenever those formats can represent the data. The
+> same trust requirement applies to model checkpoints and the optional dataset
+> cache, cross-validation split/index pickle files, and Hyperopt trial
+> checkpoint directories.
+
 #### Molecule-Level Custom Features
 
 If you install from source, you can modify the code to load custom features as follows:
@@ -374,6 +400,10 @@ registered because Chemprop's SMILES input does not define reproducible
 conformers. The conda environment also supplies OpenJDK 17, which is required
 when `padelpy` invokes PaDEL-Descriptor.
 
+PaDEL calculation or numeric-conversion failures abort feature generation with
+the affected batch row, SMILES, and underlying cause. They are never replaced
+by an all-zero descriptor row, since doing so can silently corrupt a model.
+
 Feature generation during `get_data()` is chunked, deduplicates exact
 atom-order-preserving structures within a dataset, and preserves the v1
 generator/SMILES-column concatenation order. For reusable offline features:
@@ -388,6 +418,20 @@ chunks for restart, and consolidates them through a disk-backed array rather
 than retaining the full feature matrix as Python objects. It writes a sidecar
 manifest containing the ordered input hash, generator configuration, feature
 schema, dependency versions, and resumable progress.
+
+`--selected_features_path` accepts a CSV whose column names are generator
+names and whose values are the ordered feature names to retain. Fixed
+fingerprints use `bit_N` (`morgan`, `maccs`, `rdkit`, `avalon`, `atompair`),
+`count_N` (`morgan_count`), `erg_N` (`erg`, `erg_float`), or `fp_N`
+(`map4`, `map4_v1_1`) labels. Repeated names intentionally produce repeated
+columns. The selected order is recorded in feature/checkpoint metadata.
+
+> [!WARNING]
+> This maintenance version fixes fixed-fingerprint and pretrained-Molfeat
+> generators that previously accepted selected columns but silently returned
+> their full vectors. A checkpoint trained with that old behavior and a
+> `selected_features_path` should be retrained; its input width may no longer
+> match the correctly selected vector.
 
 ##### MAP4 compatibility
 
@@ -461,6 +505,11 @@ Similar to the additional molecular features described above, you can also provi
 * `.npz` file, where descriptors are saved as 2D array for each molecule in the exact same order as the SMILES strings in your data file.
 * `.pkl` / `.pckl` / `.pickle` containing a pandas dataframe with smiles as index and a numpy array of descriptors as columns.
 * `.sdf` containing all mol blocks with descriptors as entries.
+
+Pickle descriptor rows are matched and reordered by their SMILES index. Every
+raw CSV row must have exactly one corresponding pickle row. Duplicate SMILES
+are accepted only when both files already use exactly the same order; otherwise
+their row identity is ambiguous and loading fails explicitly.
 
 The order of the descriptors for each atom per molecule must match the ordering of atoms in the RDKit molecule object. Further information on supplying atomic descriptors can be found [here](https://github.com/chemprop/chemprop/releases/tag/v1.1.0). 
 

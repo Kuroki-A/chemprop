@@ -6,9 +6,15 @@ from tqdm import tqdm
 
 from chemprop.data import MoleculeDataset, StandardScaler, MoleculeDataLoader
 from chemprop.models import MoleculeModel
-from chemprop.train.predict import predict
 from chemprop.spectra_utils import normalize_spectra, roundrobin_sid
 from chemprop.multitask_utils import reshape_values, reshape_individual_preds
+
+
+def predict(*args, **kwargs):
+    """Imports the training predictor lazily to avoid package import cycles."""
+    from chemprop.train.predict import predict as train_predict
+
+    return train_predict(*args, **kwargs)
 
 
 class UncertaintyPredictor(ABC):
@@ -50,9 +56,46 @@ class UncertaintyPredictor(ABC):
         self.spectra_phase_mask = spectra_phase_mask
         self.train_class_sizes = None
 
+        if (
+            not isinstance(self.num_models, int)
+            or isinstance(self.num_models, bool)
+            or self.num_models < 1
+        ):
+            raise ValueError('num_models must be a positive integer.')
         self.raise_argument_errors()
         self.test_data_loader = test_data_loader
         self.calculate_predictions()
+
+    def _model_scaler_pairs(self):
+        """Iterates exactly ``num_models`` model/scaler pairs.
+
+        ``zip`` silently truncates unequal iterables. That behavior is unsafe
+        here because all ensemble aggregates are divided by ``num_models``.
+        """
+        model_iterator = iter(self.models)
+        scaler_iterator = iter(self.scalers)
+        sentinel = object()
+
+        def validated_pairs():
+            for _ in range(self.num_models):
+                model = next(model_iterator, sentinel)
+                scaler = next(scaler_iterator, sentinel)
+                if model is sentinel or scaler is sentinel:
+                    raise ValueError(
+                        'The number of supplied models and scalers must both '
+                        f'match num_models={self.num_models}.'
+                    )
+                yield model, scaler
+            if (
+                next(model_iterator, sentinel) is not sentinel
+                or next(scaler_iterator, sentinel) is not sentinel
+            ):
+                raise ValueError(
+                    'The number of supplied models and scalers must both '
+                    f'match num_models={self.num_models}.'
+                )
+
+        return tqdm(validated_pairs(), total=self.num_models)
 
     @property
     @abstractmethod
@@ -120,9 +163,7 @@ class NoUncertaintyPredictor(UncertaintyPredictor):
         return "no_uncertainty_method"
 
     def calculate_predictions(self):
-        for i, (model, scaler_list) in enumerate(
-            tqdm(zip(self.models, self.scalers), total=self.num_models)
-        ):
+        for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
             (
                 scaler,
                 features_scaler,
@@ -276,9 +317,7 @@ class ConformalQuantileRegressionPredictor(UncertaintyPredictor):
         return intervals
 
     def calculate_predictions(self):
-        for i, (model, scaler_list) in enumerate(
-            tqdm(zip(self.models, self.scalers), total=self.num_models)
-        ):
+        for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
             (
                 scaler,
                 features_scaler,
@@ -344,7 +383,7 @@ class ConformalQuantileRegressionPredictor(UncertaintyPredictor):
 
         if model.is_atom_bond_targets:
             raise NotImplementedError(
-                f"Uncertainty predictor type ConformalQuantileRegressionPredictor and ConformalRegressionPredictor are not currently supported for atom and bond properties prediction."
+                "Uncertainty predictor type ConformalQuantileRegressionPredictor and ConformalRegressionPredictor are not currently supported for atom and bond properties prediction."
             )
         else:
             uncal_preds = sum_preds / self.num_models
@@ -391,15 +430,17 @@ class RoundRobinSpectraPredictor(UncertaintyPredictor):
 
     def raise_argument_errors(self):
         super().raise_argument_errors()
-        if self.num_models == 1:
+        if self.dataset_type != "spectra":
+            raise ValueError(
+                "Round-robin spectral uncertainty requires the spectra dataset type."
+            )
+        if self.num_models < 2:
             raise ValueError(
                 "Roundrobin uncertainty is only available when multiple models are provided."
             )
 
     def calculate_predictions(self):
-        for i, (model, scaler_list) in enumerate(
-            tqdm(zip(self.models, self.scalers), total=self.num_models)
-        ):
+        for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
             (
                 scaler,
                 features_scaler,
@@ -474,9 +515,7 @@ class MVEPredictor(UncertaintyPredictor):
             )
 
     def calculate_predictions(self):
-        for i, (model, scaler_list) in enumerate(
-            tqdm(zip(self.models, self.scalers), total=self.num_models)
-        ):
+        for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
             (
                 scaler,
                 features_scaler,
@@ -547,7 +586,6 @@ class MVEPredictor(UncertaintyPredictor):
                         )
 
         if model.is_atom_bond_targets:
-            num_tasks = sum_preds.shape[1]
             uncal_preds, uncal_vars = [], []
             for pred, squared, var in zip(sum_preds, sum_squared, sum_vars):
                 uncal_pred = pred / self.num_models
@@ -616,9 +654,7 @@ class EvidentialTotalPredictor(UncertaintyPredictor):
             )
 
     def calculate_predictions(self):
-        for i, (model, scaler_list) in enumerate(
-            tqdm(zip(self.models, self.scalers), total=self.num_models)
-        ):
+        for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
             (
                 scaler,
                 features_scaler,
@@ -690,7 +726,6 @@ class EvidentialTotalPredictor(UncertaintyPredictor):
                         )
 
         if model.is_atom_bond_targets:
-            num_tasks = sum_preds.shape[1]
             uncal_preds, uncal_vars = [], []
             for pred, squared, var in zip(sum_preds, sum_squared, sum_vars):
                 uncal_pred = pred / self.num_models
@@ -759,9 +794,7 @@ class EvidentialAleatoricPredictor(UncertaintyPredictor):
             )
 
     def calculate_predictions(self):
-        for i, (model, scaler_list) in enumerate(
-            tqdm(zip(self.models, self.scalers), total=self.num_models)
-        ):
+        for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
             (
                 scaler,
                 features_scaler,
@@ -833,7 +866,6 @@ class EvidentialAleatoricPredictor(UncertaintyPredictor):
                         )
 
         if model.is_atom_bond_targets:
-            num_tasks = sum_preds.shape[1]
             uncal_preds, uncal_vars = [], []
             for pred, squared, var in zip(sum_preds, sum_squared, sum_vars):
                 uncal_pred = pred / self.num_models
@@ -902,9 +934,7 @@ class EvidentialEpistemicPredictor(UncertaintyPredictor):
             )
 
     def calculate_predictions(self):
-        for i, (model, scaler_list) in enumerate(
-            tqdm(zip(self.models, self.scalers), total=self.num_models)
-        ):
+        for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
             (
                 scaler,
                 features_scaler,
@@ -976,7 +1006,6 @@ class EvidentialEpistemicPredictor(UncertaintyPredictor):
                         )
 
         if model.is_atom_bond_targets:
-            num_tasks = sum_preds.shape[1]
             uncal_preds, uncal_vars = [], []
             for pred, squared, var in zip(sum_preds, sum_squared, sum_vars):
                 uncal_pred = pred / self.num_models
@@ -1035,15 +1064,13 @@ class EnsemblePredictor(UncertaintyPredictor):
 
     def raise_argument_errors(self):
         super().raise_argument_errors()
-        if self.num_models == 1:
+        if self.num_models < 2:
             raise ValueError(
                 "Ensemble method for uncertainty is only available when multiple models are provided."
             )
 
     def calculate_predictions(self):
-        for i, (model, scaler_list) in enumerate(
-            tqdm(zip(self.models, self.scalers), total=self.num_models)
-        ):
+        for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
             (
                 scaler,
                 features_scaler,
@@ -1120,13 +1147,13 @@ class EnsemblePredictor(UncertaintyPredictor):
                     self.train_class_sizes.append(model.train_class_sizes)
 
         if model.is_atom_bond_targets:
-            num_tasks = sum_preds.shape[1]
             uncal_preds, uncal_vars = [], []
             for pred, squared in zip(sum_preds, sum_squared):
                 uncal_pred = pred / self.num_models
                 uncal_var = (
                     squared / self.num_models - np.square(pred) / self.num_models**2
                 )
+                uncal_var = np.maximum(uncal_var, 0)
                 uncal_preds.append(uncal_pred)
                 uncal_vars.append(uncal_var)
             self.uncal_preds = reshape_values(
@@ -1156,6 +1183,7 @@ class EnsemblePredictor(UncertaintyPredictor):
                 sum_squared / self.num_models
                 - np.square(sum_preds) / self.num_models**2
             )
+            uncal_vars = np.maximum(uncal_vars, 0)
             self.uncal_preds, self.uncal_vars = (
                 uncal_preds.tolist(),
                 uncal_vars.tolist(),
@@ -1185,16 +1213,22 @@ class DropoutPredictor(UncertaintyPredictor):
             raise ValueError(
                 "Dropout method for uncertainty should be used for a single model rather than an ensemble."
             )
+        if (
+            not isinstance(self.dropout_sampling_size, int)
+            or isinstance(self.dropout_sampling_size, bool)
+            or self.dropout_sampling_size < 2
+        ):
+            raise ValueError('dropout_sampling_size must be an integer of at least 2.')
 
     def calculate_predictions(self):
-        model = next(self.models)
+        (model, scaler_list), = list(self._model_scaler_pairs())
         (
             scaler,
             features_scaler,
             atom_descriptor_scaler,
             bond_descriptor_scaler,
             atom_bond_scaler,
-        ) = next(self.scalers)
+        ) = scaler_list
         if (
             features_scaler is not None
             or atom_descriptor_scaler is not None
@@ -1228,7 +1262,6 @@ class DropoutPredictor(UncertaintyPredictor):
                 sum_squared += np.square(preds)
 
         if model.is_atom_bond_targets:
-            num_tasks = sum_preds.shape[1]
             uncal_preds, uncal_vars = [], []
             for pred, square in zip(sum_preds, sum_squared):
                 uncal_pred = pred / self.dropout_sampling_size
@@ -1236,6 +1269,7 @@ class DropoutPredictor(UncertaintyPredictor):
                     square / self.dropout_sampling_size
                     - np.square(pred) / self.dropout_sampling_size**2
                 )
+                uncal_var = np.maximum(uncal_var, 0)
                 uncal_preds.append(uncal_pred)
                 uncal_vars.append(uncal_var)
             self.uncal_preds = reshape_values(
@@ -1256,6 +1290,7 @@ class DropoutPredictor(UncertaintyPredictor):
                 sum_squared / self.dropout_sampling_size
                 - np.square(sum_preds) / self.dropout_sampling_size**2
             )
+            uncal_vars = np.maximum(uncal_vars, 0)
             self.uncal_preds, self.uncal_vars = (
                 uncal_preds.tolist(),
                 uncal_vars.tolist(),
@@ -1283,9 +1318,7 @@ class ClassPredictor(UncertaintyPredictor):
             )
 
     def calculate_predictions(self):
-        for i, (model, scaler_list) in enumerate(
-            tqdm(zip(self.models, self.scalers), total=self.num_models)
-        ):
+        for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
             (
                 scaler,
                 features_scaler,
@@ -1354,7 +1387,6 @@ class ClassPredictor(UncertaintyPredictor):
                     self.train_class_sizes.append(model.train_class_sizes)
 
         if model.is_atom_bond_targets:
-            num_tasks = sum_preds.shape[1]
             uncal_preds = sum_preds / self.num_models
             self.uncal_preds = reshape_values(
                 uncal_preds,
@@ -1403,9 +1435,7 @@ class DirichletPredictor(UncertaintyPredictor):
             )
 
     def calculate_predictions(self):
-        for i, (model, scaler_list) in enumerate(
-            tqdm(zip(self.models, self.scalers), total=self.num_models)
-        ):
+        for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
             (
                 scaler,
                 features_scaler,
@@ -1482,7 +1512,6 @@ class DirichletPredictor(UncertaintyPredictor):
                     self.train_class_sizes.append(model.train_class_sizes)
 
         if model.is_atom_bond_targets:
-            num_tasks = sum_preds.shape[1]
             uncal_preds = sum_preds / self.num_models
             uncal_u = sum_u / self.num_models
             self.uncal_preds = reshape_values(

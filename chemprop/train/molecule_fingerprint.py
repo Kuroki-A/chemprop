@@ -232,7 +232,19 @@ def molecule_fingerprint(args: FingerprintArgs,
             # v1's MPN fingerprint path concatenates all input features. Keep
             # only the graph representation requested by fingerprint_type=MPN.
             model_fp = np.asarray(model_fp)[:, :total_fp_size]
-        all_fingerprints[:,:,index] = model_fp
+        model_fp = np.asarray(model_fp, dtype=float)
+        expected_shape = (len(test_data), total_fp_size)
+        if model_fp.shape != expected_shape:
+            raise ValueError(
+                f'Checkpoint {checkpoint_path!r} returned fingerprint shape '
+                f'{model_fp.shape}; expected {expected_shape}.'
+            )
+        if not np.all(np.isfinite(model_fp)):
+            raise ValueError(
+                f'Checkpoint {checkpoint_path!r} produced a non-finite '
+                'fingerprint for a valid molecule.'
+            )
+        all_fingerprints[:, :, index] = model_fp
 
     # Save predictions
     print(f'Saving predictions to {args.preds_path}')

@@ -7,7 +7,8 @@ from tempfile import TemporaryDirectory
 import numpy as np
 
 from chemprop.data import get_header, preprocess_smiles_columns, get_task_names, get_mixed_task_names, \
-    get_data_weights, get_smiles, filter_invalid_smiles, MoleculeDataset, MoleculeDatapoint, get_data, split_data
+    get_data_weights, get_smiles, filter_invalid_smiles, MoleculeDataset, MoleculeDatapoint, get_data, split_data, \
+    validate_data, get_invalid_smiles_from_list
 
 
 class TestGetHeader(TestCase):
@@ -31,6 +32,38 @@ class TestGetHeader(TestCase):
         bad_path = os.path.join(self.temp_dir.name, 'bad_path.csv')
         with self.assertRaises(FileNotFoundError):
             get_header(bad_path)
+
+    def test_empty_duplicate_and_blank_headers_are_rejected(self):
+        for filename, contents, message in [
+            ('empty.csv', '', 'header row'),
+            ('empty_header.csv', '\nC,1\n', 'empty header row'),
+            ('duplicate.csv', 'smiles,target,target\nC,1,2\n', 'duplicate'),
+            ('blank.csv', 'smiles, ,target\nC,x,1\n', 'blank'),
+        ]:
+            path = os.path.join(self.temp_dir.name, filename)
+            with open(path, 'w') as f:
+                f.write(contents)
+            with self.subTest(filename=filename), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                get_header(path)
+
+    def test_utf8_bom_is_not_part_of_first_header_name(self):
+        path = os.path.join(self.temp_dir.name, 'bom.csv')
+        with open(path, 'w', encoding='utf-8-sig') as f:
+            f.write('smiles,target\nC,1\n')
+
+        self.assertEqual(get_header(path), ['smiles', 'target'])
+
+    def test_validate_data_reports_empty_header_instead_of_crashing(self):
+        path = os.path.join(self.temp_dir.name, 'empty_header.csv')
+        with open(path, 'w') as f:
+            f.write('\nC,1\n')
+
+        errors = validate_data(path)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn('empty header row', next(iter(errors)))
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -97,7 +130,7 @@ class TestPreprocessSmiles(TestCase):
     def test_wrong_num_mol(self):
         """Test that error is raised when wrong number of molecules provided"""
         with self.assertRaises(ValueError):
-            smiles_columns = preprocess_smiles_columns(
+            preprocess_smiles_columns(
                 path='dummy_path.txt',
                 smiles_columns=['column3'],
                 number_of_molecules=2,
@@ -106,7 +139,7 @@ class TestPreprocessSmiles(TestCase):
     def test_smiles_not_in_file(self):
         """Test that error is raised whgen the provided smiles columns are not in the file"""
         with self.assertRaises(ValueError):
-            smiles_columns = preprocess_smiles_columns(
+            preprocess_smiles_columns(
                 path='dummy_path.txt',
                 smiles_columns=['column3', 'not_in_file'],
                 number_of_molecules=2,
@@ -264,7 +297,7 @@ class TestGetDataWeights(TestCase):
         with open(path, 'w') as f:
             f.write('weights\n3\n-1\n2\n2\n2')
         with self.assertRaises(ValueError):
-            weights = get_data_weights(path)
+            get_data_weights(path)
 
     def test_invalid_weight_sets(self):
         """Reject weights that cannot define a finite non-negative average."""
@@ -355,6 +388,19 @@ class TestGetSmiles(TestCase):
         )
         self.assertEqual(smiles, ['C', 'CC', 'CC', 'CN', 'O', 'CO'])
 
+    def test_ragged_rows_are_rejected(self):
+        for filename, contents in [
+            ('too_short.csv', 'column0,column1\nC\n'),
+            ('too_long.csv', 'column0,column1\nC,CC,CCC\n'),
+        ]:
+            path = os.path.join(self.temp_dir.name, filename)
+            with open(path, 'w') as f:
+                f.write(contents)
+            with self.subTest(filename=filename), self.assertRaisesRegex(
+                ValueError, 'row 2'
+            ):
+                get_smiles(path, smiles_columns=['column0', 'column1'])
+
     def tearDown(self):
         self.temp_dir.cleanup()
 
@@ -391,6 +437,19 @@ class TestFilterInvalidSmiles(TestCase):
         dataset = MoleculeDataset([MoleculeDatapoint(s) for s in smiles_list])
         filtered_dataset = filter_invalid_smiles(dataset)
         self.assertEqual(filtered_dataset.smiles(), [['C'], ['CC'], ['O']])
+
+
+class TestGetInvalidSmilesFromList(TestCase):
+    def test_empty_input(self):
+        self.assertEqual(get_invalid_smiles_from_list([]), [])
+
+    def test_inconsistent_row_width_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'same number of molecules'):
+            get_invalid_smiles_from_list([['C', 'CC'], ['CCC']])
+
+    def test_empty_molecule_row_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'at least one molecule'):
+            get_invalid_smiles_from_list([[]])
 
 
 @patch(
@@ -432,6 +491,19 @@ class TestGetData(TestCase):
             path=self.data_path
         )
         self.assertEqual(data.targets(), [[0, 1], [2, 3], [4, 5]])
+
+    def test_ragged_rows_are_rejected(self):
+        for filename, row in [
+            ('too_short.csv', 'C,CC,0'),
+            ('too_long.csv', 'C,CC,0,1,extra'),
+        ]:
+            path = os.path.join(self.temp_dir.name, filename)
+            with open(path, 'w') as f:
+                f.write('column0,column1,column2,column3\n' + row + '\n')
+            with self.subTest(filename=filename), self.assertRaisesRegex(
+                ValueError, 'row 2'
+            ):
+                get_data(path=path)
 
     @patch(
         "chemprop.data.utils.load_features",
@@ -496,10 +568,10 @@ class TestGetData(TestCase):
         "chemprop.data.utils.load_features",
         lambda *args, **kwargs: np.array([[0, 2], [1, 0], [1, 0]])
     )
-    def test_features_and_phase_features(self):
-        """Testing the handling of phase features"""
+    def test_invalid_phase_features(self):
+        """Test that non-binary phase features are rejected."""
         with self.assertRaises(ValueError):
-            data = get_data(
+            get_data(
                 path=self.data_path,
                 features_path=['dummy_path.csv'],
                 phase_features_path='dummy_path.csv'

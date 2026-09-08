@@ -1,4 +1,5 @@
 import csv
+import importlib
 import os
 from pathlib import Path
 import pickle
@@ -20,6 +21,7 @@ from chemprop.train.make_predictions import (
     load_data,
     load_model_lgbm,
     make_predictions_lgbm,
+    predict_lgbm,
 )
 from chemprop.features import get_features_generators_metadata
 from chemprop.train.run_training_lgbm import (
@@ -34,6 +36,7 @@ from chemprop.train.run_training_lgbm import (
 from chemprop.train.metrics import prc_auc
 from chemprop.utils import (
     LightGBMCheckpointError,
+    LightGBMModelBundle,
     load_checkpoint_lgbm,
     save_checkpoint_lgbm,
 )
@@ -78,6 +81,9 @@ def _training_args(tmp_path: Path, dataset_type: str, task_names) -> TrainArgs:
             dataset_type,
             "--model_type",
             "lgbm",
+            "--features_generator",
+            "morgan",
+            "--features_only",
             "--hidden_size",
             "12",
             "--ffn_hidden_size",
@@ -93,7 +99,7 @@ def _training_args(tmp_path: Path, dataset_type: str, task_names) -> TrainArgs:
         ]
     )
     args.task_names = list(task_names)
-    args.features_size = None
+    args.features_size = 2048
     args.lgbm_num_boost_round = 30
     args.lgbm_early_stopping_rounds = 5
     args.lgbm_num_threads = 1
@@ -104,10 +110,78 @@ def _training_args(tmp_path: Path, dataset_type: str, task_names) -> TrainArgs:
 def _molecule_dataset(smiles, targets) -> MoleculeDataset:
     return MoleculeDataset(
         [
-            MoleculeDatapoint(smiles=[smile], targets=list(row_targets))
+            MoleculeDatapoint(
+                smiles=[smile],
+                targets=list(row_targets),
+                features_generator=["morgan"],
+            )
             for smile, row_targets in zip(smiles, targets)
         ]
     )
+
+
+def test_lgbm_features_only_encoding_bypasses_graph_construction(
+    tmp_path: Path, monkeypatch
+):
+    args = _training_args(tmp_path, "regression", ["target"])
+    args.features_size = 3
+    data = MoleculeDataset(
+        [
+            MoleculeDatapoint(
+                smiles=["CC"], targets=[1.0], features=np.asarray([1, 2, 3])
+            ),
+            MoleculeDatapoint(
+                smiles=["CCC"], targets=[2.0], features=np.asarray([4, 5, 6])
+            ),
+        ]
+    )
+    encoder = build_frozen_lgbm_encoder(args)
+
+    def fail_if_loader_is_built(*_args, **_kwargs):
+        raise AssertionError("features-only encoding must not build molecular graphs")
+
+    monkeypatch.setattr(
+        "chemprop.train.run_training_lgbm.MoleculeDataLoader",
+        fail_if_loader_is_built,
+    )
+
+    encoded = encode_lgbm_features(encoder, data, batch_size=1, num_workers=0)
+
+    np.testing.assert_array_equal(
+        encoded, np.asarray([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
+    )
+    assert encoded.dtype == np.float32
+
+
+def test_lgbm_prediction_rejects_random_mpn_bundle(monkeypatch):
+    unsafe_bundle = LightGBMModelBundle(
+        encoder=None,
+        task_boosters=[],
+        train_args=SimpleNamespace(features_only=False),
+        scalers=(None, None, None, None, None),
+        task_names=["target"],
+        dataset_type="regression",
+        model_index=0,
+        seed=0,
+        checkpoint_path="unsafe.pkl",
+    )
+    prediction_module = importlib.import_module("chemprop.train.make_predictions")
+    monkeypatch.setattr(
+        prediction_module,
+        "load_checkpoint_lgbm",
+        lambda _path, device=None: unsafe_bundle,
+    )
+    predict_args = SimpleNamespace(checkpoint_paths=["unsafe.pkl"], device=None)
+
+    with pytest.raises(ValueError, match="untrained random MPN.*Retrain"):
+        load_model_lgbm(predict_args)
+    with pytest.raises(ValueError, match="untrained random MPN.*Retrain"):
+        predict_lgbm(
+            SimpleNamespace(batch_size=1, num_workers=0),
+            unsafe_bundle,
+            scaler=None,
+            test_data=MoleculeDataset([]),
+        )
 
 
 def test_lgbm_regression_bundle_fresh_process_round_trip_and_empty_input(
@@ -191,6 +265,8 @@ def test_lgbm_regression_bundle_fresh_process_round_trip_and_empty_input(
         str(preds_path),
         "--checkpoint_paths",
         *checkpoint_paths,
+        "--features_generator",
+        "morgan",
         "--individual_ensemble_predictions",
         "--num_workers",
         "0",
@@ -238,6 +314,8 @@ def test_lgbm_regression_bundle_fresh_process_round_trip_and_empty_input(
             str(tmp_path / "empty.csv"),
             "--checkpoint_paths",
             *checkpoint_paths,
+            "--features_generator",
+            "morgan",
             "--num_workers",
             "0",
             "--no_cuda",
@@ -312,6 +390,13 @@ def test_lgbm_classification_multitask_missing_targets_and_seed_reproducibility(
     np.testing.assert_array_equal(first_predictions, second_predictions)
     assert np.all((0 <= first_predictions) & (first_predictions <= 1))
 
+    invalid_prediction_features = val_features.copy()
+    invalid_prediction_features[0, 0] = np.inf
+    with pytest.raises(ValueError, match="prediction features contain"):
+        predict_task_boosters(first, invalid_prediction_features)
+    with pytest.raises(ValueError, match="feature width does not match"):
+        predict_task_boosters(first, val_features[:, :-1])
+
     args.metric = "prc-auc"
     prc_boosters = train_task_boosters(
         args,
@@ -325,6 +410,110 @@ def test_lgbm_classification_multitask_missing_targets_and_seed_reproducibility(
         predictions = booster.predict(val_features)
         assert booster.best_score["validation"]["prc-auc"] == pytest.approx(
             prc_auc(val_targets[:, task_index], predictions)
+        )
+
+
+@pytest.mark.parametrize("metric", ["auc", "prc-auc"])
+def test_lgbm_rank_metric_does_not_early_stop_on_single_class_validation(metric):
+    rng = np.random.default_rng(12)
+    train_features = rng.normal(size=(80, 8))
+    val_features = rng.normal(size=(20, 8))
+    train_targets = (np.arange(80) % 2).reshape(-1, 1)
+    val_targets = np.zeros((20, 1))
+    args = SimpleNamespace(
+        dataset_type="classification",
+        metric=metric,
+        num_tasks=1,
+        task_names=["active"],
+        class_balance=False,
+        quiet=True,
+        num_workers=0,
+        lgbm_num_boost_round=12,
+        lgbm_early_stopping_rounds=3,
+        lgbm_num_threads=1,
+        lgbm_min_data_in_leaf=2,
+    )
+
+    booster = train_task_boosters(
+        args,
+        train_features,
+        train_targets,
+        val_features,
+        val_targets,
+        seed=5,
+    )[0]
+
+    assert booster.best_iteration == 0
+    assert "validation" not in booster.best_score
+
+
+def test_lgbm_rejects_invalid_targets_features_and_data_weights():
+    args = SimpleNamespace(
+        dataset_type="classification",
+        metric="binary_cross_entropy",
+        num_tasks=1,
+        task_names=["active"],
+        class_balance=False,
+        quiet=True,
+        num_workers=0,
+        lgbm_num_boost_round=5,
+        lgbm_early_stopping_rounds=0,
+        lgbm_num_threads=1,
+        lgbm_min_data_in_leaf=1,
+    )
+    train_features = np.arange(16, dtype=float).reshape(8, 2)
+    val_features = np.arange(8, dtype=float).reshape(4, 2)
+    train_targets = (np.arange(8) % 2).reshape(-1, 1)
+    val_targets = (np.arange(4) % 2).reshape(-1, 1)
+
+    invalid_val_targets = val_targets.astype(float)
+    invalid_val_targets[0, 0] = 2
+    with pytest.raises(ValueError, match="validation labels other than 0 and 1"):
+        train_task_boosters(
+            args,
+            train_features,
+            train_targets,
+            val_features,
+            invalid_val_targets,
+            seed=1,
+        )
+
+    invalid_features = train_features.copy()
+    invalid_features[0, 0] = np.inf
+    with pytest.raises(ValueError, match="encoded features contain"):
+        train_task_boosters(
+            args,
+            invalid_features,
+            train_targets,
+            val_features,
+            val_targets,
+            seed=1,
+        )
+
+    with pytest.raises(ValueError, match="non-negative"):
+        train_task_boosters(
+            args,
+            train_features,
+            train_targets,
+            val_features,
+            val_targets,
+            seed=1,
+            train_weights=[1, 1, 1, 1, 1, 1, 1, -1],
+        )
+
+    regression_args = SimpleNamespace(
+        **{**vars(args), "dataset_type": "regression", "metric": "rmse"}
+    )
+    infinite_targets = train_targets.astype(float)
+    infinite_targets[0, 0] = np.inf
+    with pytest.raises(ValueError, match="infinite value"):
+        train_task_boosters(
+            regression_args,
+            train_features,
+            infinite_targets,
+            val_features,
+            val_targets.astype(float),
+            seed=1,
         )
 
 

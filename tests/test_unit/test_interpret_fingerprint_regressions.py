@@ -389,6 +389,43 @@ def test_multimolecule_ensemble_csv_columns_follow_c_order_flatten(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ('fingerprint', 'message'),
+    [([[1.0]], 'fingerprint shape'), ([[1.0, float('nan')]], 'non-finite')],
+)
+def test_fingerprint_rejects_invalid_model_output(
+    tmp_path, fingerprint, message,
+):
+    args = _fingerprint_args(tmp_path, 'invalid_fingerprint.csv')
+    train_args = _fingerprint_train_args()
+    train_args.atom_descriptor_scaling = False
+    train_args.bond_descriptor_scaling = False
+    full_data = MoleculeDataset([
+        MoleculeDatapoint(
+            smiles=['CCO'], row=OrderedDict([('smiles', 'CCO')]),
+        ),
+    ])
+
+    with mock.patch.object(
+        fingerprint_module, 'load_args', return_value=train_args,
+    ), mock.patch.object(
+        fingerprint_module, 'update_prediction_args', return_value=None,
+    ), mock.patch.object(
+        fingerprint_module, 'restore_checkpoint_featurization', return_value=None,
+    ), mock.patch.object(
+        fingerprint_module, 'get_data_from_smiles', return_value=full_data,
+    ), mock.patch.object(
+        fingerprint_module, 'validate_checkpoint_feature_schema', return_value=None,
+    ), mock.patch.object(
+        fingerprint_module, 'load_checkpoint', return_value=object(),
+    ), mock.patch.object(
+        fingerprint_module, 'load_scalers', return_value=(None,) * 5,
+    ), mock.patch.object(
+        fingerprint_module, 'model_fingerprint', return_value=fingerprint,
+    ), pytest.raises(ValueError, match=message):
+        molecule_fingerprint(args, smiles=[['CCO']])
+
+
 def test_interpret_restores_settings_and_validates_generated_data():
     args = SimpleNamespace(
         checkpoint_paths=['model.pt'],
@@ -467,3 +504,65 @@ def test_interpret_uses_each_ensemble_members_target_scaler():
 
     assert [call.kwargs['scaler'] for call in predict_mock.call_args_list] == target_scalers
     np.testing.assert_allclose(predictions, [[2.0]])
+
+
+def test_interpret_rejects_external_features_that_mcts_cannot_recompute():
+    args = SimpleNamespace(
+        checkpoint_paths=['model.pt'],
+        features_generator=None,
+        property_id=1,
+    )
+    train_args = _fingerprint_train_args()
+    train_args.features_path = ['external_features.npz']
+
+    with mock.patch('chemprop.interpret.load_args', return_value=train_args), \
+            pytest.raises(ValueError, match='external features cannot be generated'):
+        ChempropModel(args)
+
+
+def test_interpret_rejects_property_index_outside_checkpoint_tasks():
+    args = SimpleNamespace(
+        checkpoint_paths=['model.pt'],
+        features_generator=None,
+        property_id=3,
+    )
+    train_args = _fingerprint_train_args()
+    train_args.task_names = ['solubility', 'toxicity']
+
+    with mock.patch('chemprop.interpret.load_args', return_value=train_args), \
+            pytest.raises(ValueError, match='between 1 and 2'):
+        ChempropModel(args)
+
+
+def test_interpret_preserves_invalid_input_positions():
+    args = SimpleNamespace(
+        checkpoint_paths=['model.pt'],
+        features_generator=None,
+        selected_features_path=None,
+        atom_descriptors=None,
+        bond_descriptors_size=0,
+        property_id=1,
+        device='cpu',
+        num_workers=0,
+    )
+    train_args = _fingerprint_train_args()
+    train_args.task_names = ['activity']
+    train_args.features_scaling = False
+    train_args.atom_descriptor_scaling = False
+    train_args.bond_descriptor_scaling = False
+    data = get_data_from_smiles(
+        [['CCO'], ['not-a-smiles']], skip_invalid_smiles=False,
+    )
+
+    with mock.patch('chemprop.interpret.load_args', return_value=train_args), \
+            mock.patch('chemprop.interpret.restore_checkpoint_featurization'), \
+            mock.patch('chemprop.interpret.load_scalers', return_value=(None,) * 5), \
+            mock.patch('chemprop.interpret.load_checkpoint', return_value=object()), \
+            mock.patch('chemprop.interpret.get_data_from_smiles', return_value=data), \
+            mock.patch('chemprop.interpret.validate_checkpoint_feature_schema'), \
+            mock.patch('chemprop.interpret.predict', return_value=[[1.25]]):
+        predictions = ChempropModel(args)([['CCO'], ['not-a-smiles']])
+
+    assert predictions.shape == (2, 1)
+    assert predictions[0, 0] == pytest.approx(1.25)
+    assert np.isnan(predictions[1, 0])
