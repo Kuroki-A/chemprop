@@ -14,9 +14,18 @@ DB_PATH = 'chemprop.sqlite3'
 
 
 def init_app(app: Flask):
+    """Registers database cleanup once and selects this app's database path.
+
+    ``build_app`` is intentionally reusable (notably in WSGI factories and
+    tests). Flask 3 rejects registering teardown handlers after the first
+    request, so repeated initialization must not register the handler again.
+    """
     global DB_PATH
 
-    app.teardown_appcontext(close_db)
+    extension = app.extensions.setdefault('chemprop_db', {})
+    if not extension.get('teardown_registered', False):
+        app.teardown_appcontext(close_db)
+        extension['teardown_registered'] = True
     DB_PATH = app.config['DB_PATH']
 
 
@@ -48,6 +57,7 @@ def get_db():
             detect_types=sqlite3.PARSE_DECLTYPES
         )
         g.db.row_factory = sqlite3.Row
+        g.db.execute('PRAGMA foreign_keys = ON')
 
     return g.db
 
@@ -132,7 +142,18 @@ def get_ckpts(user_id: int) -> List[sqlite3.Row]:
     if not user_id:
         user_id = app.config['DEFAULT_USER_ID']
 
-    return query_db(f'SELECT * FROM ckpt WHERE associated_user = {user_id}')
+    return query_db('SELECT * FROM ckpt WHERE associated_user = ?', (int(user_id),))
+
+
+def get_ckpt(ckpt_id: int, user_id: int = None) -> Optional[sqlite3.Row]:
+    """Returns a checkpoint, optionally requiring ownership by ``user_id``."""
+    if user_id is None:
+        return query_db('SELECT * FROM ckpt WHERE id = ?', (int(ckpt_id),), one=True)
+    return query_db(
+        'SELECT * FROM ckpt WHERE id = ? AND associated_user = ?',
+        (int(ckpt_id), int(user_id)),
+        one=True,
+    )
 
 
 def insert_ckpt(ckpt_name: str,
@@ -178,34 +199,40 @@ def insert_ckpt(ckpt_name: str,
     return new_ckpt_id, temp_name
 
 
-def delete_ckpt(ckpt_id: int):
+def delete_ckpt(ckpt_id: int, user_id: int = None) -> bool:
     """
     Removes the checkpoint with the specified id from the database,
     associated model columns, and the corresponding files.
 
     :param ckpt_id: The id of the checkpoint to be deleted.
     """
-    rows = query_db(f'SELECT * FROM model WHERE associated_ckpt = {ckpt_id}')
+    if get_ckpt(ckpt_id, user_id=user_id) is None:
+        return False
+
+    rows = query_db('SELECT * FROM model WHERE associated_ckpt = ?', (int(ckpt_id),))
 
     for row in rows:
-        os.remove(os.path.join(app.config['CHECKPOINT_FOLDER'], f'{row["id"]}.pt'))
+        path = os.path.join(app.config['CHECKPOINT_FOLDER'], f'{row["id"]}.pt')
+        if os.path.isfile(path):
+            os.remove(path)
 
     db = get_db()
-    cur = db.cursor()
-    db.execute(f'DELETE FROM ckpt WHERE id = {ckpt_id}')
-    db.execute(f'DELETE FROM model WHERE associated_ckpt = {ckpt_id}')
+    db.execute('DELETE FROM model WHERE associated_ckpt = ?', (int(ckpt_id),))
+    db.execute('DELETE FROM ckpt WHERE id = ?', (int(ckpt_id),))
     db.commit()
-    cur.close()
+    return True
 
 
-def get_models(ckpt_id: int) -> List[sqlite3.Row]:
+def get_models(ckpt_id: int, user_id: int = None) -> List[sqlite3.Row]:
     """
     Returns the models associated with the given ckpt.
 
     :param ckpt_id: The id of the ckpt whose component models are returned.
     :return A list of models.
     """
-    return query_db(f'SELECT * FROM model WHERE associated_ckpt = {ckpt_id}')
+    if user_id is not None and get_ckpt(ckpt_id, user_id=user_id) is None:
+        return []
+    return query_db('SELECT * FROM model WHERE associated_ckpt = ?', (int(ckpt_id),))
 
 
 def insert_model(ckpt_id: int) -> str:
@@ -236,7 +263,18 @@ def get_datasets(user_id: int) -> List[sqlite3.Row]:
     if not user_id:
         user_id = app.config['DEFAULT_USER_ID']
 
-    return query_db(f'SELECT * FROM dataset WHERE associated_user = {user_id}')
+    return query_db('SELECT * FROM dataset WHERE associated_user = ?', (int(user_id),))
+
+
+def get_dataset(dataset_id: int, user_id: int = None) -> Optional[sqlite3.Row]:
+    """Returns a dataset, optionally requiring ownership by ``user_id``."""
+    if user_id is None:
+        return query_db('SELECT * FROM dataset WHERE id = ?', (int(dataset_id),), one=True)
+    return query_db(
+        'SELECT * FROM dataset WHERE id = ? AND associated_user = ?',
+        (int(dataset_id), int(user_id)),
+        one=True,
+    )
 
 
 def insert_dataset(dataset_name: str,
@@ -274,14 +312,18 @@ def insert_dataset(dataset_name: str,
     return new_dataset_id, temp_name
 
 
-def delete_dataset(dataset_id: int):
+def delete_dataset(dataset_id: int, user_id: int = None) -> bool:
     """
     Removes the dataset with the specified id from the database,
     and deletes the corresponding file.
 
     :param dataset_id: The id of the dataset to be deleted.
     """
+    if get_dataset(dataset_id, user_id=user_id) is None:
+        return False
+
     db = get_db()
-    cur = db.execute(f'DELETE FROM dataset WHERE id = {dataset_id}')
+    cur = db.execute('DELETE FROM dataset WHERE id = ?', (int(dataset_id),))
     db.commit()
     cur.close()
+    return True

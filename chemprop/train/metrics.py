@@ -4,14 +4,15 @@ from tqdm import trange
 import torch
 import numpy as np
 import torch.nn as nn
+from packaging.version import Version
 
 import sklearn
 from sklearn.metrics import auc, mean_absolute_error, mean_squared_error, precision_recall_curve, r2_score, \
     roc_auc_score, accuracy_score, log_loss, f1_score, matthews_corrcoef, recall_score, precision_score, \
     balanced_accuracy_score
 
-version = sklearn.__version__
-if tuple(map(int, version.split("."))) >= (1, 6):
+SKLEARN_VERSION = Version(sklearn.__version__)
+if SKLEARN_VERSION >= Version("1.6"):
     from sklearn.metrics import root_mean_squared_error
 
 
@@ -113,10 +114,17 @@ def compute_hard_predictions(preds, threshold=0.5):
     Returns:
     - hard_preds (list): A list of hard predictions (0/1 for binary, class index for multiclass).
     """
-    if preds and isinstance(preds[0], list):  # Multiclass prediction
-        return [p.index(max(p)) for p in preds]
-    else:  # Binary prediction
-        return [1 if p > threshold else 0 for p in preds]
+    preds_array = np.asarray(preds)
+
+    if preds_array.ndim == 2:  # Multiclass prediction
+        return np.argmax(preds_array, axis=1).tolist()
+    if preds_array.ndim == 1:  # Binary prediction
+        return (preds_array > threshold).astype(int).tolist()
+
+    raise ValueError(
+        'Predictions must be a one-dimensional binary probability array or '
+        'a two-dimensional multiclass probability array.'
+    )
 
 
 def prc_auc(targets: List[int], preds: List[float]) -> float:
@@ -154,7 +162,7 @@ def rmse(targets: List[float], preds: List[float]) -> float:
     :param preds: A list of predictions.
     :return: The computed rmse.
     """
-    if tuple(map(int, version.split("."))) >= (1, 6):
+    if SKLEARN_VERSION >= Version("1.6"):
         return root_mean_squared_error(targets, preds)
     else:
         return mean_squared_error(targets, preds, squared=False)
@@ -198,7 +206,7 @@ def bounded_rmse(targets: List[float], preds: List[float], gt_targets: List[bool
         targets,
         preds,
     )
-    return mean_squared_error(targets, preds, squared=False)
+    return rmse(targets, preds)
 
 
 def bounded_mse(targets: List[float], preds: List[float], gt_targets: List[bool] = None,
@@ -224,7 +232,7 @@ def bounded_mse(targets: List[float], preds: List[float], gt_targets: List[bool]
         targets,
         preds,
     )
-    return mean_squared_error(targets, preds, squared=True)
+    return mean_squared_error(targets, preds)
 
 
 def bounded_mae(targets: List[float], preds: List[float], gt_targets: List[bool] = None,
@@ -264,7 +272,7 @@ def accuracy(targets: List[int], preds: Union[List[float], List[List[float]]], t
     :param threshold: The threshold above which a prediction is a 1 and below which (inclusive) a prediction is a 0.
     :return: The computed accuracy.
     """
-    hard_preds = compute_hard_predictions(preds)
+    hard_preds = compute_hard_predictions(preds, threshold=threshold)
 
     return accuracy_score(targets, hard_preds)
 
@@ -280,9 +288,9 @@ def recall_metric(targets: List[int], preds: Union[List[float], List[List[float]
     :param threshold: The threshold above which a prediction is considered positive.
     :return: The computed recall.
     """
-    hard_preds = compute_hard_predictions(preds)
+    hard_preds = compute_hard_predictions(preds, threshold=threshold)
 
-    return recall_score(targets, hard_preds)
+    return recall_score(targets, hard_preds, zero_division=0)
 
 
 def precision_metric(targets: List[int], preds: Union[List[float], List[List[float]]], threshold: float = 0.5) -> float:
@@ -296,9 +304,9 @@ def precision_metric(targets: List[int], preds: Union[List[float], List[List[flo
     :param threshold: The threshold above which a prediction is considered positive.
     :return: The computed precision.
     """
-    hard_preds = compute_hard_predictions(preds)
+    hard_preds = compute_hard_predictions(preds, threshold=threshold)
 
-    return precision_score(targets, hard_preds)
+    return precision_score(targets, hard_preds, zero_division=0)
 
 
 def balanced_accuracy_metric(targets: List[int], preds: Union[List[float], List[List[float]]],
@@ -313,7 +321,7 @@ def balanced_accuracy_metric(targets: List[int], preds: Union[List[float], List[
     :param threshold: The threshold above which a prediction is considered positive.
     :return: The computed balanced accuracy.
     """
-    hard_preds = compute_hard_predictions(preds)
+    hard_preds = compute_hard_predictions(preds, threshold=threshold)
 
     return balanced_accuracy_score(targets, hard_preds)
 
@@ -331,12 +339,12 @@ def f1_metric(targets: List[int], preds: Union[List[float], List[List[float]]], 
     :param threshold: The threshold above which a prediction is a 1 and below which (inclusive) a prediction is a 0.
     :return: The computed f1 score.
     """
-    hard_preds = compute_hard_predictions(preds)
+    hard_preds = compute_hard_predictions(preds, threshold=threshold)
 
-    if type(preds[0]) == list:  # multiclass
-        score = f1_score(targets, hard_preds, average='micro')
+    if np.asarray(preds).ndim == 2:  # multiclass
+        score = f1_score(targets, hard_preds, average='micro', zero_division=0)
     else:  # binary prediction
-        score = f1_score(targets, hard_preds)
+        score = f1_score(targets, hard_preds, zero_division=0)
 
     return score
 
@@ -352,7 +360,7 @@ def mcc_metric(targets: List[int], preds: Union[List[float], List[List[float]]],
     :param threshold: The threshold above which a prediction is a 1 and below which (inclusive) a prediction is a 0.
     :return: The computed accuracy.
     """
-    hard_preds = compute_hard_predictions(preds)
+    hard_preds = compute_hard_predictions(preds, threshold=threshold)
 
     return matthews_corrcoef(targets, hard_preds)
 
@@ -397,7 +405,7 @@ def sid_metric(model_spectra: List[List[float]], target_spectra: List[List[float
         loss = loss.tolist()
         losses.extend(loss)
 
-    loss = np.mean(loss)
+    loss = np.mean(losses)
 
     return loss
 
@@ -443,6 +451,6 @@ def wasserstein_metric(model_spectra: List[List[float]], target_spectra: List[Li
         loss = loss.tolist()
         losses.extend(loss)
 
-    loss = np.mean(loss)
+    loss = np.mean(losses)
 
     return loss

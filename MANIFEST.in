@@ -1,0 +1,7 @@
+include LICENSE.txt
+include README.md
+include CHANGELOG.md
+include chemprop/py.typed
+include chemprop/web/app/schema.sql
+recursive-include chemprop/web/app/templates *.html
+recursive-include chemprop/web/app/static *

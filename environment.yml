@@ -1,28 +1,72 @@
-name: chemprop
+# Chemprop v1 Kuroki development/runtime environment for Linux x86_64.
+#
+# Create this environment from the repository root:
+#   conda env create -f environment.yml
+#   conda activate chemprop310-cu124
+#
+# The NVIDIA driver may report CUDA 12.5. PyTorch 2.6.0 is intentionally
+# installed from the official CUDA 12.4 wheel index because cu124 is the
+# newest PyTorch build available for that CUDA minor series.
+
+name: chemprop310-cu124
 
 channels:
-  - pytorch
   - conda-forge
+  - nodefaults
 
 dependencies:
-  - python>=3.7,<3.9
-  - flask>=1.1.2,<=2.1.3
-  - Werkzeug<3
-  - gunicorn>=20.0.4
-  - hyperopt>=0.2.3
-  - matplotlib>=3.1.3
-  - numpy>=1.18.1
-  - pandas>=1.0.3
-  - pandas-flavor>=0.2.0
-  - pip>=20.0.2
-  - pytorch>=1.4.0
-  - rdkit>=2020.03.1.0
-  - scikit-learn>=0.22.2.post1
-  - scipy>=1.4.1
-  - tensorboardX>=2.0
-  - torchvision>=0.5.0
-  - tqdm>=4.45.0
-  - sphinx-rtd-theme>=2.0.0
+  - python=3.10
+  - pip>=25,<27
+  - setuptools>=78,<82
+  - wheel>=0.45,<0.46
+  # PaDEL-Descriptor is a Java application; keep its runtime in the environment.
+  - openjdk=17
   - pip:
-      - typed-argument-parser>=1.6.1
-      - git+https://github.com/bp-kelley/descriptastorus
+      # Keep PyPI as the primary index and use the official PyTorch index only
+      # for the explicitly pinned local-version wheel.
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch==2.6.0+cu124
+
+      # Numerical and cheminformatics stack: newest stable releases available
+      # for Python 3.10 when this environment was refreshed (2026-09-07).
+      - numpy==2.2.6
+      - pandas==2.3.3
+      - scipy==1.15.3
+      - scikit-learn==1.7.2
+      - rdkit==2026.3.6
+      - lightgbm==4.7.0
+      - matplotlib==3.10.9
+
+      # Chemprop runtime and Web interface.
+      - Flask==3.1.3
+      - Werkzeug==3.1.8
+      - gunicorn==26.2.0
+      - hyperopt==0.3.0
+      - packaging==26.3
+      - pandas-flavor==0.8.1
+      - tensorboardX==2.6.5
+      - tqdm==4.70.0
+      - typed-argument-parser==1.12.0
+      - typing-extensions==4.16.0
+
+      # Stable, local molecular feature generators. Pretrained Molfeat
+      # backends are deliberately not installed here; see setup.py's
+      # `features-pretrained` extra for their older backend constraints.
+      - descriptastorus==2.8.0
+      - molfeat==0.11.0
+      - datamol==0.12.5
+      - mordredcommunity==2.0.7
+      - padelpy==0.1.17
+      - map4==1.1.3
+      - mhfp==1.9.6
+      - h5py==3.16.0
+
+      # Test, documentation, and notebook tooling.
+      - pytest==9.1.1
+      - parameterized==0.9.0
+      - sphinx==8.1.3
+      - sphinx-rtd-theme==3.1.0
+      - notebook==7.6.2
+
+      # Install this checkout after all exact environment pins are present.
+      - -e .

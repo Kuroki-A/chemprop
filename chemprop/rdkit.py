@@ -16,7 +16,13 @@ def make_mol(s: str, keep_h: bool, add_h: bool, keep_atom_map: bool):
     params = Chem.SmilesParserParams()
     params.removeHs = not keep_h
     mol = Chem.MolFromSmiles(s, params)
-    
+
+    # Invalid SMILES are represented by None and filtered by the data-loading
+    # layer. Chem.AddHs(None), however, raises an RDKit ArgumentError before
+    # that validation can take place.
+    if mol is None:
+        return None
+
     if add_h:
         mol = Chem.AddHs(mol)
 

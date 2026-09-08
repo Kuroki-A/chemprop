@@ -3,7 +3,7 @@
 Command Line Arguments
 ======================
 
-`chemprop.args.py <https://github.com/chemprop/chemprop/tree/master/chemprop/args.py>`_ contains all command line arguments, which are processed using the `Typed Argument Parser <https://github.com/swansonk14/typed-argument-parser>`_ (:code:`Tap`) package.
+`chemprop.args.py <https://github.com/Kuroki-A/chemprop/tree/master/chemprop/args.py>`_ contains all command line arguments, which are processed using the `Typed Argument Parser <https://github.com/swansonk14/typed-argument-parser>`_ (:code:`Tap`) package.
 
 Common Arguments
 ----------------

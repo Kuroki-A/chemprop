@@ -5,8 +5,13 @@ import numpy as np
 from rdkit import Chem
 
 from chemprop.args import InterpretArgs
-from chemprop.data import get_data_from_smiles, get_header, get_smiles, MoleculeDataLoader, MoleculeDataset
+from chemprop.data import get_data_from_smiles, get_header, get_smiles, is_valid_datapoint, MoleculeDataLoader, MoleculeDataset
 from chemprop.train import predict
+from chemprop.train.molecule_fingerprint import (
+    restore_checkpoint_featurization,
+    validate_checkpoint_ensemble,
+    validate_checkpoint_feature_schema,
+)
 from chemprop.utils import load_args, load_checkpoint, load_scalers, timeit
 
 
@@ -22,7 +27,9 @@ class ChempropModel:
         :param args: A :class:`~chemprop.args.InterpretArgs` object containing arguments for interpretation.
         """
         self.args = args
-        self.train_args = load_args(args.checkpoint_paths[0])
+        checkpoint_train_args = [load_args(path) for path in args.checkpoint_paths]
+        validate_checkpoint_ensemble(checkpoint_train_args)
+        self.train_args = checkpoint_train_args[0]
 
         # If features were used during training, they must be used when predicting
         if ((self.train_args.features_path is not None or self.train_args.features_generator is not None)
@@ -34,7 +41,13 @@ class ChempropModel:
         if self.train_args.atom_descriptors_size > 0 or self.train_args.atom_features_size > 0 or self.train_args.bond_descriptors_size > 0 or self.train_args.bond_features_size > 0:
             raise NotImplementedError('The interpret function does not yet work with additional atom or bond features')
 
-        self.scaler, self.features_scaler, self.atom_descriptor_scaler, self.bond_descriptor_scaler, self.atom_bond_scaler = load_scalers(args.checkpoint_paths[0])
+        restore_checkpoint_featurization(self.train_args)
+        self.checkpoint_scalers = [
+            load_scalers(checkpoint_path) for checkpoint_path in args.checkpoint_paths
+        ]
+        # Preserve the historical public attributes while applying each
+        # ensemble member's own scalers during prediction below.
+        self.scaler, self.features_scaler, self.atom_descriptor_scaler, self.bond_descriptor_scaler, self.atom_bond_scaler = self.checkpoint_scalers[0]
         self.checkpoints = [load_checkpoint(checkpoint_path, device=args.device) for checkpoint_path in args.checkpoint_paths]
 
     def __call__(self, smiles: List[str], batch_size: int = 500) -> List[List[float]]:
@@ -45,25 +58,41 @@ class ChempropModel:
         :param batch_size: The batch size.
         :return: A list of lists of floats containing the predicted values.
         """
-        test_data = get_data_from_smiles(smiles=smiles, skip_invalid_smiles=False, features_generator=self.args.features_generator)
-        valid_indices = [i for i in range(len(test_data)) if test_data[i].mol is not None]
-        test_data = MoleculeDataset([test_data[i] for i in valid_indices])
-
-        if self.train_args.features_scaling:
-            test_data.normalize_features(self.features_scaler)
-        if self.train_args.atom_descriptor_scaling and self.args.atom_descriptors is not None:
-            test_data.normalize_features(self.atom_descriptor_scaler, scale_atom_descriptors=True)
-        if self.train_args.bond_descriptor_scaling and self.args.bond_descriptors_size > 0:
-            test_data.normalize_features(self.bond_descriptor_scaler, scale_bond_descriptors=True)
-
-        test_data_loader = MoleculeDataLoader(dataset=test_data, batch_size=batch_size, num_workers=self.args.num_workers)
+        test_data = get_data_from_smiles(
+            smiles=smiles,
+            skip_invalid_smiles=False,
+            features_generator=self.args.features_generator,
+            selected_features_path=self.args.selected_features_path,
+        )
+        valid_indices = [i for i in range(len(test_data)) if is_valid_datapoint(test_data[i])]
+        valid_data = MoleculeDataset([test_data[i] for i in valid_indices])
+        validate_checkpoint_feature_schema(
+            self.args, self.train_args, test_data, valid_data,
+        )
+        test_data = valid_data
 
         sum_preds = []
-        for model in self.checkpoints:
+        for model, checkpoint_scalers in zip(
+            self.checkpoints, self.checkpoint_scalers,
+        ):
+            scaler, features_scaler, atom_descriptor_scaler, bond_descriptor_scaler, _ = checkpoint_scalers
+            test_data.reset_features_and_targets()
+            if self.train_args.features_scaling:
+                test_data.normalize_features(features_scaler)
+            if self.train_args.atom_descriptor_scaling and self.args.atom_descriptors is not None:
+                test_data.normalize_features(atom_descriptor_scaler, scale_atom_descriptors=True)
+            if self.train_args.bond_descriptor_scaling and self.args.bond_descriptors_size > 0:
+                test_data.normalize_features(bond_descriptor_scaler, scale_bond_descriptors=True)
+
+            test_data_loader = MoleculeDataLoader(
+                dataset=test_data,
+                batch_size=batch_size,
+                num_workers=self.args.num_workers,
+            )
             model_preds = predict(
                 model=model,
                 data_loader=test_data_loader,
-                scaler=self.scaler,
+                scaler=scaler,
                 disable_progress_bar=True
             )
             sum_preds.append(np.array(model_preds))

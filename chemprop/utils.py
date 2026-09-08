@@ -1,13 +1,16 @@
 from argparse import Namespace
 import csv
+from dataclasses import dataclass
 from datetime import timedelta
 from functools import wraps
 import logging
+from math import ceil
 import os
 import pickle
 import re
+import tempfile
 from time import time
-from typing import Any, Callable, List, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 import collections
 
 import torch
@@ -19,11 +22,50 @@ from tqdm import tqdm
 
 from chemprop.args import PredictArgs, TrainArgs, FingerprintArgs
 from chemprop.data import StandardScaler, AtomBondScaler, MoleculeDataset, preprocess_smiles_columns, get_task_names
-from chemprop.models import MoleculeModel
+from chemprop.features import (
+    reset_featurization_parameters,
+    set_adding_hs,
+    set_explicit_h,
+    set_extra_atom_fdim,
+    set_extra_bond_fdim,
+    set_keeping_atom_map,
+    set_reaction,
+)
+from chemprop.models import MoleculeModel, MoleculeModelEncoder
 from chemprop.nn_utils import NoamLR
 from chemprop.models.ffn import MultiReadout
 
-from distutils.version import LooseVersion
+from packaging.version import parse as parse_version
+
+
+LIGHTGBM_BUNDLE_FORMAT = "chemprop-lightgbm-bundle"
+LIGHTGBM_BUNDLE_VERSION = 1
+
+
+class LightGBMCheckpointError(ValueError):
+    """Raised when a LightGBM checkpoint cannot be loaded safely or compatibly."""
+
+
+@dataclass
+class LightGBMModelBundle:
+    """A loaded LightGBM model and the exact MPN/scalers used to create its inputs."""
+
+    encoder: MoleculeModelEncoder
+    task_boosters: List[Any]
+    train_args: TrainArgs
+    scalers: Tuple[
+        StandardScaler,
+        StandardScaler,
+        StandardScaler,
+        StandardScaler,
+        AtomBondScaler,
+    ]
+    task_names: List[str]
+    dataset_type: str
+    model_index: int
+    seed: int
+    checkpoint_path: str
+
 
 def makedirs(path: str, isfile: bool = False) -> None:
     """
@@ -89,44 +131,314 @@ def save_checkpoint(
         "bond_descriptor_scaler": bond_descriptor_scaler,
         "atom_bond_scaler": atom_bond_scaler,
     }
-    torch.save(state, path)
+    absolute_path = os.path.abspath(path)
+    makedirs(absolute_path, isfile=True)
+    checkpoint_dir = os.path.dirname(absolute_path) or "."
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        dir=checkpoint_dir, prefix=".checkpoint-", suffix=".tmp"
+    )
+    os.close(file_descriptor)
+    try:
+        torch.save(state, temporary_path)
+        with open(temporary_path, "rb") as checkpoint_file:
+            os.fsync(checkpoint_file.fileno())
+        os.replace(temporary_path, absolute_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
     
+
+def _standard_scaler_state(scaler: StandardScaler) -> Dict[str, np.ndarray]:
+    """Converts a scaler into plain checkpoint data."""
+    if scaler is None:
+        return None
+
+    return {
+        "means": np.asarray(scaler.means),
+        "stds": np.asarray(scaler.stds),
+    }
+
+
+def _load_standard_scaler(
+    state: Dict[str, np.ndarray], replace_nan_token: Any = None
+) -> StandardScaler:
+    """Restores a :class:`StandardScaler` from plain checkpoint data."""
+    if state is None:
+        return None
+
+    return StandardScaler(
+        means=state["means"],
+        stds=state["stds"],
+        replace_nan_token=replace_nan_token,
+    )
+
+
+def _is_lightgbm_booster(model: Any) -> bool:
+    """Checks the concrete LightGBM type without importing the optional package."""
+    model_type = type(model)
+    return model_type.__name__ == "Booster" and model_type.__module__.startswith(
+        "lightgbm."
+    )
+
 
 def save_checkpoint_lgbm(
     path: str,
+    encoder: MoleculeModelEncoder,
+    task_boosters: Sequence[Any],
     scaler: StandardScaler = None,
     features_scaler: StandardScaler = None,
     atom_descriptor_scaler: StandardScaler = None,
     bond_descriptor_scaler: StandardScaler = None,
     atom_bond_scaler: AtomBondScaler = None,
     args: TrainArgs = None,
-) -> None:
-    # Convert args to namespace for backwards compatibility
-    if args is not None:
-        args = Namespace(**args.as_dict())
+    model_index: int = 0,
+    seed: int = 0,
+) -> str:
+    """Saves a versioned LightGBM bundle.
 
-    data_scaler = {"means": scaler.means, "stds": scaler.stds} if scaler is not None else None
-    if atom_bond_scaler is not None:
-        atom_bond_scaler = {"means": atom_bond_scaler.means, "stds": atom_bond_scaler.stds}
-    if features_scaler is not None:
-        features_scaler = {"means": features_scaler.means, "stds": features_scaler.stds}
-    if atom_descriptor_scaler is not None:
-        atom_descriptor_scaler = {
-            "means": atom_descriptor_scaler.means,
-            "stds": atom_descriptor_scaler.stds,
-        }
-    if bond_descriptor_scaler is not None:
-        bond_descriptor_scaler = {"means": bond_descriptor_scaler.means, "stds": bond_descriptor_scaler.stds}
+    Unlike the legacy LightGBM path, this bundle contains the exact MPN state
+    used to generate LightGBM inputs. The file is a trusted pickle: callers
+    must never load a checkpoint obtained from an untrusted source.
 
-    state = {
-        "args": args,
-        "data_scaler": data_scaler,
-        "features_scaler": features_scaler,
-        "atom_descriptor_scaler": atom_descriptor_scaler,
-        "bond_descriptor_scaler": bond_descriptor_scaler,
-        "atom_bond_scaler": atom_bond_scaler,
+    :return: The absolute checkpoint path.
+    """
+    if args is None:
+        raise ValueError("LightGBM checkpoints require the training arguments.")
+    if encoder is None or not hasattr(encoder, "encoder"):
+        raise ValueError("LightGBM checkpoints require a MoleculeModelEncoder.")
+    if len(task_boosters) != args.num_tasks:
+        raise ValueError(
+            f"Expected one LightGBM Booster per task ({args.num_tasks}), "
+            f"but received {len(task_boosters)}."
+        )
+    if any(not _is_lightgbm_booster(booster) for booster in task_boosters):
+        raise ValueError("LightGBM checkpoints require one LightGBM Booster per task.")
+
+    absolute_path = os.path.abspath(path)
+    makedirs(absolute_path, isfile=True)
+    args_namespace = Namespace(**args.as_dict())
+    encoder_state_dict = {
+        name: value.detach().cpu().clone()
+        for name, value in encoder.encoder.state_dict().items()
     }
-    torch.save(state, path)
+    atom_bond_scaler_state = _standard_scaler_state(atom_bond_scaler)
+    if atom_bond_scaler_state is not None:
+        atom_bond_scaler_state.update(
+            {
+                "n_atom_targets": atom_bond_scaler.n_atom_targets,
+                "n_bond_targets": atom_bond_scaler.n_bond_targets,
+            }
+        )
+
+    bundle = {
+        "format": LIGHTGBM_BUNDLE_FORMAT,
+        "version": LIGHTGBM_BUNDLE_VERSION,
+        "args": args_namespace,
+        "encoder_state_dict": encoder_state_dict,
+        "task_boosters": list(task_boosters),
+        "scalers": {
+            "data": _standard_scaler_state(scaler),
+            "features": _standard_scaler_state(features_scaler),
+            "atom_descriptor": _standard_scaler_state(atom_descriptor_scaler),
+            "bond_descriptor": _standard_scaler_state(bond_descriptor_scaler),
+            "atom_bond": atom_bond_scaler_state,
+        },
+        "metadata": {
+            "task_names": list(args.task_names),
+            "dataset_type": args.dataset_type,
+            "model_index": int(model_index),
+            "seed": int(seed),
+        },
+    }
+
+    checkpoint_dir = os.path.dirname(absolute_path) or "."
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        dir=checkpoint_dir, prefix=".lgbm-bundle-", suffix=".tmp"
+    )
+    os.close(file_descriptor)
+    try:
+        with open(temporary_path, "wb") as checkpoint_file:
+            pickle.dump(bundle, checkpoint_file, protocol=pickle.HIGHEST_PROTOCOL)
+            checkpoint_file.flush()
+            os.fsync(checkpoint_file.fileno())
+        os.replace(temporary_path, absolute_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+    return absolute_path
+
+
+def load_checkpoint_lgbm(
+    path: str, device: torch.device = None
+) -> LightGBMModelBundle:
+    """Loads a trusted versioned LightGBM bundle and restores its frozen MPN.
+
+    Legacy checkpoints stored a raw LightGBM ``Booster`` separately from a
+    scaler-only ``.pt`` file and did not save the randomly initialized encoder.
+    Reconstructing such an encoder would silently change predictions, so those
+    checkpoints are intentionally rejected with a migration error.
+    """
+    absolute_path = os.path.abspath(path)
+    try:
+        with open(absolute_path, "rb") as checkpoint_file:
+            bundle = pickle.load(checkpoint_file)
+    except (OSError, pickle.PickleError, EOFError) as error:
+        raise LightGBMCheckpointError(
+            f'Could not read LightGBM checkpoint "{absolute_path}". '
+            "Only trusted Chemprop LightGBM bundle files may be loaded."
+        ) from error
+
+    if not isinstance(bundle, dict) or bundle.get("format") != LIGHTGBM_BUNDLE_FORMAT:
+        raise LightGBMCheckpointError(
+            f'LightGBM checkpoint "{absolute_path}" uses the legacy raw-Booster format. '
+            "It has no saved MPN encoder state and cannot reproduce its training features. "
+            "Retrain the model to create a versioned Chemprop LightGBM bundle."
+        )
+
+    version = bundle.get("version")
+    if version != LIGHTGBM_BUNDLE_VERSION:
+        raise LightGBMCheckpointError(
+            f'Unsupported LightGBM bundle version {version!r} in "{absolute_path}"; '
+            f"this Chemprop build supports version {LIGHTGBM_BUNDLE_VERSION}."
+        )
+
+    required_keys = {"args", "encoder_state_dict", "task_boosters", "scalers", "metadata"}
+    missing_keys = sorted(required_keys.difference(bundle))
+    if missing_keys:
+        raise LightGBMCheckpointError(
+            f'LightGBM bundle "{absolute_path}" is incomplete; missing keys: '
+            f'{", ".join(missing_keys)}.'
+        )
+
+    train_args = TrainArgs()
+    try:
+        train_args.from_dict(vars(bundle["args"]), skip_unsettable=True)
+    except (TypeError, AttributeError) as error:
+        raise LightGBMCheckpointError(
+            f'LightGBM bundle "{absolute_path}" contains invalid training arguments.'
+        ) from error
+    if device is not None:
+        train_args.device = device
+
+    # Model input dimensions depend on process-global featurization settings.
+    # Restore them before constructing the MPN so fresh-process loads work for
+    # reactions and custom atom/bond features as well as ordinary molecules.
+    reset_featurization_parameters(logger=logging.getLogger(__name__))
+    set_explicit_h(train_args.explicit_h)
+    set_adding_hs(getattr(train_args, "adding_h", False))
+    set_keeping_atom_map(getattr(train_args, "keeping_atom_map", False))
+    if train_args.reaction:
+        set_reaction(True, train_args.reaction_mode)
+    elif train_args.reaction_solvent:
+        set_reaction(True, train_args.reaction_mode)
+    if train_args.atom_descriptors == "feature":
+        set_extra_atom_fdim(train_args.atom_features_size)
+    if train_args.bond_descriptors == "feature":
+        set_extra_bond_fdim(train_args.bond_features_size)
+
+    encoder = MoleculeModelEncoder(train_args).to(train_args.device)
+    try:
+        encoder.encoder.load_state_dict(bundle["encoder_state_dict"], strict=True)
+    except (RuntimeError, TypeError) as error:
+        raise LightGBMCheckpointError(
+            f'LightGBM bundle "{absolute_path}" contains an incompatible MPN state.'
+        ) from error
+    encoder.eval()
+    for parameter in encoder.parameters():
+        parameter.requires_grad_(False)
+
+    try:
+        task_boosters = list(bundle["task_boosters"])
+    except TypeError as error:
+        raise LightGBMCheckpointError(
+            f'LightGBM bundle "{absolute_path}" has invalid task Boosters.'
+        ) from error
+    if len(task_boosters) != train_args.num_tasks or any(
+        not _is_lightgbm_booster(booster) for booster in task_boosters
+    ):
+        raise LightGBMCheckpointError(
+            f'LightGBM bundle "{absolute_path}" must contain one Booster per task.'
+        )
+    expected_objective = (
+        "binary" if train_args.dataset_type == "classification" else "regression"
+    )
+    booster_objectives = [booster.params.get("objective") for booster in task_boosters]
+    booster_widths = [booster.num_feature() for booster in task_boosters]
+    if any(objective != expected_objective for objective in booster_objectives):
+        raise LightGBMCheckpointError(
+            f'LightGBM bundle "{absolute_path}" contains a Booster objective '
+            "which does not match its dataset type."
+        )
+    if not booster_widths or booster_widths[0] < 1 or len(set(booster_widths)) != 1:
+        raise LightGBMCheckpointError(
+            f'LightGBM bundle "{absolute_path}" contains incompatible task feature widths.'
+        )
+
+    scaler_states = bundle["scalers"]
+    required_scaler_keys = {
+        "data", "features", "atom_descriptor", "bond_descriptor", "atom_bond"
+    }
+    if (
+        not isinstance(scaler_states, dict)
+        or set(scaler_states) != required_scaler_keys
+    ):
+        raise LightGBMCheckpointError(
+            f'LightGBM bundle "{absolute_path}" has invalid or incomplete scaler state.'
+        )
+    scaler = _load_standard_scaler(scaler_states.get("data"))
+    features_scaler = _load_standard_scaler(
+        scaler_states.get("features"), replace_nan_token=0
+    )
+    atom_descriptor_scaler = _load_standard_scaler(
+        scaler_states.get("atom_descriptor"), replace_nan_token=0
+    )
+    bond_descriptor_scaler = _load_standard_scaler(
+        scaler_states.get("bond_descriptor"), replace_nan_token=0
+    )
+    atom_bond_state = scaler_states.get("atom_bond")
+    if atom_bond_state is None:
+        atom_bond_scaler = None
+    else:
+        atom_bond_scaler = AtomBondScaler(
+            means=atom_bond_state["means"],
+            stds=atom_bond_state["stds"],
+            replace_nan_token=0,
+            n_atom_targets=atom_bond_state.get("n_atom_targets"),
+            n_bond_targets=atom_bond_state.get("n_bond_targets"),
+        )
+
+    metadata = bundle["metadata"]
+    if not isinstance(metadata, dict):
+        raise LightGBMCheckpointError(
+            f'LightGBM bundle "{absolute_path}" has invalid metadata.'
+        )
+    task_names = list(metadata.get("task_names", train_args.task_names))
+    dataset_type = metadata.get("dataset_type", train_args.dataset_type)
+    if (
+        task_names != list(train_args.task_names)
+        or dataset_type != train_args.dataset_type
+    ):
+        raise LightGBMCheckpointError(
+            f'LightGBM bundle "{absolute_path}" metadata does not match its training arguments.'
+        )
+    return LightGBMModelBundle(
+        encoder=encoder,
+        task_boosters=task_boosters,
+        train_args=train_args,
+        scalers=(
+            scaler,
+            features_scaler,
+            atom_descriptor_scaler,
+            bond_descriptor_scaler,
+            atom_bond_scaler,
+        ),
+        task_names=task_names,
+        dataset_type=dataset_type,
+        model_index=int(metadata.get("model_index", 0)),
+        seed=int(metadata.get("seed", 0)),
+        checkpoint_path=absolute_path,
+    )
 
 
 def load_checkpoint(
@@ -146,7 +458,7 @@ def load_checkpoint(
         debug = info = print
 
     # Load model and args
-    if LooseVersion(torch.__version__) >= LooseVersion("2.6"):
+    if parse_version(torch.__version__) >= parse_version("2.6"):
         state = torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)
     else:
         state = torch.load(path, map_location=lambda storage, loc: storage)
@@ -250,7 +562,7 @@ def load_frzn_model(
     """
     debug = logger.debug if logger is not None else print
 
-    if LooseVersion(torch.__version__) >= LooseVersion("2.6"):
+    if parse_version(torch.__version__) >= parse_version("2.6"):
         loaded_mpnn_model = torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)
     else:
         loaded_mpnn_model = torch.load(path, map_location=lambda storage, loc: storage)
@@ -458,7 +770,7 @@ def load_scalers(
     :return: A tuple with the data :class:`~chemprop.data.scaler.StandardScaler`
              and features :class:`~chemprop.data.scaler.StandardScaler`.
     """
-    if LooseVersion(torch.__version__) >= LooseVersion("2.6"):
+    if parse_version(torch.__version__) >= parse_version("2.6"):
         state = torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)
     else:
         state = torch.load(path, map_location=lambda storage, loc: storage)
@@ -515,7 +827,7 @@ def load_args(path: str) -> TrainArgs:
     :return: The :class:`~chemprop.args.TrainArgs` object that the model was trained with.
     """
     args = TrainArgs()
-    if LooseVersion(torch.__version__) >= LooseVersion("2.6"):
+    if parse_version(torch.__version__) >= parse_version("2.6"):
         args.from_dict(
             vars(torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)["args"]),
             skip_unsettable=True,
@@ -568,7 +880,7 @@ def build_lr_scheduler(
         optimizer=optimizer,
         warmup_epochs=[args.warmup_epochs],
         total_epochs=total_epochs or [args.epochs] * args.num_lrs,
-        steps_per_epoch=args.train_data_size // args.batch_size,
+        steps_per_epoch=max(1, ceil(args.train_data_size / args.batch_size)),
         init_lr=[args.init_lr],
         max_lr=[args.max_lr],
         final_lr=[args.final_lr],
@@ -889,16 +1201,33 @@ def update_prediction_args(
             "for training, please specify a path to new constraints for prediction."
         )
 
-    # If features were used during training, they must be used when predicting
+    # If features were used during training, they must be used when predicting.
+    # External feature files are intentionally compared by presence because the
+    # prediction rows normally come from a different file. Generated features,
+    # however, are part of the model input schema and their order is significant.
     if validate_feature_sources:
-        if ((train_args.features_path is None) != (predict_args.features_path is None)) or (
-            (train_args.features_generator is None) != (predict_args.features_generator is None)
+        train_features_path = getattr(train_args, "features_path", None)
+        predict_features_path = getattr(predict_args, "features_path", None)
+        train_features_generator = getattr(train_args, "features_generator", None)
+        predict_features_generator = getattr(predict_args, "features_generator", None)
+        if ((train_features_path is None) != (predict_features_path is None)) or (
+            (train_features_generator is None)
+            != (predict_features_generator is None)
         ):
             raise ValueError(
                 "Features were used during training so they must be specified again during "
                 "prediction using the same type of features as before "
                 "(with either --features_generator or --features_path "
                 "and using --no_features_scaling if applicable)."
+            )
+        if (
+            train_features_generator is not None
+            and predict_features_generator is not None
+            and list(train_features_generator) != list(predict_features_generator)
+        ):
+            raise ValueError(
+                "The ordered feature generators used for prediction must exactly "
+                "match those used during training."
             )
 
 
@@ -925,8 +1254,8 @@ def multitask_mean(
     scale_dependent_metrics = ["rmse", "mae", "mse", "bounded_rmse", "bounded_mae", "bounded_mse", "quantile"]
     nonscale_dependent_metrics = [
         "auc", "prc-auc", "r2", "accuracy", "cross_entropy",
-        "binary_cross_entropy", "sid", "wasserstein", "f1", "mcc", "recall", "precision", "balanced_accuracy", "confusion_matrix"
-
+        "binary_cross_entropy", "sid", "wasserstein", "f1", "mcc", "recall",
+        "precision", "balanced_accuracy",
     ]
 
     mean_fn = np.nanmean if ignore_nan_metrics else np.mean

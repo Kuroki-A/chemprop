@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 from collections import OrderedDict, defaultdict
+import hashlib
 import sys
 import csv
 import ctypes
 from logging import Logger
 import pickle
 from random import Random
-from typing import List, Set, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 import os
 import json
 
@@ -14,11 +17,15 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from .data import MoleculeDatapoint, MoleculeDataset, make_mols
+from .data import MoleculeDatapoint, MoleculeDataset, generate_features_for_smiles_batch, \
+    load_selected_feature_columns, make_mols
 from .scaffold import log_scaffold_stats, scaffold_split
-from chemprop.args import PredictArgs, TrainArgs
-from chemprop.features import load_features, load_valid_atom_or_bond_features, is_mol
+from chemprop.features import get_features_generator_schema, is_mol, load_features, \
+    load_valid_atom_or_bond_features
 from chemprop.rdkit import make_mol
+
+if TYPE_CHECKING:
+    from chemprop.args import PredictArgs, TrainArgs
 
 # Increase maximum size of field in the csv processing for the current architecture
 csv.field_size_limit(int(ctypes.c_ulong(-1).value // 2))
@@ -35,12 +42,334 @@ def get_header(path: str) -> List[str]:
     return header
 
 
+_FEATURE_MANIFEST_SCHEMA_FIELDS = (
+    'schema_version',
+    'generator',
+    'generator_config',
+    'versions',
+    'feature_names',
+    'dimension',
+    'dtype',
+    'implementation_sha256',
+)
+
+
+def _load_feature_manifest(path: str) -> Optional[dict]:
+    """Loads and minimally validates a save_features sidecar manifest."""
+    manifest_path = f'{path}.manifest.json'
+    if not os.path.isfile(manifest_path):
+        return None
+
+    try:
+        with open(manifest_path, encoding='utf-8') as manifest_file:
+            manifest = json.load(manifest_file)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f'Invalid feature manifest {manifest_path}: {error}'
+        ) from error
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            f'Invalid feature manifest {manifest_path}: expected a JSON object.'
+        )
+
+    return manifest
+
+
+def _manifest_dimension(path: str, manifest: dict) -> int:
+    """Returns a validated feature width from a sidecar manifest."""
+    manifest_path = f'{path}.manifest.json'
+
+    recorded_dimension = manifest.get('dimension')
+    if (
+        isinstance(recorded_dimension, bool)
+        or not isinstance(recorded_dimension, int)
+        or recorded_dimension < 0
+    ):
+        raise ValueError(
+            f'Invalid feature manifest {manifest_path}: dimension must be a '
+            'non-negative integer.'
+        )
+    return recorded_dimension
+
+
+def _normalize_feature_matrix(
+    path: str,
+    values: np.ndarray,
+    manifest: Optional[dict],
+) -> np.ndarray:
+    """Normalizes the special empty save_features archive to a 2-D matrix."""
+    array = np.asarray(values)
+    if array.ndim == 2:
+        return array
+    if array.ndim == 1 and array.size == 0:
+        manifest_path = f'{path}.manifest.json'
+        if manifest is None:
+            raise ValueError(
+                f'Feature file {path} is an empty 1-D array. A complete '
+                'save_features manifest is required to recover its width.'
+            )
+        if manifest.get('status') != 'complete':
+            raise ValueError(
+                f'Invalid feature manifest {manifest_path}: status must be '
+                "'complete' to load an empty feature array."
+            )
+        dimension = _manifest_dimension(path, manifest)
+        return array.reshape((0, dimension))
+    raise ValueError(
+        f'Feature file {path} must contain a 2-D matrix, got shape {array.shape}.'
+    )
+
+
+def _ordered_smiles_sha256(smiles: List[str]) -> str:
+    """Hashes ordered SMILES using the save_features length-prefixed format."""
+    digest = hashlib.sha256(b'chemprop-ordered-smiles-v1\0')
+    for value in smiles:
+        encoded = str(value).encode('utf-8')
+        digest.update(len(encoded).to_bytes(8, byteorder='big', signed=False))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _manifest_smiles_column_indices(
+    path: str,
+    manifest: dict,
+    ordered_smiles_columns: List[List[str]],
+) -> Optional[List[int]]:
+    """Validates manifest row identity and returns matching SMILES columns."""
+    manifest_path = f'{path}.manifest.json'
+    input_identity = manifest.get('input')
+    if input_identity is None:
+        return None
+    if not isinstance(input_identity, dict):
+        raise ValueError(
+            f'Invalid feature manifest {manifest_path}: input must be a JSON object.'
+        )
+
+    has_hash = 'ordered_smiles_sha256' in input_identity
+    has_count = 'num_smiles' in input_identity
+    if not has_hash and not has_count:
+        return None
+    if not has_hash or not has_count:
+        raise ValueError(
+            f'Invalid feature manifest {manifest_path}: input must contain both '
+            'ordered_smiles_sha256 and num_smiles.'
+        )
+
+    encoding = input_identity.get(
+        'ordered_smiles_encoding', 'chemprop-length-prefixed-utf8-v1',
+    )
+    if encoding != 'chemprop-length-prefixed-utf8-v1':
+        raise ValueError(
+            f'Invalid feature manifest {manifest_path}: unsupported '
+            f'ordered_smiles_encoding {encoding!r}.'
+        )
+
+    recorded_count = input_identity['num_smiles']
+    if (
+        isinstance(recorded_count, bool)
+        or not isinstance(recorded_count, int)
+        or recorded_count < 0
+    ):
+        raise ValueError(
+            f'Invalid feature manifest {manifest_path}: input.num_smiles must '
+            'be a non-negative integer.'
+        )
+    expected_count = (
+        len(ordered_smiles_columns[0]) if ordered_smiles_columns else 0
+    )
+    if recorded_count != expected_count:
+        raise ValueError(
+            f'Feature manifest {manifest_path} records input.num_smiles '
+            f'{recorded_count}, but the current data has {expected_count} rows.'
+        )
+
+    recorded_hash = input_identity['ordered_smiles_sha256']
+    if not isinstance(recorded_hash, str):
+        raise ValueError(
+            f'Invalid feature manifest {manifest_path}: '
+            'input.ordered_smiles_sha256 must be a string.'
+        )
+    matching_indices = [
+        index
+        for index, smiles in enumerate(ordered_smiles_columns)
+        if _ordered_smiles_sha256(smiles) == recorded_hash
+    ]
+    if not matching_indices:
+        raise ValueError(
+            f'Feature manifest {manifest_path} input.ordered_smiles_sha256 '
+            'does not match any configured SMILES column in the current data; '
+            'the SMILES values or row order changed.'
+        )
+    return matching_indices
+
+
+def _feature_manifest_schema(
+    path: str,
+    array: np.ndarray,
+    manifest: Optional[dict] = None,
+) -> Optional[dict]:
+    """Loads row-independent semantic fields from a save_features manifest."""
+    if manifest is None:
+        manifest = _load_feature_manifest(path)
+    if manifest is None:
+        return None
+    manifest_path = f'{path}.manifest.json'
+
+    recorded_dimension = _manifest_dimension(path, manifest)
+    actual_dimension = int(array.shape[1])
+    if recorded_dimension != actual_dimension:
+        raise ValueError(
+            f'Feature manifest {manifest_path} records dimension '
+            f'{recorded_dimension}, but the feature array has width '
+            f'{actual_dimension}.'
+        )
+
+    recorded_dtype = manifest.get('dtype')
+    if recorded_dtype is not None:
+        try:
+            dtype_matches = np.dtype(recorded_dtype) == array.dtype
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f'Invalid feature manifest {manifest_path}: unsupported dtype '
+                f'{recorded_dtype!r}.'
+            ) from error
+        if not dtype_matches:
+            raise ValueError(
+                f'Feature manifest {manifest_path} records dtype '
+                f'{recorded_dtype!r}, but the feature array has dtype '
+                f'{array.dtype!s}.'
+            )
+
+    feature_names = manifest.get('feature_names')
+    if feature_names is not None and (
+        not isinstance(feature_names, list)
+        or len(feature_names) != actual_dimension
+    ):
+        raise ValueError(
+            f'Invalid feature manifest {manifest_path}: feature_names must '
+            f'contain exactly {actual_dimension} entries.'
+        )
+
+    return {
+        field: manifest[field]
+        for field in _FEATURE_MANIFEST_SCHEMA_FIELDS
+        if field in manifest
+    }
+
+
+def _feature_source_entry(
+    path: str,
+    values: np.ndarray,
+    manifest: Optional[dict] = None,
+    ordered_smiles_columns: Optional[List[List[str]]] = None,
+) -> dict:
+    """Describes one ordered external feature matrix without recording row data."""
+    array = np.asarray(values)
+    if array.ndim != 2:
+        raise ValueError(
+            f'Feature file {path} must contain a 2-D matrix, got shape {array.shape}.'
+        )
+
+    extension = os.path.splitext(path)[1].lower()
+    # ``load_features`` may be supplied by an embedding application or mocked in
+    # tests without a corresponding on-disk CSV.  The matrix shape remains the
+    # authoritative schema in that case; record a header only when it can be
+    # inspected safely.
+    csv_header = (
+        get_header(path)
+        if extension in {'.csv', '.txt'} and os.path.isfile(path)
+        else None
+    )
+    if csv_header is not None and len(csv_header) != array.shape[1]:
+        raise ValueError(
+            f'Feature file {path} has {len(csv_header)} header columns but '
+            f'{array.shape[1]} feature columns.'
+        )
+
+    entry = {
+        'dimension': int(array.shape[1]),
+        'dtype': str(array.dtype),
+        'csv_header': csv_header,
+    }
+    feature_manifest = _feature_manifest_schema(path, array, manifest=manifest)
+    if feature_manifest is not None:
+        entry['feature_manifest'] = feature_manifest
+        if ordered_smiles_columns is not None:
+            expected_rows = (
+                len(ordered_smiles_columns[0])
+                if ordered_smiles_columns
+                else 0
+            )
+            if array.shape[0] != expected_rows:
+                raise ValueError(
+                    f'Feature file {path} has {array.shape[0]} rows, but its '
+                    f'manifest is being loaded with {expected_rows} data rows.'
+                )
+            smiles_column_indices = _manifest_smiles_column_indices(
+                path, manifest, ordered_smiles_columns,
+            )
+            if smiles_column_indices is not None:
+                entry['smiles_column_indices'] = smiles_column_indices
+
+    return entry
+
+
+def _features_source_metadata(
+    external_features: List[dict],
+    phase_features: Optional[dict],
+    generated_dimension: Optional[int],
+) -> dict:
+    """Builds the ordered, row-independent molecular feature source schema."""
+    external_dimension = sum(source['dimension'] for source in external_features)
+    phase_dimension = 0 if phase_features is None else phase_features['dimension']
+    return {
+        'schema_version': 1,
+        'external_features': external_features,
+        'phase_features': phase_features,
+        'generated_dimension': (
+            None if generated_dimension is None else int(generated_dimension)
+        ),
+        'total_dimension': (
+            None
+            if generated_dimension is None
+            else int(external_dimension + phase_dimension + generated_dimension)
+        ),
+    }
+
+
+def _static_generated_dimension(
+    features_generators: List[str],
+    selected_feature_columns: dict,
+    number_of_molecules: int,
+) -> Optional[int]:
+    """Returns a generator width without evaluating molecules when it is known."""
+    if not features_generators:
+        return 0
+
+    dimension = 0
+    for generator_name in features_generators:
+        try:
+            generator_schema = get_features_generator_schema(
+                generator_name,
+                selected_feature_columns=selected_feature_columns.get(generator_name),
+            )
+        except ImportError:
+            return None
+        generator_dimension = generator_schema.get('dimension')
+        if generator_dimension is None:
+            return None
+        dimension += int(generator_dimension)
+
+    return dimension * number_of_molecules
+
+
 def preprocess_smiles_columns(path: str,
                               smiles_columns: Union[str, List[str]] = None,
                               number_of_molecules: int = 1) -> List[str]:
     """
     Preprocesses the :code:`smiles_columns` variable to ensure that it is a list of column
     headings corresponding to the columns in the data file holding SMILES. Assumes file has a header.
+
     :param path: Path to a CSV file.
     :param smiles_columns: The names of the columns containing SMILES.
                            By default, uses the first :code:`number_of_molecules` columns.
@@ -68,6 +397,22 @@ def preprocess_smiles_columns(path: str,
     return smiles_columns
 
 
+def _expand_quantile_task_names(
+    target_names: List[str], loss_function: str = None,
+) -> List[str]:
+    """Returns lower/upper output names without duplicating an expanded list."""
+    names = list(target_names)
+    if loss_function != 'quantile_interval':
+        return names
+    midpoint = len(names) // 2
+    already_expanded = (
+        len(names) > 0
+        and len(names) % 2 == 0
+        and names[:midpoint] == names[midpoint:]
+    )
+    return names if already_expanded else names * 2
+
+
 def get_task_names(
     path: str,
     smiles_columns: Union[str, List[str]] = None,
@@ -81,6 +426,7 @@ def get_task_names(
     Otherwise, returns all columns except the :code:`smiles_columns`
     (or the first column, if the :code:`smiles_columns` is None) and
     the :code:`ignore_columns`.
+
     :param path: Path to a CSV file.
     :param smiles_columns: The names of the columns containing SMILES.
                            By default, uses the first :code:`number_of_molecules` columns.
@@ -90,7 +436,7 @@ def get_task_names(
     :return: A list of task names.
     """
     if target_columns is not None:
-        return target_columns
+        return _expand_quantile_task_names(target_columns, loss_function)
 
     columns = get_header(path)
 
@@ -101,10 +447,7 @@ def get_task_names(
 
     target_names = [column for column in columns if column not in ignore_columns]
 
-    if loss_function == "quantile_interval":
-        target_names = target_names * 2
-
-    return target_names
+    return _expand_quantile_task_names(target_names, loss_function)
 
 
 def get_mixed_task_names(path: str,
@@ -205,15 +548,26 @@ def get_data_weights(path: str) -> List[float]:
     weights = []
     with open(path) as f:
         reader = csv.reader(f)
-        next(reader)  # skip header row
+        try:
+            next(reader)  # skip header row
+        except StopIteration as error:
+            raise ValueError('Data weights file must contain a header row.') from error
         for line in reader:
+            if len(line) != 1 or line[0] == '':
+                raise ValueError('Each data weights row must contain exactly one value.')
             weights.append(float(line[0]))
     # normalize the data weights
-    avg_weight = sum(weights) / len(weights)
-    weights = [w / avg_weight for w in weights]
-    if min(weights) < 0:
+    if not weights:
+        raise ValueError('At least one data weight must be provided.')
+    weights_array = np.asarray(weights, dtype=float)
+    if not np.all(np.isfinite(weights_array)):
+        raise ValueError('Data weights must be finite for each datapoint.')
+    if np.any(weights_array < 0):
         raise ValueError('Data weights must be non-negative for each datapoint.')
-    return weights
+    if float(weights_array.sum()) <= 0:
+        raise ValueError('At least one data weight must be positive.')
+    weights_array /= float(weights_array.mean())
+    return weights_array.tolist()
 
 
 def get_constraints(path: str,
@@ -291,6 +645,24 @@ def get_smiles(path: str,
     return smiles
 
 
+def is_valid_molecule(mol) -> bool:
+    """Returns whether a parsed molecule or reaction has usable heavy atoms."""
+    if isinstance(mol, tuple):
+        return (
+            len(mol) == 2
+            and all(component is not None for component in mol)
+            and sum(component.GetNumHeavyAtoms() for component in mol) > 0
+        )
+    return mol is not None and mol.GetNumHeavyAtoms() > 0
+
+
+def is_valid_datapoint(datapoint: MoleculeDatapoint) -> bool:
+    """Returns whether every SMILES entry in a datapoint parses successfully."""
+    if any(smiles == '' for smiles in datapoint.smiles):
+        return False
+    return all(is_valid_molecule(mol) for mol in datapoint.mol)
+
+
 def filter_invalid_smiles(data: MoleculeDataset) -> MoleculeDataset:
     """
     Filters out invalid SMILES.
@@ -298,10 +670,9 @@ def filter_invalid_smiles(data: MoleculeDataset) -> MoleculeDataset:
     :param data: A :class:`~chemprop.data.MoleculeDataset`.
     :return: A :class:`~chemprop.data.MoleculeDataset` with only the valid molecules.
     """
-    return MoleculeDataset([datapoint for datapoint in tqdm(data)
-                            if all(s != '' for s in datapoint.smiles) and all(m is not None for m in datapoint.mol)
-                            and all(m.GetNumHeavyAtoms() > 0 for m in datapoint.mol if not isinstance(m, tuple))
-                            and all(m[0].GetNumHeavyAtoms() + m[1].GetNumHeavyAtoms() > 0 for m in datapoint.mol if isinstance(m, tuple))])
+    return MoleculeDataset([
+        datapoint for datapoint in tqdm(data) if is_valid_datapoint(datapoint)
+    ])
 
 
 def get_invalid_smiles_from_file(path: str = None,
@@ -348,10 +719,16 @@ def get_invalid_smiles_from_list(smiles: List[List[str]], reaction: bool = False
     for mol_smiles in smiles:
         mols = make_mols(smiles=mol_smiles, reaction_list=is_reaction_list, keep_h_list=is_explicit_h_list,
                          add_h_list=is_adding_hs_list, keep_atom_map_list=keep_atom_map_list)
-        if any(s == '' for s in mol_smiles) or \
-           any(m is None for m in mols) or \
-           any(m.GetNumHeavyAtoms() == 0 for m in mols if not isinstance(m, tuple)) or \
-           any(m[0].GetNumHeavyAtoms() + m[1].GetNumHeavyAtoms() == 0 for m in mols if isinstance(m, tuple)):
+        invalid_molecule = any(
+            (
+                any(component is None for component in mol)
+                or sum(component.GetNumHeavyAtoms() for component in mol) == 0
+            )
+            if isinstance(mol, tuple)
+            else mol is None or mol.GetNumHeavyAtoms() == 0
+            for mol in mols
+        )
+        if any(s == '' for s in mol_smiles) or invalid_molecule:
 
             invalid_smiles.append(mol_smiles)
 
@@ -375,7 +752,8 @@ def get_data(path: str,
              store_row: bool = False,
              logger: Logger = None,
              loss_function: str = None,
-             skip_none_targets: bool = False) -> MoleculeDataset:
+             skip_none_targets: bool = False,
+             selected_features_path: str = None) -> MoleculeDataset:
     """
     Gets SMILES and target values from a CSV file.
 
@@ -392,6 +770,7 @@ def get_data(path: str,
                           in place of :code:`args.features_path`.
     :param features_generator: A list of features generators to use. If provided, it is used
                                in place of :code:`args.features_generator`.
+    :param selected_features_path: Path to a CSV mapping generators to selected descriptor names.
     :param phase_features_path: A path to a file containing phase features as applicable to spectra.
     :param atom_descriptors_path: The path to the file containing the custom atom descriptors.
     :param bond_descriptors_path: The path to the file containing the custom bond descriptors.
@@ -414,59 +793,148 @@ def get_data(path: str,
         ignore_columns = ignore_columns if ignore_columns is not None else args.ignore_columns
         features_path = features_path if features_path is not None else args.features_path
         features_generator = features_generator if features_generator is not None else args.features_generator
+        selected_features_path = selected_features_path if selected_features_path is not None \
+            else args.selected_features_path
         phase_features_path = phase_features_path if phase_features_path is not None else args.phase_features_path
         atom_descriptors_path = atom_descriptors_path if atom_descriptors_path is not None \
             else args.atom_descriptors_path
         bond_descriptors_path = bond_descriptors_path if bond_descriptors_path is not None \
             else args.bond_descriptors_path
         constraints_path = constraints_path if constraints_path is not None else args.constraints_path
+        data_weights_path = data_weights_path if data_weights_path is not None \
+            else getattr(args, 'data_weights_path', None)
         max_data_size = max_data_size if max_data_size is not None else args.max_data_size
         loss_function = loss_function if loss_function is not None else args.loss_function
+
+    if target_columns is not None:
+        target_columns = _expand_quantile_task_names(target_columns, loss_function)
 
     if isinstance(smiles_columns, str) or smiles_columns is None:
         smiles_columns = preprocess_smiles_columns(path=path, smiles_columns=smiles_columns)
 
     max_data_size = max_data_size or float('inf')
 
+    feature_paths = [] if features_path is None else features_path
+    feature_manifests = [
+        _load_feature_manifest(feature_path) for feature_path in feature_paths
+    ]
+    phase_features_manifest = (
+        _load_feature_manifest(phase_features_path)
+        if phase_features_path is not None
+        else None
+    )
+
+    # A save_features manifest identifies the raw, unfiltered CSV input. Build
+    # one ordered sequence per configured molecule column: save_features accepts
+    # one SMILES column and its ``flatten=True`` result is exactly one of these
+    # sequences, even for a multi-molecule Chemprop dataset.
+    ordered_smiles_columns = None
+    if any(manifest is not None for manifest in feature_manifests) \
+            or phase_features_manifest is not None:
+        raw_smiles_rows = get_smiles(
+            path=path,
+            smiles_columns=smiles_columns,
+            flatten=False,
+        )
+        ordered_smiles_columns = [[] for _ in smiles_columns]
+        for smiles_row in raw_smiles_rows:
+            for column_index, smiles in enumerate(smiles_row):
+                ordered_smiles_columns[column_index].append(smiles)
+        raw_data_row_count = len(raw_smiles_rows)
+    elif (
+        feature_paths
+        or phase_features_path is not None
+        or data_weights_path is not None
+        or constraints_path is not None
+        or (
+            atom_descriptors_path is not None
+            and os.path.splitext(atom_descriptors_path)[1].lower() != '.sdf'
+        )
+        or (
+            bond_descriptors_path is not None
+            and os.path.splitext(bond_descriptors_path)[1].lower() != '.sdf'
+        )
+    ):
+        with open(path) as raw_data_file:
+            raw_data_row_count = sum(1 for _ in csv.DictReader(raw_data_file))
+    else:
+        raw_data_row_count = None
+
     # Load features
-    if features_path is not None:
+    external_features_metadata = []
+    if feature_paths:
         features_data = []
-        for feat_path in features_path:
-            features_data.append(load_features(feat_path))  # each is num_data x num_features
+        for feat_path, manifest in zip(feature_paths, feature_manifests):
+            loaded_features = _normalize_feature_matrix(
+                feat_path, load_features(feat_path), manifest,
+            )
+            if len(loaded_features) != raw_data_row_count:
+                raise ValueError(
+                    f'Feature file {feat_path} has {len(loaded_features)} rows, '
+                    f'but the input CSV has {raw_data_row_count} data rows. '
+                    'Features must preserve every input row in order.'
+                )
+            external_features_metadata.append(
+                _feature_source_entry(
+                    feat_path,
+                    loaded_features,
+                    manifest=manifest,
+                    ordered_smiles_columns=ordered_smiles_columns,
+                )
+            )
+            features_data.append(loaded_features)  # each is num_data x num_features
+        feature_row_counts = {len(values) for values in features_data}
+        if len(feature_row_counts) != 1:
+            raise ValueError(
+                'External feature files have inconsistent row counts: '
+                + ', '.join(
+                    f'{feature_path}={len(values)}'
+                    for feature_path, values in zip(feature_paths, features_data)
+                )
+                + '.'
+            )
         features_data = np.concatenate(features_data, axis=1)
     else:
         features_data = None
 
     if phase_features_path is not None:
-        phase_features = load_features(phase_features_path)
+        phase_features = _normalize_feature_matrix(
+            phase_features_path,
+            load_features(phase_features_path),
+            phase_features_manifest,
+        )
+        if len(phase_features) != raw_data_row_count:
+            raise ValueError(
+                f'Phase feature file {phase_features_path} has '
+                f'{len(phase_features)} rows, but the input CSV has '
+                f'{raw_data_row_count} data rows. Phase features must '
+                'preserve every input row in order.'
+            )
+        phase_features_metadata = _feature_source_entry(
+            phase_features_path,
+            phase_features,
+            manifest=phase_features_manifest,
+            ordered_smiles_columns=ordered_smiles_columns,
+        )
         for d_phase in phase_features:
             if not (d_phase.sum() == 1 and np.count_nonzero(d_phase) == 1):
                 raise ValueError('Phase features must be one-hot encoded.')
         if features_data is not None:
+            if len(features_data) != len(phase_features):
+                raise ValueError(
+                    'External and phase feature files have inconsistent row '
+                    f'counts: {len(features_data)} and {len(phase_features)}.'
+                )
             features_data = np.concatenate((features_data, phase_features), axis=1)
         else:  # if there are no other molecular features, phase features become the only molecular features
             features_data = np.array(phase_features)
     else:
         phase_features = None
+        phase_features_metadata = None
 
-    # Load constraints
-    if constraints_path is not None:
-        constraints_data, raw_constraints_data = get_constraints(
-            path=constraints_path,
-            target_columns=args.target_columns,
-            save_raw_data=args.save_smiles_splits
-        )
-    else:
-        constraints_data = None
-        raw_constraints_data = None
-
-    # Load data weights
-    if data_weights_path is not None:
-        data_weights = get_data_weights(data_weights_path)
-    else:
-        data_weights = None
-
-    # By default, the targets columns are all the columns except the SMILES column
+    # Resolve target columns before loading constraints or inequality metadata,
+    # both of which require the concrete task order. This also keeps the public
+    # ``get_data(path, args=None, constraints_path=...)`` API usable.
     if target_columns is None:
         target_columns = get_task_names(
             path=path,
@@ -475,6 +943,35 @@ def get_data(path: str,
             ignore_columns=ignore_columns,
             loss_function=loss_function,
         )
+
+    # Load constraints
+    if constraints_path is not None:
+        constraints_data, raw_constraints_data = get_constraints(
+            path=constraints_path,
+            target_columns=target_columns,
+            save_raw_data=getattr(args, 'save_smiles_splits', False)
+        )
+        if len(constraints_data) != raw_data_row_count:
+            raise ValueError(
+                f'Constraints file {constraints_path} has '
+                f'{len(constraints_data)} rows, but the input CSV has '
+                f'{raw_data_row_count} data rows.'
+            )
+    else:
+        constraints_data = None
+        raw_constraints_data = None
+
+    # Load data weights
+    if data_weights_path is not None:
+        data_weights = get_data_weights(data_weights_path)
+        if len(data_weights) != raw_data_row_count:
+            raise ValueError(
+                f'Data weights file {data_weights_path} has '
+                f'{len(data_weights)} rows, but the input CSV has '
+                f'{raw_data_row_count} data rows.'
+            )
+    else:
+        data_weights = None
 
     # Find targets provided as inequalities
     if loss_function == 'bounded_mse':
@@ -491,7 +988,7 @@ def get_data(path: str,
         if any([c not in fieldnames for c in target_columns]):
             raise ValueError(f'Data file did not contain all provided target columns: {target_columns}. Data file field names are: {fieldnames}')
 
-        all_smiles, all_targets, all_atom_targets, all_bond_targets, all_rows, all_features, all_phase_features, all_constraints_data, all_raw_constraints_data, all_weights, all_gt, all_lt = [], [], [], [], [], [], [], [], [], [], [], []
+        all_smiles, all_targets, all_atom_targets, all_bond_targets, all_rows, all_features, all_phase_features, all_constraints_data, all_raw_constraints_data, all_weights, all_gt, all_lt, all_row_indices = [], [], [], [], [], [], [], [], [], [], [], [], []
         for i, row in enumerate(tqdm(reader)):
             smiles = [row[c] for c in smiles_columns]
 
@@ -508,15 +1005,20 @@ def get_data(path: str,
                 elif '[' in value or ']' in value:
                     value = value.replace('None', 'null')
                     target = np.array(json.loads(value))
-                    if len(target.shape) == 1 and column in args.atom_targets:  # Atom targets saved as 1D list
+                    if len(target.shape) == 1 and column in getattr(args, 'atom_targets', []):  # Atom targets saved as 1D list
                         atom_targets.append(target)
                         targets.append(target)
-                    elif len(target.shape) == 1 and column in args.bond_targets:  # Bond targets saved as 1D list
+                    elif len(target.shape) == 1 and column in getattr(args, 'bond_targets', []):  # Bond targets saved as 1D list
                         bond_targets.append(target)
                         targets.append(target)
                     elif len(target.shape) == 2:  # Bond targets saved as 2D list
                         bond_target_arranged = []
-                        mol = make_mol(smiles[0], args.explicit_h, args.adding_h, args.keeping_atom_map)
+                        mol = make_mol(
+                            smiles[0],
+                            getattr(args, 'explicit_h', False),
+                            getattr(args, 'adding_h', False),
+                            getattr(args, 'keeping_atom_map', False),
+                        )
                         for bond in mol.GetBonds():
                             bond_target_arranged.append(target[bond.GetBeginAtom().GetIdx(), bond.GetEndAtom().GetIdx()])
                         bond_targets.append(np.array(bond_target_arranged))
@@ -534,8 +1036,15 @@ def get_data(path: str,
             all_targets.append(targets)
             all_atom_targets.append(atom_targets)
             all_bond_targets.append(bond_targets)
+            all_row_indices.append(i)
 
             if features_data is not None:
+                if i >= len(features_data):
+                    raise ValueError(
+                        'Molecular feature files do not contain the feature row '
+                        f'for CSV row {i + 1}. Features must preserve the input '
+                        'CSV row order, including rows skipped for missing targets.'
+                    )
                 all_features.append(features_data[i])
 
             if phase_features is not None:
@@ -569,6 +1078,19 @@ def get_data(path: str,
                 descriptors = load_valid_atom_or_bond_features(atom_descriptors_path, [x[0] for x in all_smiles])
             except Exception as e:
                 raise ValueError(f'Failed to load or validate custom atomic descriptors or features: {e}')
+            if os.path.splitext(atom_descriptors_path)[1].lower() != '.sdf':
+                if len(descriptors) != raw_data_row_count:
+                    raise ValueError(
+                        f'Atom descriptor file {atom_descriptors_path} has '
+                        f'{len(descriptors)} rows, but the input CSV has '
+                        f'{raw_data_row_count} data rows.'
+                    )
+                descriptors = [descriptors[index] for index in all_row_indices]
+            elif len(descriptors) != len(all_smiles):
+                raise ValueError(
+                    f'Atom descriptor file {atom_descriptors_path} did not '
+                    'resolve exactly one entry per loaded molecule.'
+                )
 
             if args.atom_descriptors == 'feature':
                 atom_features = descriptors
@@ -582,25 +1104,100 @@ def get_data(path: str,
                 descriptors = load_valid_atom_or_bond_features(bond_descriptors_path, [x[0] for x in all_smiles])
             except Exception as e:
                 raise ValueError(f'Failed to load or validate custom bond descriptors or features: {e}')
+            if os.path.splitext(bond_descriptors_path)[1].lower() != '.sdf':
+                if len(descriptors) != raw_data_row_count:
+                    raise ValueError(
+                        f'Bond descriptor file {bond_descriptors_path} has '
+                        f'{len(descriptors)} rows, but the input CSV has '
+                        f'{raw_data_row_count} data rows.'
+                    )
+                descriptors = [descriptors[index] for index in all_row_indices]
+            elif len(descriptors) != len(all_smiles):
+                raise ValueError(
+                    f'Bond descriptor file {bond_descriptors_path} did not '
+                    'resolve exactly one entry per loaded molecule.'
+                )
 
             if args.bond_descriptors == 'feature':
                 bond_features = descriptors
             elif args.bond_descriptors == 'descriptor':
                 bond_descriptors = descriptors
 
+        selected_feature_columns = (
+            load_selected_feature_columns(selected_features_path)
+            if selected_features_path is not None
+            else {}
+        )
+
+        generated_features = None
+        if features_generator:
+            debug(
+                'Generating molecular features in batches: '
+                + ', '.join(features_generator)
+            )
+            generated_features = generate_features_for_smiles_batch(
+                all_smiles,
+                features_generator,
+                selected_feature_columns,
+                use_atom_mapping_for_hydrogens=[
+                    bool(atom_row or bond_row)
+                    for atom_row, bond_row in zip(all_atom_targets, all_bond_targets)
+                ],
+            )
+
+        observed_generated_dimension = max(
+            (int(np.asarray(row).size) for row in generated_features),
+            default=0,
+        ) if generated_features is not None else 0
+        generated_dimension = observed_generated_dimension
+        if observed_generated_dimension == 0:
+            generated_dimension = _static_generated_dimension(
+                features_generator or [],
+                selected_feature_columns,
+                number_of_molecules=len(smiles_columns),
+            )
+        features_source_metadata = _features_source_metadata(
+            external_features=external_features_metadata,
+            phase_features=phase_features_metadata,
+            generated_dimension=generated_dimension,
+        )
+
+        generated_features_precomputed = generated_features is not None
+        if features_data is None:
+            # Avoid copying every generated vector through a one-element
+            # concatenate before MoleculeDatapoint construction.
+            combined_features = generated_features
+        elif generated_features is None:
+            combined_features = all_features
+        else:
+            combined_features = [
+                np.concatenate((
+                    np.asarray(all_features[index]),
+                    np.asarray(generated_features[index]),
+                ))
+                for index in range(len(all_smiles))
+            ]
+            # The combined arrays own their data, so release both source
+            # collections before constructing all datapoints.
+            generated_features = None
+            features_data = None
+            all_features = []
+
         data = MoleculeDataset([
             MoleculeDatapoint(
                 smiles=smiles,
                 targets=targets,
-                atom_targets=all_atom_targets[i] if atom_targets else None,
-                bond_targets=all_bond_targets[i] if bond_targets else None,
+                atom_targets=all_atom_targets[i] if all_atom_targets[i] else None,
+                bond_targets=all_bond_targets[i] if all_bond_targets[i] else None,
                 row=all_rows[i] if store_row else None,
                 data_weight=all_weights[i] if data_weights is not None else None,
                 gt_targets=all_gt[i] if gt_targets is not None else None,
                 lt_targets=all_lt[i] if lt_targets is not None else None,
                 features_generator=features_generator,
-                selected_features_path=args.selected_features_path,
-                features=all_features[i] if features_data is not None else None,
+                features_generator_precomputed=generated_features_precomputed,
+                selected_features_path=selected_features_path,
+                selected_feature_columns=selected_feature_columns,
+                features=combined_features[i] if combined_features is not None else None,
                 phase_features=all_phase_features[i] if phase_features is not None else None,
                 atom_features=atom_features[i] if atom_features is not None else None,
                 atom_descriptors=atom_descriptors[i] if atom_descriptors is not None else None,
@@ -622,13 +1219,16 @@ def get_data(path: str,
         if len(data) < original_data_len:
             debug(f'Warning: {original_data_len - len(data)} SMILES are invalid.')
 
+    data._features_source_metadata = features_source_metadata
+
     return data
 
 
 def get_data_from_smiles(smiles: List[List[str]],
                          skip_invalid_smiles: bool = True,
                          logger: Logger = None,
-                         features_generator: List[str] = None) -> MoleculeDataset:
+                         features_generator: List[str] = None,
+                         selected_features_path: str = None) -> MoleculeDataset:
     """
     Converts a list of SMILES to a :class:`~chemprop.data.MoleculeDataset`.
 
@@ -636,16 +1236,54 @@ def get_data_from_smiles(smiles: List[List[str]],
     :param skip_invalid_smiles: Whether to skip and filter out invalid smiles using :func:`filter_invalid_smiles`
     :param logger: A logger for recording output.
     :param features_generator: List of features generators.
+    :param selected_features_path: Path to a CSV mapping generators to selected descriptor names.
     :return: A :class:`~chemprop.data.MoleculeDataset` with all of the provided SMILES.
     """
     debug = logger.debug if logger is not None else print
+
+    selected_feature_columns = (
+        load_selected_feature_columns(selected_features_path)
+        if selected_features_path is not None
+        else {}
+    )
+
+    generated_features = (
+        generate_features_for_smiles_batch(
+            smiles,
+            features_generator,
+            selected_feature_columns,
+        )
+        if features_generator
+        else None
+    )
+    observed_generated_dimension = max(
+        (int(np.asarray(row).size) for row in generated_features),
+        default=0,
+    ) if generated_features is not None else 0
+    if features_generator and not smiles:
+        # An empty public SMILES list does not reveal how many molecule columns
+        # the checkpoint expects. Prediction validation treats this width as
+        # unknown and relies on ordered generator metadata instead.
+        generated_dimension = None
+    else:
+        generated_dimension = observed_generated_dimension
+        if observed_generated_dimension == 0:
+            generated_dimension = _static_generated_dimension(
+                features_generator or [],
+                selected_feature_columns,
+                number_of_molecules=len(smiles[0]) if smiles else 0,
+            )
 
     data = MoleculeDataset([
         MoleculeDatapoint(
             smiles=smile,
             row=OrderedDict({'smiles': smile}),
-            features_generator=features_generator
-        ) for smile in smiles
+            features_generator=features_generator,
+            features_generator_precomputed=generated_features is not None,
+            selected_features_path=selected_features_path,
+            selected_feature_columns=selected_feature_columns,
+            features=generated_features[index] if generated_features is not None else None,
+        ) for index, smile in enumerate(smiles)
     ])
 
     # Filter out invalid SMILES
@@ -655,6 +1293,12 @@ def get_data_from_smiles(smiles: List[List[str]],
 
         if len(data) < original_data_len:
             debug(f'Warning: {original_data_len - len(data)} SMILES are invalid.')
+
+    data._features_source_metadata = _features_source_metadata(
+        external_features=[],
+        phase_features=None,
+        generated_dimension=generated_dimension,
+    )
 
     return data
 

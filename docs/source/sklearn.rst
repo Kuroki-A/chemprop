@@ -8,7 +8,7 @@ In addition to message passing neural networks, Chemprop also enables training a
 Scikit-Learn Train
 ------------------
 
-`chemprop.sklearn_train.py <https://github.com/chemprop/chemprop/tree/master/chemprop/sklearn_train.py>`_ contains functions for training :code:`scikit-learn` models.
+`chemprop.sklearn_train.py <https://github.com/Kuroki-A/chemprop/tree/master/chemprop/sklearn_train.py>`_ contains functions for training :code:`scikit-learn` models.
 
 .. automodule:: chemprop.sklearn_train
    :members:
@@ -16,7 +16,7 @@ Scikit-Learn Train
 Scikit-Learn Predict
 --------------------
 
-`chemprop.sklearn_predict.py <https://github.com/chemprop/chemprop/tree/master/chemprop/sklearn_predict.py>`_ contains functions for training :code:`scikit-learn` models.
+`chemprop.sklearn_predict.py <https://github.com/Kuroki-A/chemprop/tree/master/chemprop/sklearn_predict.py>`_ contains functions for training :code:`scikit-learn` models.
 
 .. automodule:: chemprop.sklearn_predict
    :members:

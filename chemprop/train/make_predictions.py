@@ -1,18 +1,225 @@
 from collections import OrderedDict
 import csv
+import os
 from typing import List, Optional, Union, Tuple
 
-import pickle
 import numpy as np
-from tqdm import tqdm
 
 from chemprop.args import PredictArgs, TrainArgs
-from chemprop.data import get_data, get_data_from_smiles, MoleculeDataLoader, MoleculeDataset, StandardScaler, AtomBondScaler
-from chemprop.utils import load_args, load_checkpoint, load_scalers, makedirs, timeit, update_prediction_args
-from chemprop.features import set_extra_atom_fdim, set_extra_bond_fdim, set_reaction, set_explicit_h, set_adding_hs, set_keeping_atom_map, reset_featurization_parameters
-from chemprop.models import MoleculeModel, MoleculeModelEncoder
+from chemprop.data import get_data, get_data_from_smiles, get_header, is_valid_datapoint, load_selected_feature_columns, MoleculeDataLoader, MoleculeDataset, StandardScaler, AtomBondScaler
+from chemprop.utils import (
+    LightGBMModelBundle,
+    load_args,
+    load_checkpoint,
+    load_checkpoint_lgbm,
+    load_scalers,
+    makedirs,
+    timeit,
+    update_prediction_args,
+)
+from chemprop.features import get_features_generators_metadata, set_extra_atom_fdim, set_extra_bond_fdim, set_reaction, set_explicit_h, set_adding_hs, set_keeping_atom_map, reset_featurization_parameters
+from chemprop.models import MoleculeModel
 from chemprop.uncertainty import UncertaintyCalibrator, build_uncertainty_calibrator, UncertaintyEstimator, build_uncertainty_evaluator
 from chemprop.multitask_utils import reshape_values
+
+
+_LGBM_ENSEMBLE_COMPATIBILITY_FIELDS = (
+    "dataset_type",
+    "number_of_molecules",
+    "reaction",
+    "reaction_solvent",
+    "reaction_mode",
+    "explicit_h",
+    "adding_h",
+    "keeping_atom_map",
+    "features_generator",
+    "features_generator_metadata",
+    "features_source_metadata",
+    "features_size",
+    "features_only",
+    "use_input_features",
+    "atom_descriptors",
+    "atom_descriptors_size",
+    "atom_features_size",
+    "bond_descriptors",
+    "bond_descriptors_size",
+    "bond_features_size",
+    "overwrite_default_atom_features",
+    "overwrite_default_bond_features",
+    "atom_messages",
+    "hidden_size",
+    "hidden_size_solvent",
+    "bias",
+    "bias_solvent",
+    "depth",
+    "depth_solvent",
+    "undirected",
+    "aggregation",
+    "aggregation_norm",
+    "activation",
+    "mpn_shared",
+)
+
+_FFN_ENSEMBLE_COMPATIBILITY_FIELDS = tuple(dict.fromkeys(
+    _LGBM_ENSEMBLE_COMPATIBILITY_FIELDS + (
+        "model_type",
+        "task_names",
+        "num_tasks",
+        "loss_function",
+        "multiclass_num_classes",
+        "ffn_hidden_size",
+        "ffn_num_layers",
+        "dropout",
+        "features_scaling",
+        "atom_descriptor_scaling",
+        "bond_descriptor_scaling",
+        "is_atom_bond_targets",
+        "atom_targets",
+        "bond_targets",
+        "atom_constraints",
+        "bond_constraints",
+        "shared_atom_bond_ffn",
+        "adding_bond_types",
+        "weights_ffn_num_layers",
+        "spectra_activation",
+        "spectra_phase_mask",
+        "quantile_loss_alpha",
+        "quantiles",
+    )
+))
+
+
+def _lgbm_compatibility_signature(train_args: TrainArgs) -> dict:
+    """Captures every setting that changes encoder inputs or architecture."""
+    return {
+        field: getattr(train_args, field, None)
+        for field in _LGBM_ENSEMBLE_COMPATIBILITY_FIELDS
+    }
+
+
+def _validate_ensemble_train_args(
+    train_args_list: List[TrainArgs],
+    fields: Tuple[str, ...],
+    model_label: str,
+) -> None:
+    """Rejects checkpoints which cannot safely share one prediction dataset."""
+    if not train_args_list:
+        raise ValueError(f"No {model_label} checkpoint arguments were loaded.")
+
+    def values_equal(expected, actual) -> bool:
+        """Compares ordinary checkpoint values and array-valued schemas."""
+        if isinstance(expected, np.ndarray) or isinstance(actual, np.ndarray):
+            try:
+                return np.array_equal(
+                    np.asarray(expected), np.asarray(actual), equal_nan=True,
+                )
+            except TypeError:
+                # ``equal_nan`` is unsupported for some non-numeric arrays.
+                return np.array_equal(np.asarray(expected), np.asarray(actual))
+        return expected == actual
+
+    reference = {
+        field: getattr(train_args_list[0], field, None) for field in fields
+    }
+    for checkpoint_index, candidate in enumerate(train_args_list[1:], start=1):
+        incompatible = [
+            field for field, expected in reference.items()
+            if not values_equal(expected, getattr(candidate, field, None))
+        ]
+        if incompatible:
+            raise ValueError(
+                f"{model_label} ensemble checkpoint {checkpoint_index} is incompatible "
+                f"with checkpoint 0: {', '.join(incompatible)}."
+            )
+
+
+def _feature_source_metadata_matches(expected: dict, actual: dict) -> bool:
+    """Compares source schemas while allowing unknown widths for empty API input.
+
+    Generator identity and configuration are validated separately. An empty
+    in-memory ``smiles=[]`` call has no molecule-column count from which to
+    realize the generated width, but its external and phase layouts remain
+    fully checkable.
+    """
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return expected == actual
+    normalized_actual = dict(actual)
+    for field in ("generated_dimension", "total_dimension"):
+        if normalized_actual.get(field) is None:
+            normalized_actual[field] = expected.get(field)
+    return normalized_actual == expected
+
+
+def validate_prediction_feature_schema(
+    args: PredictArgs,
+    train_args: TrainArgs,
+    full_data: MoleculeDataset,
+    valid_data: MoleculeDataset,
+    input_label: str = "Prediction",
+) -> None:
+    """Validates the complete molecular-feature schema for a model input.
+
+    ``full_data`` retains source metadata even when invalid molecules were
+    filtered from ``valid_data``. A realized row is required only for the width
+    check; generator and source metadata remain checkable for empty inputs.
+    """
+    expected_features_size = getattr(train_args, 'features_size', None)
+    actual_features_size = valid_data.features_size() if len(valid_data) > 0 else None
+    if (
+        actual_features_size is not None
+        and expected_features_size is not None
+        and actual_features_size != expected_features_size
+    ):
+        raise ValueError(
+            f'{input_label} feature width does not match the checkpoint: '
+            f'generated {actual_features_size}, expected {expected_features_size}. '
+            'Use the same feature generators, selected-feature file, and '
+            'dependency versions as training. Legacy reaction checkpoints '
+            'trained with selected features may need to be retrained.'
+        )
+
+    expected_metadata = getattr(train_args, 'features_generator_metadata', None)
+    if expected_metadata is not None:
+        selected_features_path = getattr(args, 'selected_features_path', None)
+        selected_feature_columns = (
+            load_selected_feature_columns(selected_features_path)
+            if selected_features_path is not None
+            else {}
+        )
+        metadata_dimension = (
+            actual_features_size
+            if actual_features_size is not None
+            else expected_metadata.get('total_dimension')
+        )
+        actual_metadata = get_features_generators_metadata(
+            getattr(args, 'features_generator', None) or [],
+            selected_feature_columns=selected_feature_columns,
+            total_dimension=metadata_dimension,
+        )
+        if actual_metadata != expected_metadata:
+            changed = sorted(
+                key for key in set(actual_metadata).union(expected_metadata)
+                if actual_metadata.get(key) != expected_metadata.get(key)
+            )
+            raise ValueError(
+                f'{input_label} feature schema does not match the checkpoint '
+                f'({", ".join(changed)} changed). Use the same ordered '
+                'generators, selected columns, and dependency versions as training.'
+            )
+
+    expected_source_metadata = getattr(train_args, 'features_source_metadata', None)
+    actual_source_metadata = getattr(full_data, '_features_source_metadata', None)
+    if (
+        expected_source_metadata is not None
+        and not _feature_source_metadata_matches(
+            expected_source_metadata, actual_source_metadata
+        )
+    ):
+        raise ValueError(
+            f'{input_label} feature sources do not match the checkpoint. Use the same '
+            'ordered external feature widths/columns, phase-feature width, and '
+            'generated-feature layout as training.'
+        )
 
 
 def load_model(args: PredictArgs, generator: bool = False):
@@ -27,7 +234,13 @@ def load_model(args: PredictArgs, generator: bool = False):
                  generator object of scalers, the number of tasks and their respective names.
     """
     print('Loading training args')
-    train_args = load_args(args.checkpoint_paths[0])
+    checkpoint_train_args = [load_args(path) for path in args.checkpoint_paths]
+    _validate_ensemble_train_args(
+        checkpoint_train_args,
+        _FFN_ENSEMBLE_COMPATIBILITY_FIELDS,
+        "FFN",
+    )
+    train_args = checkpoint_train_args[0]
     num_tasks, task_names = train_args.num_tasks, train_args.task_names
 
     update_prediction_args(predict_args=args, train_args=train_args)
@@ -47,31 +260,75 @@ def load_model(args: PredictArgs, generator: bool = False):
     return args, train_args, models, scalers, num_tasks, task_names
 
 def load_model_lgbm(args: PredictArgs, generator: bool = False):
+    """Loads versioned LightGBM bundles and validates ensemble compatibility."""
     print('Loading training args')
-    scalers = (
-        load_scalers(checkpoint_path) for checkpoint_path in sorted(args.checkpoint_paths_scaler)
+    checkpoint_paths = sorted(os.path.abspath(path) for path in args.checkpoint_paths)
+    if not checkpoint_paths:
+        raise ValueError("No LightGBM bundle checkpoints were provided.")
+
+    bundles = [load_checkpoint_lgbm(path, device=args.device) for path in checkpoint_paths]
+    bundles.sort(key=lambda bundle: (bundle.model_index, bundle.checkpoint_path))
+    first_bundle = bundles[0]
+    _validate_ensemble_train_args(
+        [bundle.train_args for bundle in bundles],
+        _LGBM_ENSEMBLE_COMPATIBILITY_FIELDS,
+        "LightGBM",
     )
-    
-    train_args = load_args(args.checkpoint_paths_scaler[0])
-    num_tasks, task_names = train_args.num_tasks, train_args.task_names
+    train_args = first_bundle.train_args
+    num_tasks, task_names = train_args.num_tasks, list(first_bundle.task_names)
+    reference_signature = _lgbm_compatibility_signature(train_args)
+
+    encoder_groups = [(first_bundle.encoder.encoder.state_dict(), first_bundle.encoder)]
+    for bundle in bundles[1:]:
+        if bundle.dataset_type != first_bundle.dataset_type or bundle.task_names != task_names:
+            raise ValueError(
+                "All LightGBM ensemble bundles must have the same dataset type and task names."
+            )
+        bundle_signature = _lgbm_compatibility_signature(bundle.train_args)
+        incompatible_fields = [
+            field
+            for field, reference_value in reference_signature.items()
+            if bundle_signature[field] != reference_value
+        ]
+        if incompatible_fields:
+            raise ValueError(
+                "LightGBM ensemble bundles have incompatible encoder/feature settings: "
+                + ", ".join(incompatible_fields)
+                + "."
+            )
+        bundle_state = bundle.encoder.encoder.state_dict()
+        for group_state, group_encoder in encoder_groups:
+            same_encoder = bundle_state.keys() == group_state.keys() and all(
+                np.array_equal(
+                    bundle_state[name].detach().cpu().numpy(),
+                    group_state[name].detach().cpu().numpy(),
+                )
+                for name in group_state
+            )
+            if same_encoder:
+                # A fold's ensemble shares one frozen encoder in memory as well as on disk.
+                bundle.encoder = group_encoder
+                break
+        else:
+            encoder_groups.append((bundle_state, bundle.encoder))
 
     update_prediction_args(predict_args=args, train_args=train_args)
     args: Union[PredictArgs, TrainArgs]
 
-    # Load model and scalers
-    models = []
-    for model_name in sorted(args.checkpoint_paths):
-        model = pickle.load(open(f'{model_name}', 'rb'))
-        models.append(model)
-    
-    if not generator:
-        models = list(models)
-        scalers = list(scalers)
+    scalers = [bundle.scalers for bundle in bundles]
+    models = bundles
+    if generator:
+        models = iter(models)
+        scalers = iter(scalers)
 
     return args, train_args, models, scalers, num_tasks, task_names
 
 
-def load_data(args: PredictArgs, smiles: List[List[str]]):
+def load_data(
+    args: PredictArgs,
+    smiles: List[List[str]],
+    train_args: TrainArgs = None,
+):
     """
     Function to load data from a list of smiles or a file.
 
@@ -87,6 +344,7 @@ def load_data(args: PredictArgs, smiles: List[List[str]]):
             smiles=smiles,
             skip_invalid_smiles=False,
             features_generator=args.features_generator,
+            selected_features_path=args.selected_features_path,
         )
     else:
         full_data = get_data(
@@ -103,12 +361,19 @@ def load_data(args: PredictArgs, smiles: List[List[str]]):
     full_to_valid_indices = {}
     valid_index = 0
     for full_index in range(len(full_data)):
-        if all(mol is not None for mol in full_data[full_index].mol):
+        if is_valid_datapoint(full_data[full_index]):
             full_to_valid_indices[full_index] = valid_index
             valid_index += 1
 
     test_data = MoleculeDataset(
         [full_data[i] for i in sorted(full_to_valid_indices.keys())]
+    )
+
+    validate_prediction_feature_schema(
+        args=args,
+        train_args=train_args,
+        full_data=full_data,
+        valid_data=test_data,
     )
 
     print(f"Test size = {len(test_data):,}")
@@ -147,6 +412,143 @@ def set_features(args: PredictArgs, train_args: TrainArgs):
         set_reaction(True, train_args.reaction_mode)
 
 
+_UNCERTAINTY_OUTPUT_LABELS = {
+    None: "no_uncertainty_method",
+    "mve": "mve_uncal_var",
+    "ensemble": "ensemble_uncal_var",
+    "classification": "classification_uncal_confidence",
+    "evidential_total": "evidential_total_uncal_var",
+    "evidential_epistemic": "evidential_epistemic_uncal_var",
+    "evidential_aleatoric": "evidential_aleatoric_uncal_var",
+    "dropout": "dropout_uncal_var",
+    "spectra_roundrobin": "roundrobin_sid",
+    "dirichlet": "dirichlet_uncal_uncertainty",
+    "conformal_quantile_regression": "no_uncertainty_method",
+    "conformal_regression": "no_uncertainty_method",
+}
+
+
+def _save_no_valid_ffn_predictions(
+    args: PredictArgs,
+    full_data: MoleculeDataset,
+    task_names: List[str],
+    calibrator: UncertaintyCalibrator = None,
+    return_invalid_smiles: bool = False,
+) -> Tuple[List[List[str]], List[List[str]]]:
+    """Writes deterministic output when an FFN input has no valid molecules."""
+    output_task_names = list(task_names)
+    if args.loss_function == "quantile_interval":
+        output_task_names = output_task_names[:len(output_task_names) // 2]
+    if args.dataset_type == "multiclass":
+        output_task_names = [
+            f"{name}_class_{class_index}"
+            for name in output_task_names
+            for class_index in range(args.multiclass_num_classes)
+        ]
+
+    num_prediction_tasks = len(output_task_names)
+    if args.uncertainty_method == "spectra_roundrobin":
+        num_uncertainty_tasks = 1
+    elif args.uncertainty_method == "dirichlet" and args.dataset_type == "multiclass":
+        num_uncertainty_tasks = (
+            num_prediction_tasks // args.multiclass_num_classes
+        )
+    elif args.calibration_method in {"conformal_regression", "conformal"}:
+        num_uncertainty_tasks = 2 * num_prediction_tasks
+    else:
+        num_uncertainty_tasks = num_prediction_tasks
+
+    uncertainty_label = (
+        calibrator.label
+        if calibrator is not None
+        else _UNCERTAINTY_OUTPUT_LABELS.get(
+            args.uncertainty_method, str(args.uncertainty_method),
+        )
+    )
+    if args.uncertainty_method == "spectra_roundrobin":
+        uncertainty_names = [uncertainty_label]
+    elif (
+        args.uncertainty_method == "conformal_quantile_regression"
+        and args.calibration_method is None
+    ):
+        uncertainty_names = [
+            f"{name}_{args.conformal_alpha}_half_interval"
+            for name in output_task_names
+        ]
+    elif (
+        args.calibration_method == "conformal_regression"
+        and args.calibration_path is None
+    ):
+        uncertainty_names = []
+    elif args.calibration_method == "conformal" and args.dataset_type == "classification":
+        uncertainty_names = [
+            f"{name}_{uncertainty_label}_in_set" for name in output_task_names
+        ] + [
+            f"{name}_{uncertainty_label}_out_set" for name in output_task_names
+        ]
+    else:
+        uncertainty_names = [
+            f"{name}_{uncertainty_label}" for name in output_task_names
+        ]
+    if args.uncertainty_method is None and args.calibration_method is None:
+        uncertainty_names = []
+
+    invalid_predictions = [
+        ["Invalid SMILES"] * num_prediction_tasks for _ in range(len(full_data))
+    ]
+    invalid_uncertainties = [
+        ["Invalid SMILES"] * num_uncertainty_tasks for _ in range(len(full_data))
+    ]
+
+    for datapoint in full_data:
+        if args.drop_extra_columns:
+            datapoint.row = OrderedDict(
+                (column, smiles)
+                for column, smiles in zip(args.smiles_columns, datapoint.smiles)
+            )
+        for name in output_task_names:
+            datapoint.row[name] = "Invalid SMILES"
+        for name in uncertainty_names:
+            datapoint.row[name] = "Invalid SMILES"
+        if args.individual_ensemble_predictions:
+            for name in output_task_names:
+                for model_index in range(len(args.checkpoint_paths)):
+                    datapoint.row[f"{name}_model_{model_index}"] = "Invalid SMILES"
+
+    if len(full_data) > 0:
+        fieldnames = list(full_data[0].row.keys())
+    else:
+        if (
+            not args.drop_extra_columns
+            and args.test_path is not None
+            and os.path.isfile(args.test_path)
+        ):
+            fieldnames = list(get_header(args.test_path))
+        else:
+            fieldnames = list(args.smiles_columns)
+        for name in output_task_names + uncertainty_names:
+            if name not in fieldnames:
+                fieldnames.append(name)
+        if args.individual_ensemble_predictions:
+            fieldnames.extend(
+                f"{name}_model_{model_index}"
+                for name in output_task_names
+                for model_index in range(len(args.checkpoint_paths))
+            )
+
+    print(f"Saving predictions to {args.preds_path}")
+    makedirs(args.preds_path, isfile=True)
+    with open(args.preds_path, "w", newline="") as predictions_file:
+        writer = csv.DictWriter(predictions_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for datapoint in full_data:
+            writer.writerow(datapoint.row)
+
+    if return_invalid_smiles:
+        return invalid_predictions, invalid_uncertainties
+    return [], []
+
+
 def predict_and_save(
     args: PredictArgs,
     train_args: TrainArgs,
@@ -175,7 +577,7 @@ def predict_and_save(
     :param test_data_loader: A :class:`~chemprop.data.MoleculeDataLoader` to load the test data.
     :param full_data:  A :class:`~chemprop.data.MoleculeDataset` containing all (valid and invalid) datapoints.
     :param full_to_valid_indices: A dictionary dictionary mapping full to valid indices.
-    :param models: A list or generator object of :class:`~chemprop.models.MoleculeModel`\ s.
+    :param models: A list or generator object of :class:`~chemprop.models.MoleculeModel` objects.
     :param scalers: A list or generator object of :class:`~chemprop.features.scaler.StandardScaler` objects.
     :param num_models: The number of models included in the models and scalers input.
     :param calibrator: A :class: `~chemprop.uncertainty.UncertaintyCalibrator` object, for use in calibrating uncertainty predictions.
@@ -386,41 +788,68 @@ def predict_and_save(
     
 
 def predict_lgbm(
-    args,
-    model,
+    args: PredictArgs,
+    model: LightGBMModelBundle,
     scaler,
-    test_data,
-):
-    
-    train_args = load_args(args.checkpoint_paths_scaler[0])
-    encoder = MoleculeModelEncoder(train_args)
-    encoder = encoder.to(args.device)
-    
-    num_workers = 8
-    
-    if scaler[1] != None:
-        features_scaler = scaler[1]
-        test_data.normalize_features(features_scaler)
-            
-    test_data_loader = MoleculeDataLoader(
-            dataset=test_data,
-            batch_size=len(test_data),
-            num_workers=num_workers
-        )
-        
-    for batch in tqdm(test_data_loader, total=len(test_data_loader), leave=False):
-        test_mol_batch, test_features_batch, test_target_batch = batch.batch_graph(), batch.features(), batch.targets()
+    test_data: MoleculeDataset,
+    encoded_features: np.ndarray = None,
+) -> np.ndarray:
+    """Predicts with a versioned bundle and its restored frozen encoder."""
+    # Keep LightGBM optional for standard FFN prediction imports.
+    from chemprop.train.run_training_lgbm import (
+        encode_lgbm_features,
+        predict_task_boosters,
+    )
 
-    test_features = encoder(test_mol_batch, test_features_batch)
-    test_features = test_features.to('cpu').detach().numpy().copy()
-    test_target_batch = [x for row in test_target_batch for x in row]
-    
-    test_pred = model.predict(test_features).reshape(-1, 1)
-    
-    if scaler[0] != None:
-        test_pred = scaler[0].inverse_transform(test_pred)
-            
-    return test_pred
+    if not isinstance(model, LightGBMModelBundle):
+        raise TypeError(
+            "LightGBM prediction requires a versioned Chemprop LightGBM bundle."
+        )
+
+    if encoded_features is None:
+        _apply_lgbm_feature_scalers(test_data, model.scalers)
+        encoded_features = encode_lgbm_features(
+            encoder=model.encoder,
+            data=test_data,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+    predictions = predict_task_boosters(model.task_boosters, encoded_features)
+    data_scaler = model.scalers[0]
+    if data_scaler is not None:
+        predictions = data_scaler.inverse_transform(predictions)
+    return np.asarray(predictions, dtype=float)
+
+
+def _apply_lgbm_feature_scalers(test_data: MoleculeDataset, scalers) -> None:
+    """Resets raw inputs and applies the exact feature scalers from training."""
+    test_data.reset_features_and_targets()
+    _, features_scaler, atom_descriptor_scaler, bond_descriptor_scaler, _ = scalers
+    if features_scaler is not None:
+        test_data.normalize_features(features_scaler)
+    if atom_descriptor_scaler is not None:
+        test_data.normalize_features(
+            atom_descriptor_scaler, scale_atom_descriptors=True
+        )
+    if bond_descriptor_scaler is not None:
+        test_data.normalize_features(
+            bond_descriptor_scaler, scale_bond_descriptors=True
+        )
+
+
+def _lgbm_input_scaler_key(scalers) -> tuple:
+    """Returns a stable key for the scalers that affect encoder inputs."""
+    key = []
+    for scaler in scalers[1:4]:
+        if scaler is None:
+            key.append(None)
+        else:
+            means = np.asarray(scaler.means)
+            stds = np.asarray(scaler.stds)
+            key.append(
+                (means.dtype.str, means.shape, means.tobytes(), stds.dtype.str, stds.shape, stds.tobytes())
+            )
+    return tuple(key)
 
     
 def predict_and_save_lgbm(
@@ -432,21 +861,47 @@ def predict_and_save_lgbm(
     test_data_loader: MoleculeDataLoader,
     full_data: MoleculeDataset,
     full_to_valid_indices: dict,
-    models: List[MoleculeModel],
+    models: List[LightGBMModelBundle],
     scalers: List[Union[StandardScaler, AtomBondScaler]],
     num_models: int,
     calibrator: UncertaintyCalibrator = None,
     return_invalid_smiles: bool = False,
     save_results: bool = True,
 ):
+    """Ensembles LightGBM bundles and optionally writes predictions."""
+    # Keep LightGBM optional for standard FFN prediction imports.
+    from chemprop.train.run_training_lgbm import encode_lgbm_features
 
+    models = list(models)
+    scalers = list(scalers)
+    if not models:
+        raise ValueError("At least one LightGBM bundle is required for prediction.")
+    if len(models) != len(scalers):
+        raise ValueError("LightGBM model and scaler counts do not match.")
+
+    encoded_feature_cache = {}
     test_preds = []
-
     for model, scaler in zip(models, scalers):
-        test_pred = predict_lgbm(args, model, scaler, test_data)         
-        test_preds.append(test_pred)
-    
-    preds = sum(test_preds) / len(test_preds)
+        cache_key = (id(model.encoder), _lgbm_input_scaler_key(model.scalers))
+        if cache_key not in encoded_feature_cache:
+            _apply_lgbm_feature_scalers(test_data, model.scalers)
+            encoded_feature_cache[cache_key] = encode_lgbm_features(
+                encoder=model.encoder,
+                data=test_data,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+            )
+        test_preds.append(
+            predict_lgbm(
+                args,
+                model,
+                scaler,
+                test_data,
+                encoded_feature_cache[cache_key],
+            )
+        )
+    individual_preds = np.stack(test_preds, axis=2)
+    preds = np.mean(individual_preds, axis=2)
     
     # Save results
     if save_results:
@@ -454,16 +909,6 @@ def predict_and_save_lgbm(
         assert len(test_data) == len(preds)
 
         makedirs(args.preds_path, isfile=True)
-
-        # Set multiclass column names, update num_tasks definitions
-        if args.dataset_type == "multiclass":
-            original_task_names = task_names
-            task_names = [
-                f"{name}_class_{i}"
-                for name in task_names
-                for i in range(args.multiclass_num_classes)
-            ]
-            num_tasks = num_tasks * args.multiclass_num_classes
 
         # Copy predictions over to full_data
         for full_index, datapoint in enumerate(full_data):
@@ -475,14 +920,7 @@ def predict_and_save_lgbm(
             else:
                 d_preds = ["Invalid SMILES"] * num_tasks
                 if args.individual_ensemble_predictions:
-                    ind_preds = [["Invalid SMILES"] * len(args.checkpoint_paths)] * num_tasks
-            # Reshape multiclass to merge task and class dimension, with updated num_tasks
-            if args.dataset_type == "multiclass":
-                d_preds = np.array(d_preds).reshape((num_tasks))
-                if args.individual_ensemble_predictions:
-                    ind_preds = ind_preds.reshape(
-                        (num_tasks, len(args.checkpoint_paths))
-                    )
+                    ind_preds = [["Invalid SMILES"] * len(models) for _ in range(num_tasks)]
 
             # If extra columns have been dropped, add back in SMILES columns
             if args.drop_extra_columns:
@@ -504,9 +942,19 @@ def predict_and_save_lgbm(
                     for idx, pred in enumerate(model_preds):
                         datapoint.row[pred_name + f"_model_{idx}"] = pred
 
-        # Save
+        fieldnames = list(args.smiles_columns) + list(task_names)
+        if args.individual_ensemble_predictions:
+            fieldnames.extend(
+                f"{task_name}_model_{model_index}"
+                for task_name in task_names
+                for model_index in range(len(models))
+            )
+        if len(full_data) > 0:
+            fieldnames = list(full_data[0].row.keys())
+
+        # Save, including a header-only file for a truly empty input dataset.
         with open(args.preds_path, 'w', newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=full_data[0].row.keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
 
             for datapoint in full_data:
@@ -517,13 +965,13 @@ def predict_and_save_lgbm(
         for full_index in range(len(full_data)):
             valid_index = full_to_valid_indices.get(full_index, None)
             if valid_index is not None:
-                pred = preds[valid_index]
+                pred = preds[valid_index].tolist()
             else:
                 pred = ["Invalid SMILES"] * num_tasks
             full_preds.append(pred)
         return full_preds
     else:
-        return preds
+        return preds.tolist()
 
 
 @timeit()
@@ -575,7 +1023,9 @@ def make_predictions(
     set_features(args, train_args)
 
     # Note: to get the invalid SMILES for your data, use the get_invalid_smiles_from_file or get_invalid_smiles_from_list functions from data/utils.py
-    full_data, test_data, test_data_loader, full_to_valid_indices = load_data(args, smiles)
+    full_data, test_data, test_data_loader, full_to_valid_indices = load_data(
+        args, smiles, train_args=train_args
+    )
 
     if args.uncertainty_method is not None and args.calibration_method in [
         "conformal_regression",
@@ -624,6 +1074,14 @@ def make_predictions(
             loss_function=args.loss_function,
         )
 
+        validate_prediction_feature_schema(
+            args=args,
+            train_args=train_args,
+            full_data=calibration_data,
+            valid_data=calibration_data,
+            input_label="Calibration",
+        )
+
         calibration_data_loader = MoleculeDataLoader(
             dataset=calibration_data,
             batch_size=args.batch_size,
@@ -658,8 +1116,13 @@ def make_predictions(
 
     # Edge case if empty list of smiles is provided
     if len(test_data) == 0:
-        preds = [None] * len(full_data)
-        unc = [None] * len(full_data)
+        preds, unc = _save_no_valid_ffn_predictions(
+            args=args,
+            full_data=full_data,
+            task_names=task_names,
+            calibrator=calibrator,
+            return_invalid_smiles=return_invalid_smiles,
+        )
     else:
         preds, unc = predict_and_save(
             args=args,
@@ -707,7 +1170,7 @@ def make_predictions_lgbm(
     model_objects: Tuple[
         PredictArgs,
         TrainArgs,
-        List[MoleculeModel],
+        List[LightGBMModelBundle],
         List[Union[StandardScaler, AtomBondScaler]],
         int,
         List[str],
@@ -717,7 +1180,14 @@ def make_predictions_lgbm(
     return_index_dict: bool = False,
     return_uncertainty: bool = False,
 ) -> List[List[Optional[float]]]:
-    
+    """Makes predictions with one or more versioned LightGBM bundles."""
+    if return_uncertainty:
+        raise ValueError("LightGBM prediction does not provide uncertainty estimates.")
+    if calibrator is not None or getattr(args, "calibration_path", None) is not None:
+        raise ValueError("LightGBM prediction does not support uncertainty calibration.")
+    if getattr(args, "uncertainty_method", None) is not None:
+        raise ValueError("LightGBM prediction does not support uncertainty methods.")
+
     if model_objects:
         (
             args,
@@ -737,36 +1207,41 @@ def make_predictions_lgbm(
             task_names,
         ) = load_model_lgbm(args, generator=True)
 
+    models = list(models)
+    scalers = list(scalers)
     num_models = len(models)
 
     set_features(args, train_args)
 
     # Note: to get the invalid SMILES for your data, use the get_invalid_smiles_from_file or get_invalid_smiles_from_list functions from data/utils.py
     full_data, test_data, test_data_loader, full_to_valid_indices = load_data(
-        args, smiles
+        args, smiles, train_args=train_args
     )
 
-    # Edge case if empty list of smiles is provided
-    if len(test_data) == 0:
-        preds = [None] * len(full_data)
-        unc = [None] * len(full_data)
-    else:
-        preds = predict_and_save_lgbm(
-            args=args,
-            train_args=train_args,
-            test_data=test_data,
-            task_names=task_names,
-            num_tasks=num_tasks,
-            test_data_loader=test_data_loader,
-            full_data=full_data,
-            full_to_valid_indices=full_to_valid_indices,
-            models=models,
-            scalers=scalers,
-            num_models=num_models,
-            calibrator=calibrator,
-            return_invalid_smiles=return_invalid_smiles,
-        )
-        
+    # This also handles all-invalid and truly empty inputs, including CSV output.
+    preds = predict_and_save_lgbm(
+        args=args,
+        train_args=train_args,
+        test_data=test_data,
+        task_names=task_names,
+        num_tasks=num_tasks,
+        test_data_loader=test_data_loader,
+        full_data=full_data,
+        full_to_valid_indices=full_to_valid_indices,
+        models=models,
+        scalers=scalers,
+        num_models=num_models,
+        calibrator=calibrator,
+        return_invalid_smiles=return_invalid_smiles,
+    )
+
+    if return_index_dict:
+        if return_invalid_smiles:
+            return {index: prediction for index, prediction in enumerate(preds)}
+        return {
+            full_index: preds[valid_index]
+            for full_index, valid_index in full_to_valid_indices.items()
+        }
     return preds
 
 
@@ -775,9 +1250,9 @@ def chemprop_predict() -> None:
 
     This is the entry point for the command line command :code:`chemprop_predict`.
     """
-    args=PredictArgs().parse_args()
+    args = PredictArgs().parse_args()
     
     if args.model_type == 'FFN':
-        make_predictions(args=PredictArgs().parse_args())
+        make_predictions(args=args)
     elif args.model_type == 'lgbm':
-        make_predictions_lgbm(args=PredictArgs().parse_args())
+        make_predictions_lgbm(args=args)

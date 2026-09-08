@@ -13,7 +13,7 @@ from sklearn.manifold import TSNE
 from tap import Tap
 from tqdm import tqdm
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from chemprop.data import get_smiles
 from chemprop.features import get_features_generator

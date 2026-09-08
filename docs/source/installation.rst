@@ -6,39 +6,43 @@ Installation
 Overview
 --------
 
-Chemprop can either be installed from PyPi via pip or from source (i.e., directly from the git repo). The PyPi version includes a vast majority of Chemprop functionality, but some functionality is only accessible when installed from source.
+Install this maintained v1 build directly from the fork's source tree. The
+package named ``chemprop`` on PyPI is the upstream project and does not contain
+the maintenance fixes and feature generators documented here.
+
+.. note::
+   The Kuroki-maintained v1 build is available from this fork's source tree,
+   not from the upstream ``chemprop`` package on PyPI.
 
 Conda
 -----
 
 Both options require conda, so first install Miniconda from `<https://conda.io/miniconda.html>`_.
 
-Then proceed to either option below to complete the installation. Note that on machines with GPUs, you may need to manually install a GPU-enabled version of PyTorch by following the instructions `here <https://pytorch.org/get-started/locally/>`_.
+The committed environment targets Python 3.10 and installs the official
+PyTorch 2.6.0 CUDA 12.4 wheel. A CUDA 12.5-capable NVIDIA driver is backward
+compatible with this cu124 runtime.
 
-Option 1: Installing from PyPi
-------------------------------
+Installing from source
+----------------------
 
-1. :code:`conda create -n chemprop python=3.8`
-2. :code:`conda activate chemprop`
-3. :code:`conda install -c conda-forge rdkit`
-4. :code:`pip install git+https://github.com/bp-kelley/descriptastorus`
-5. :code:`pip install chemprop`
-
-Option 2: Installing from source
---------------------------------
-
-1. :code:`git clone https://github.com/chemprop/chemprop.git`
+1. :code:`git clone https://github.com/Kuroki-A/chemprop.git`
 2. :code:`cd chemprop`
 3. :code:`conda env create -f environment.yml`
-4. :code:`conda activate chemprop`
-5. :code:`pip install -e .`
+4. :code:`conda activate chemprop310-cu124`
+5. :code:`python -m pip check`
+6. :code:`python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"`
+
+The expected GPU check is :code:`2.6.0+cu124`, :code:`12.4`, and
+:code:`True`. The editable Chemprop installation is already performed by the
+environment file.
 
 Docker
 ------
 
 Chemprop can also be installed with Docker. Docker makes it possible to isolate the Chemprop code and environment. To install and run our code in a Docker container, follow these steps:
 
-1. :code:`git clone https://github.com/chemprop/chemprop.git`
+1. :code:`git clone https://github.com/Kuroki-A/chemprop.git`
 2. :code:`cd chemprop`
 3. Install Docker from `<https://docs.docker.com/install/>`_
 4. :code:`docker build -t chemprop .`
@@ -47,6 +51,6 @@ Chemprop can also be installed with Docker. Docker makes it possible to isolate 
 Note that you will need to run the latter command with nvidia-docker if you are on a GPU machine in order to be able to access the GPUs.
 Alternatively, with Docker 19.03+, you can specify the :code:`--gpus` command line option instead.
 
-In addition, you will also need to ensure that the CUDA toolkit version in the Docker image is compatible with the CUDA driver on your host machine.
-Newer CUDA driver versions are backward-compatible with older CUDA toolkit versions.
-To set a specific CUDA toolkit version, add :code:`cudatoolkit=X.Y` to :code:`environment.yml` before building the Docker image.
+The container CUDA runtime must be compatible with the host NVIDIA driver.
+This repository uses the PyTorch cu124 wheel rather than a conda
+:code:`cudatoolkit` dependency.

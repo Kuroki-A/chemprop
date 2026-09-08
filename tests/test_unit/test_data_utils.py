@@ -156,6 +156,20 @@ class TestGetTaskNames(TestCase):
         )
         self.assertEqual(task_names, ['column1', 'column3'])
 
+    def test_quantile_interval_duplicates_specified_target_columns(self):
+        """Explicit targets still need lower and upper quantile heads."""
+        task_names = get_task_names(
+            path='dummy_path.txt',
+            smiles_columns=None,
+            target_columns=['column1', 'column3'],
+            ignore_columns=None,
+            loss_function='quantile_interval',
+        )
+        self.assertEqual(
+            task_names,
+            ['column1', 'column3', 'column1', 'column3'],
+        )
+
     def test_ignore_columns(self):
         """Test behavior with ignore columns specified"""
         task_names = get_task_names(
@@ -251,6 +265,25 @@ class TestGetDataWeights(TestCase):
             f.write('weights\n3\n-1\n2\n2\n2')
         with self.assertRaises(ValueError):
             weights = get_data_weights(path)
+
+    def test_invalid_weight_sets(self):
+        """Reject weights that cannot define a finite non-negative average."""
+        for filename, contents in {
+            'all_negative.csv': 'weights\n-1\n-2',
+            'all_zero.csv': 'weights\n0\n0',
+            'zero_sum.csv': 'weights\n1\n-1',
+            'nan.csv': 'weights\nnan\n1',
+            'inf.csv': 'weights\ninf\n1',
+            'empty.csv': 'weights\n',
+            'no_header.csv': '',
+            'blank_row.csv': 'weights\n\n',
+            'two_columns.csv': 'weights\n1,2\n',
+        }.items():
+            path = os.path.join(self.temp_dir.name, filename)
+            with open(path, 'w') as f:
+                f.write(contents)
+            with self.subTest(filename=filename), self.assertRaises(ValueError):
+                get_data_weights(path)
 
     def tearDown(self):
         self.temp_dir.cleanup()

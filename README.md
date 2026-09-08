@@ -1,17 +1,21 @@
 ![ChemProp Logo](logo/chemprop_logo.svg)
 # Chemprop
 
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/chemprop)](https://badge.fury.io/py/chemprop)
-[![PyPI version](https://badge.fury.io/py/chemprop.svg)](https://badge.fury.io/py/chemprop)
-[![Anaconda-Server Badge](https://anaconda.org/conda-forge/chemprop/badges/version.svg)](https://anaconda.org/conda-forge/chemprop)
-[![Build Status](https://github.com/chemprop/chemprop/workflows/tests/badge.svg)](https://github.com/chemprop/chemprop/actions/workflows/tests.yml)
-[![Documentation Status](https://readthedocs.org/projects/chemprop/badge/?version=latest)](https://chemprop.readthedocs.io/en/latest/?badge=latest)
+[![Version](https://img.shields.io/badge/version-1.7.1%2Bkuroki.1-blue)](CHANGELOG.md)
+[![Python](https://img.shields.io/badge/python-3.10-blue)](setup.py)
+[![Build Status](https://github.com/Kuroki-A/chemprop/workflows/tests/badge.svg)](https://github.com/Kuroki-A/chemprop/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Downloads](https://static.pepy.tech/badge/chemprop)](https://pepy.tech/project/chemprop)
-[![Downloads](https://static.pepy.tech/badge/chemprop/month)](https://pepy.tech/project/chemprop)
-[![Downloads](https://static.pepy.tech/badge/chemprop/week)](https://pepy.tech/project/chemprop)
 
 Chemprop is a repository containing message passing neural networks for molecular property prediction.
+
+> [!IMPORTANT]
+> This repository is the Kuroki-maintained Chemprop v1 line (`1.7.1+kuroki.1`).
+> It intentionally retains the v1 command line and checkpoint interfaces while
+> carrying local correctness, LightGBM, security, dependency, and feature-generation
+> fixes. Install this fork from source; the `chemprop` package on PyPI is the
+> upstream project and is not this maintenance build.
+
+See [CHANGELOG.md](CHANGELOG.md) for fixes and checkpoint compatibility notes.
 
 **License:** Chemprop is free to use under the [MIT License](LICENSE.txt). The Chemprop logo is free to use under [CC0 1.0](logo/LICENSE.txt).
 
@@ -34,8 +38,7 @@ Chemprop is a repository containing message passing neural networks for molecula
 - [Tutorials and Examples](#tutorials-and-examples)
 - [Requirements](#requirements)
 - [Installation](#installation)
-  * [Option 1: Installing from PyPi](#option-1-installing-from-pypi)
-  * [Option 2: Installing from source](#option-2-installing-from-source)
+  * [Installing from source](#installing-from-source)
   * [Docker](#docker)
 - [Known Issues](#known-issues)
 - [Web Interface](#web-interface)
@@ -46,6 +49,7 @@ Chemprop is a repository containing message passing neural networks for molecula
   * [Loss functions](#loss-functions)
   * [Metrics](#metrics)
   * [Cross validation and ensembling](#cross-validation-and-ensembling)
+  * [LightGBM heads](#lightgbm-heads)
   * [Aggregation](#aggregation)
   * [Additional Features](#additional-features)
     * [Custom Features](#molecule-level-custom-features)
@@ -75,9 +79,10 @@ Chemprop is a repository containing message passing neural networks for molecula
 
 ## Documentation
 
-* Documentation of Chemprop is available at https://chemprop.readthedocs.io/en/latest/. Note that this site is several versions behind. An up-to-date version of Read the Docs is forthcoming with the release of Chemprop v2.0.
-* This README is currently the best source for documentation on more recently-added features.
-* Please also see descriptions of all the possible command line arguments in our [`args.py`](https://github.com/chemprop/chemprop/blob/master/chemprop/args.py) file.
+* This README and the versioned files under [`docs/source`](docs/source) are the
+  authoritative documentation for this maintained v1 fork. Build the local
+  HTML documentation with `python -m sphinx -W -b html docs/source docs/build`.
+* Please also see descriptions of all the possible command line arguments in our [`args.py`](https://github.com/Kuroki-A/chemprop/blob/master/chemprop/args.py) file.
 
 ## Tutorials and Examples
 
@@ -92,81 +97,60 @@ Chemprop is a repository containing message passing neural networks for molecula
 
 For small datasets (~1000 molecules), it is possible to train models within a few minutes on a standard laptop with CPUs only. However, for larger datasets and larger Chemprop models, we recommend using a GPU for significantly faster training.
 
-To use `chemprop` with GPUs, you will need:
- * cuda >= 8.0
- * cuDNN
+This maintained environment targets Python 3.10 and PyTorch 2.6.0 with the
+official CUDA 12.4 wheel. A CUDA 12.5-capable NVIDIA driver can run the cu124
+wheel; a separately installed system CUDA toolkit is not required by the
+PyTorch wheel.
 
 ## Installation
 
-Chemprop can either be installed from PyPi via pip or from source (i.e., directly from this git repo). The PyPi version includes a vast majority of Chemprop functionality, but some functionality is only accessible when installed from source.
+Install this maintained v1 build directly from this repository. The package named
+`chemprop` on PyPI is the upstream project and does not contain the fixes and
+feature generators documented here.
 
 Both options require conda, so first install Miniconda from [https://conda.io/miniconda.html](https://conda.io/miniconda.html).
 
-Then proceed to either option below to complete the installation. If installing the environment with conda seems to be taking too long, you can also try running `conda install -c conda-forge mamba` and then replacing `conda` with `mamba` in each of the steps below.
+If installing the environment with conda seems to be taking too long, you can
+also try running `conda install -c conda-forge mamba` and then replacing
+`conda` with `mamba` in the steps below.
 
-**Note for machines with GPUs:** You may need to manually install a GPU-enabled version of PyTorch by following the instructions [here](https://pytorch.org/get-started/locally/). If you're encountering issues with Chemprop not using a GPU on your system after following the instructions below, check which version of PyTorch you have installed in your environment using `conda list | grep torch` or similar. If the PyTorch line includes `cpu`, please uninstall it using `conda remove pytorch` and reinstall a GPU-enabled version using the instructions at the link above.
+The committed environment installs `torch==2.6.0+cu124` from PyTorch's
+official wheel index. PyTorch 2.6.0 is the newest release for which a cu124
+wheel is published; newer PyTorch releases use newer CUDA wheel series.
 
-### Option 1: Installing from PyPi
-
-1. `conda create -n chemprop python=3.8`
-2. `conda activate chemprop`
-3. `pip install chemprop`
-
-> [!NOTE]  
-> Some features that were not made available in the main releases of Chemprop are instead available through 'feature releases' via PyPI: 
-> - SSL Pre-train with DDP - available in version `1.6.1.dev0`, install with `pip install chemprop==1.6.1.dev0`. Also available to be installed from source using the `sslddpv1` branch. Authored by Jiali Li, Kevin Greenman, and Shomik Verma.
-
-### Option 2: Installing from source
+### Installing from source
 
 1. `git clone https://github.com/Kuroki-A/chemprop.git`
 2. `cd chemprop`
-3. `conda create -y -n chemprop python=3.10 pip=24.0`
-4. `conda activate chemprop`
-5. `pip install -e .`
-6. `pip install "molfeat[all]"`
-7. Download the appropriate version of torch for your CUDA from [here](https://download.pytorch.org/whl/torch/)
-8. `pip install torch-2.6.0+cu124-cp310-cp310-linux_x86_64.whl torchdata==0.9.0 dgl==1.1.0`
+3. `conda env create -f environment.yml`
+4. `conda activate chemprop310-cu124`
+5. `python -m pip check`
 
- #### Check whether 'torch' can recognize 'gpu' or not
- 8. `cd ~`
- 9. `python`
- 10. `import torch`
- 11. `torch.tensor([0.1, 0.2]).cuda()`
-    If an error occurs, install the appropriate version of torch from [here](https://download.pytorch.org/whl/torch/).
-    (If 'CUDA' version is 12.4, `pip install torch-2.6.0+cu124-cp310-cp310-linux_x86_64.whl`)
- 12. `quit()`
+ #### Check whether `torch` can recognize the GPU
+6. `python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"`
+
+The expected values are `2.6.0+cu124`, `12.4`, and `True`. The environment
+already installs this checkout in editable mode. For a CPU-only CI or
+workstation, install `torch==2.6.0` from
+`https://download.pytorch.org/whl/cpu` before `pip install -e .`.
 
 ### Docker
 
 Chemprop can also be installed with Docker.
-Docker makes it possible to isolate the Chemprop code and environment.
-You can either pull a pre-built image or build it locally.
+Docker makes it possible to isolate the Chemprop code and environment. This
+fork does not publish a pre-built image, so build it locally.
 
 Note that regardless of installation method you will need to run the `docker run` command with the `--gpus` command line flag to access GPUs on your machine.
 
-In addition, you will also need to ensure that the CUDA toolkit version in the Docker image is compatible with the CUDA driver on your host machine.
-Newer CUDA driver versions are backward-compatible with older CUDA toolkit versions.
-To set a specific CUDA toolkit version, add `cudatoolkit=X.Y` to `environment.yml` before building the Docker image.
-
-#### Pull Pre-Built
-
-Run this command to download and run a given release version of Chemprop:
-
-`docker run -it chemprop/chemprop:X.Y.X`
-
-where `X.Y.Z` is the version you want to download, i.e. `1.7.0`.
-
-> [!NOTE]
-> Not all versions of Chemprop are available from DockerHub - see the [DockerHub](https://hub.docker.com/r/chemprop/chemprop/tags) page for a complete list of those available.
-
-DockerHub also has a `latest` tag - this is _not_ the latest release of Chemprop, but rather the latest version of `master` which is _not necessarily fit for deployment_.
-Use this tag only for development or if you need to access a feature which has not yet been formally released!
+The container CUDA runtime must be compatible with the host NVIDIA driver.
+This repository's conda environment uses the PyTorch cu124 wheel rather than a
+conda `cudatoolkit` package.
 
 #### Local Build
 
 To install and run our code in a Docker container, follow these steps:
 
-1. `git clone https://github.com/chemprop/chemprop.git`
+1. `git clone https://github.com/Kuroki-A/chemprop.git`
 2. `cd chemprop`
 3. Install Docker from [https://docs.docker.com/install/](https://docs.docker.com/install/)
 4. `docker build -t chemprop .`
@@ -174,7 +158,12 @@ To install and run our code in a Docker container, follow these steps:
 
 ## Known Issues
 
-As we approach the upcoming release of Chemprop v2.0, we have closed [several issues](https://github.com/chemprop/chemprop/issues?q=label%3Av1-wontfix+) corresponding to bugs that we don't plan to fix before the final release of v1 (v1.7). We will be discontinuing support for v1 once v2 is released, but we still appreciate bug reports and will tag them as [`v1-wontfix`](https://github.com/chemprop/chemprop/issues?q=label%3Av1-wontfix+) so the community can find them easily.
+The upstream project has moved to its rewritten v2 line and discontinued v1
+support. This fork deliberately maintains the v1 CLI and checkpoint interfaces;
+report fork-specific regressions through the
+[Kuroki-A/chemprop issue tracker](https://github.com/Kuroki-A/chemprop/issues).
+The upstream [`v1-wontfix`](https://github.com/chemprop/chemprop/issues?q=label%3Av1-wontfix+)
+list remains useful historical context.
 
 ## Web Interface
 
@@ -184,6 +173,16 @@ For those less familiar with the command line, Chemprop also includes a web inte
 
 Run `chemprop_web` (or optionally `python web.py` if installed from source) and then navigate to [localhost:5000](http://localhost:5000) in a web browser.
 
+The legacy v1 web interface is loopback-only by default. Checkpoint upload is
+also disabled by default because PyTorch v1 checkpoints are pickle-based. Only
+trusted local checkpoint files may be enabled with
+`--allow_checkpoint_uploads`. To bind to a non-loopback interface, explicitly
+pass `--allow_remote`, set `CHEMPROP_WEB_PASSWORD` to at least 16 characters
+and `CHEMPROP_WEB_SECRET_KEY` to at least 32 bytes, and terminate HTTPS in a
+reverse proxy. Remote mode rejects debug mode and checkpoint upload. Generate
+independent random values with, for example,
+`python -c "import secrets; print(secrets.token_hex(32))"`.
+
 ### Gunicorn
 
 Gunicorn is only available for a UNIX environment, meaning it will not work on Windows. It is not installed by default with the rest of Chemprop, so first run:
@@ -192,7 +191,12 @@ Gunicorn is only available for a UNIX environment, meaning it will not work on W
 pip install gunicorn
 ```
 
-Next, navigate to `chemprop/web` and run `gunicorn --bind {host}:{port} 'wsgi:build_app()'`. This will start the site in production mode.
+For local use, bind explicitly to loopback with
+`gunicorn --bind 127.0.0.1:5000 'chemprop.web.wsgi:build_app()'`. For an HTTPS
+reverse proxy, use
+`'chemprop.web.wsgi:build_app(allow_remote=True)'` with the two security
+environment variables above. Never publish the local/default-mode socket
+through a reverse proxy because the proxy itself appears as a loopback client.
    * To run this server in the background, add the `--daemon` flag.
    * Arguments including `init_db` and `demo` can be passed with this pattern: `'wsgi:build_app(init_db=True, demo=True)'` 
    * Gunicorn documentation can be found [here](http://docs.gunicorn.org/en/stable/index.html).
@@ -240,7 +244,7 @@ For example:
 chemprop_train --data_path data/tox21.csv --dataset_type classification --save_dir tox21_checkpoints
 ```
 
-A full list of available command-line arguments can be found in [chemprop/args.py](https://github.com/chemprop/chemprop/blob/master/chemprop/args.py).
+A full list of available command-line arguments can be found in [chemprop/args.py](https://github.com/Kuroki-A/chemprop/blob/master/chemprop/args.py).
 
 If installed from source, `chemprop_train` can be replaced with `python train.py`.
 
@@ -248,6 +252,37 @@ Notes:
 * The default metric for classification is AUC and the default metric for regression is RMSE. Other metrics may be specified with `--metric <metric>`.
 * `--save_dir` may be left out if you don't want to save model checkpoints.
 * `--quiet` can be added to reduce the amount of debugging information printed to the console. Both a quiet and verbose version of the logs are saved in the `save_dir`.
+
+### LightGBM Heads
+
+For regression and binary classification, `--model_type lgbm` trains one
+LightGBM booster per task on a frozen molecular encoder. The exact encoder,
+feature scalers, task boosters, and training metadata are stored together in
+versioned `.pkl` bundles, so prediction uses the same feature space as training.
+Missing multitask labels and ensembles are supported.
+
+For a deterministic descriptor-only baseline, using a fingerprint as the
+encoder input is recommended:
+
+```bash
+chemprop_train --data_path data.csv --dataset_type regression \
+  --model_type lgbm --features_generator morgan --features_only \
+  --save_dir lgbm_checkpoints
+
+chemprop_predict --test_path test.csv --checkpoint_dir lgbm_checkpoints \
+  --features_generator morgan --preds_path predictions.csv
+```
+
+Prediction automatically recognizes directories containing only LightGBM
+`.pkl` bundles. Important tuning flags include `--lgbm_num_boost_round`,
+`--lgbm_early_stopping_rounds`, `--lgbm_learning_rate`, `--lgbm_num_leaves`,
+`--lgbm_feature_fraction`, `--lgbm_bagging_fraction`,
+`--lgbm_min_data_in_leaf`, and `--lgbm_num_threads`. LightGBM currently
+supports mean-squared-error regression and binary-cross-entropy
+classification. Checkpoint warm-starting and `chemprop_hyperopt` are rejected
+explicitly for this backend; tune it with the `--lgbm_*` options instead.
+`--target_weights` is also rejected because each target is fit by an
+independent booster; row-wise `--data_weights_path` remains supported.
 
 ### Train/Validation/Test Splits
 
@@ -278,7 +313,7 @@ The regression loss functions `mve` and `evidential` function by minimizing the 
 
 ### Metrics
 
-Metrics are used to evaluate the success of the model against the test set as the final model score and to determine the optimal epoch to save the model at based on the validation set. The primary metric used for both purposes is selected with the argument `--metric <metric>` and additional metrics for test set score only can be added with `--extra_metrics <metric1> <metric2> ...`. Supported metrics are dependent on the dataset type. Unlike loss functions, metrics do not have to be differentiable.
+Metrics are used to evaluate the success of the model against the test set as the final model score and to determine the optimal epoch to save the model at based on the validation set. The primary metric used for both purposes is selected with the argument `--metric <metric>` and additional reported validation/test metrics can be added with `--extra_metrics <metric1> <metric2> ...`; only the primary metric selects the best epoch. Supported metrics are dependent on the dataset type. Unlike loss functions, metrics do not have to be differentiable.
 * **Regression.** rmse (default), mae, mse, r2, bounded_rmse, bounded_mae, bounded_mse (default if bounded_mse is loss function), quantile (average of pinball loss for both output heads).
 * **Classification.** auc (default), prc-auc, accuracy, binary_cross_entropy, f1, mcc, recall, precision and balanced accuracy.
 * **Multiclass.** cross_entropy (default), accuracy, f1, mcc.
@@ -310,12 +345,115 @@ If you install from source, you can modify the code to load custom features as f
 
 As a starting point, we recommend using pre-normalized RDKit features by using the `--features_generator rdkit_2d_normalized --no_features_scaling` flags. In general, we recommend NOT using the `--no_features_scaling` flag (i.e. allow the code to automatically perform feature scaling), but in the case of `rdkit_2d_normalized`, those features have been pre-normalized and don't require further scaling. The utilization of the `rdkit_2d_normalized` should be avoided in cases where molecule-level custom features have been loaded and necessitate additional scaling.
 
-The full list of available features for `--features_generator` is as follows. 
+The most useful available generators are:
 
-`morgan` is binary Morgan fingerprints, radius 2 and 2048 bits.
-`morgan_count` is count-based Morgan, radius 2 and 2048 bits.
-`rdkit_2d` is an unnormalized version of 200 assorted rdkit descriptors. Full list can be found at the bottom of our paper: https://arxiv.org/pdf/1904.01561.pdf
-`rdkit_2d_normalized` is the CDF-normalized version of the 200 rdkit descriptors.
+- RDKit fingerprints: `morgan`, `morgan_count`, `maccs`, `rdkit`, `avalon`,
+  `atompair`, `erg`, and the non-truncating `erg_float`.
+- RDKit/descriptastorus descriptors: `rdkit_2d`,
+  `rdkit_2d_normalized`, their `_wo_fr` variants, `rdkit_2d_208`,
+  `rdkit_2d_400`, `rdkit_2d_autocorr`, `rdkit_2d_bcut`, and
+  version-dependent `rdkit_2d_all`.
+- [Molfeat](https://molfeat-docs.datamol.io/stable/tutorials/types_of_featurizers.html)
+  2D/scaffold/pharmacophore features: `fcfp`, `fcfp_count`, `topological`,
+  `topological_count`, `layered`, `avalon_count`, `rdkit_count`,
+  `atompair_count`, `pattern`, `estate`, `secfp`, `cats2d`, `scaffoldkeys`, and
+  `pharm2d`.
+- Direct MAP4 implementations: legacy/Molfeat-compatible `map4` and native
+  `map4_v1_1`.
+- Optional descriptor suites: `mordred` and `padelpy`, plus the registered
+  Molfeat pretrained representations shown by `chemprop_train --help`.
+
+Install `.[features]` for the stable local descriptor backends. Pretrained
+Molfeat models are intentionally separate because Molfeat 0.11 constrains some
+of their Transformer and DGL dependencies to older versions; install
+`.[features-pretrained]` only when those registered models are needed.
+`.[features-all]` remains an alias for compatibility. Optional packages are
+loaded only when their generator is selected, so Morgan/RDKit startup remains
+lightweight. Three-dimensional Molfeat generators are intentionally not
+registered because Chemprop's SMILES input does not define reproducible
+conformers. The conda environment also supplies OpenJDK 17, which is required
+when `padelpy` invokes PaDEL-Descriptor.
+
+Feature generation during `get_data()` is chunked, deduplicates exact
+atom-order-preserving structures within a dataset, and preserves the v1
+generator/SMILES-column concatenation order. For reusable offline features:
+
+```bash
+python scripts/save_features.py --data_path data.csv \
+  --features_generator rdkit_2d_normalized --save_path features.npz
+```
+
+The script uses native batches or bounded multiprocessing, persists bounded
+chunks for restart, and consolidates them through a disk-backed array rather
+than retaining the full feature matrix as Python objects. It writes a sidecar
+manifest containing the ordered input hash, generator configuration, feature
+schema, dependency versions, and resumable progress.
+
+##### MAP4 compatibility
+
+`map4` is the recommended compatibility generator. It canonicalizes each
+molecule and reproduces the folded 2,048-bit [MAP4 v1.0
+algorithm](https://github.com/reymond-group/map4/tree/v1.0) expected by Molfeat
+0.11, including lexicographic atom-environment ordering. This implementation
+uses RDKit and MHFP directly; the obsolete MAP4 v1.0 package and its `tmap`
+dependency are not installed. The environment deliberately retains
+`map4==1.1.3`, and a compatibility adapter supplies the old class name needed
+when Molfeat imports its fingerprint modules.
+
+`map4_v1_1` also canonicalizes each molecule, but calls the native `map4`
+1.1.3 implementation with its length-based shingle ordering. The two
+generators are **not bit compatible**; neither one should be substituted for
+the other after a model has been trained or an offline feature file has been
+generated. Both Chemprop generators retain every disconnected input fragment;
+unlike the upstream v1.0 command-line `--clean-mols` behavior, they do not
+silently strip a salt or select only the largest fragment. This policy is also
+stored in feature/checkpoint metadata.
+
+To opt in to the native `map4` 1.1.3 behavior, select `map4_v1_1` explicitly
+at every relevant step:
+
+```bash
+chemprop_train --data_path data.csv --dataset_type regression \
+  --features_generator map4_v1_1 --save_dir map4_v1_1_checkpoints
+
+chemprop_predict --test_path test.csv --checkpoint_dir map4_v1_1_checkpoints \
+  --features_generator map4_v1_1 --preds_path predictions.csv
+
+python scripts/save_features.py --data_path data.csv \
+  --features_generator map4_v1_1 --save_path map4_v1_1_features.npz
+```
+
+For a large offline feature job, an explicit worker count selects Chemprop's
+persistent process pool instead of the low-overhead serial batch path:
+
+```bash
+python scripts/save_features.py --data_path data.csv \
+  --features_generator map4_v1_1 --num_workers 4 \
+  --save_path map4_v1_1_features.npz
+```
+
+Choose the worker count for available RAM; each worker loads its own backend.
+Small jobs are generally better left without `--num_workers`.
+
+Use `--features_generator map4` instead for the legacy/Molfeat-compatible
+definition. Always use the same generator name for training and prediction;
+new checkpoints and feature manifests record the generator configuration and
+reject detectable schema drift.
+
+An older development checkpoint may record the name `map4` even if it was
+created through the former map4 1.1 compatibility adapter. That path used the
+v1.1 shingle rule but did not apply the whole-molecule canonicalization used
+now, so even numerical compatibility with `map4_v1_1` is not guaranteed.
+Changing only the prediction flag is unsafe and is intentionally rejected.
+Retrain that model with the explicit `map4_v1_1` name (recommended), or migrate
+the checkpoint and its feature provenance only after independently confirming
+the original vectors.
+
+> [!WARNING]
+> This maintenance version fixes selected-feature handling for reaction data.
+> A legacy reaction checkpoint trained with `selected_features_path` may have
+> used the full reactant descriptor vector because of the old bug. Such a
+> checkpoint can report a feature-width mismatch and should be retrained.
 
 #### Atom-Level Features
 
@@ -424,6 +562,14 @@ Using the `--data_weights_path` argument followed by a path to a data file conta
 
 ### Caching
 
+`--use_cache` additionally stores the fully loaded dataset in a
+content-addressed `.chemprop_cache` directory. Set `CHEMPROP_CACHE_DIR` to an
+alternate directory if needed. These files use Python pickle internally and
+must be treated as trusted local artifacts: the cache directory must be owned
+by the current user, must have mode `0700`, and must not be shared with
+untrusted users. The loader rejects symbolic links and insecure ownership or
+permissions before deserialization.
+
 By default, the molecule objects created from each SMILES string are cached for all dataset sizes, and the graph objects created from each molecule object are cached for datasets up to 10000 molecules. If memory permits, you may use the keyword `--cache_cutoff inf` to set this cutoff from 10000 to infinity to always keep the generated graphs in cache (or to another integer value for custom behavior). This may speed up training (depending on the dataset size, molecule size, number of epochs and GPU support), since the graphs do not need to be recreated each epoch, but increases memory usage considerably. Below the cutoff, graphs are created sequentially in the first epoch. Above the cutoff, graphs are created in parallel (on `--num_workers <int>` workers) for each epoch. If training on a GPU, training without caching and creating graphs on the fly in parallel is often preferable. On CPU, training with caching if often preferable for medium-sized datasets and a very low number of CPUs. If a very large dataset causes memory issues, you might turn off caching even of the molecule objects via the commands `--no_cache_mol` to reduce memory usage further.
 
 ## Predicting
@@ -510,7 +656,10 @@ Once hyperparameter optimization is complete, the optimal hyperparameters can be
 chemprop_train --data_path <data_path> --dataset_type <type> --config_path <config_path>
 ```
 
-Note that the hyperparameter optimization script sees all the data given to it. The intended use is to run the hyperparameter optimization script on a dataset with the eventual test set held out. If you need to optimize hyperparameters separately for several different cross validation splits, you should e.g. set up a bash script to run hyperparameter_optimization.py separately on each split's training and validation data with test held out.
+Hyperparameter trials are selected only from validation scores and skip test
+evaluation. Keep an independent final test set and evaluate it once after the
+search. For multiple cross-validation splits, run the optimizer separately for
+each training/validation split while retaining the corresponding test fold.
 
 ### Choosing the Search Parameters
 
@@ -548,7 +697,7 @@ As part of the hyperopt search algorithm, the first trial configurations for the
 
 ### Manual Trials
 
-Manual training instances outside of hyperparameter optimization may also be considered in the history of attempted trials. The paths to the save_dirs for these training instances can be specified with `--manual_trial_dirs <list-of-directories>`. These directories must contain the files `test_scores.csv` and `args.json` as generated during training. To work appropriately, these training instances must be consistent with the parameter space being searched in hyperparameter optimization (including the hyperparameter optimization default of ffn_hidden_size being set equal to hidden_size). Manual trials considered with this argument are not added to the checkpoint directory.
+Manual training instances outside of hyperparameter optimization may also be considered in the history of attempted trials. The paths to the save_dirs for these training instances can be specified with `--manual_trial_dirs <list-of-directories>`. These directories must contain `args.json` and each fold's `fold_<n>/valid_scores.json`. Test scores are deliberately never used to select a hyperparameter trial. To work appropriately, these training instances must be consistent with the parameter space being searched in hyperparameter optimization (including the hyperparameter optimization default of ffn_hidden_size being set equal to hidden_size). Manual trials considered with this argument are not added to the checkpoint directory.
 
 ## Encode Fingerprint Latent Representation
 

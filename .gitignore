@@ -1,4 +1,8 @@
 *.pyc
+.ipynb_checkpoints/
+.chemprop_cache/
+# Local pre-refactor comparison retained by the maintainer; never package or release it.
+chemprop/features/_features_generators.py
 *.idea
 *.DS_Store
 *.vscode

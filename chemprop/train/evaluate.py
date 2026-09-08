@@ -83,34 +83,46 @@ def evaluate_predictions(preds: List[List[float]],
                 if not quantiles:
                     raise ValueError("quantile metric evaluation requires quantiles parameter")
                 for i, (valid_target, valid_pred) in enumerate(zip(valid_targets, valid_preds)):
+                    if len(valid_target) == 0:
+                        results[metric].append(float('nan'))
+                        continue
                     valid_target = np.concatenate(valid_target)
                     valid_pred = np.concatenate(valid_pred)
                     results[metric].append(metric_func(valid_target, valid_pred, quantiles[i]))
             else:
                 for valid_target, valid_pred in zip(valid_targets, valid_preds):
-                    results[metric].append(metric_func(valid_target, valid_pred))
+                    if len(valid_target) == 0:
+                        results[metric].append(float('nan'))
+                    else:
+                        results[metric].append(metric_func(valid_target, valid_pred))
     else:
         for i in range(num_tasks):
-            # # Skip if all targets or preds are identical, otherwise we'll crash during classification
-            if dataset_type == 'classification':
-                nan = False
-                if all(target == 0 for target in valid_targets[i]) or all(target == 1 for target in valid_targets[i]):
-                    nan = True
-                    info('Warning: Found a task with targets all 0s or all 1s')
-                if all(pred == 0 for pred in valid_preds[i]) or all(pred == 1 for pred in valid_preds[i]):
-                    nan = True
-                    info('Warning: Found a task with predictions all 0s or all 1s')
-
-                if nan:
-                    for metric in metrics:
-                        results[metric].append(float('nan'))
-                    continue
-
             if len(valid_targets[i]) == 0:
+                # Preserve the task axis even when this split has no labels for
+                # a task. Downstream fold aggregation and CSV column ordering
+                # rely on every metric containing exactly ``num_tasks`` values.
+                for metric in metrics:
+                    results[metric].append(float('nan'))
                 continue
 
+            # Only rank-based binary metrics require both target classes.
+            # Accuracy and loss metrics remain well-defined for a single-class
+            # split and must not be discarded along with AUC metrics. Constant
+            # predictions are likewise valid inputs for every supported metric.
+            single_class = (
+                dataset_type == 'classification'
+                and len(set(valid_targets[i])) < 2
+            )
+            if single_class:
+                info('Warning: Found a classification task with only one target class; '
+                     'AUC metrics will be reported as nan')
+
             for metric, metric_func in metric_to_func.items():
-                if dataset_type == 'multiclass' and metric == 'cross_entropy':
+                if single_class and metric in {'auc', 'prc-auc'}:
+                    results[metric].append(float('nan'))
+                elif dataset_type == 'classification' and metric == 'cross_entropy':
+                    results[metric].append(metric_func(valid_targets[i], valid_preds[i], labels=[0, 1]))
+                elif dataset_type == 'multiclass' and metric == 'cross_entropy':
                     results[metric].append(metric_func(valid_targets[i], valid_preds[i],
                                                     labels=list(range(len(valid_preds[i][0])))))
                 elif metric in ['bounded_rmse', 'bounded_mse', 'bounded_mae']:

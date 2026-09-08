@@ -1,7 +1,8 @@
+import os
 import threading
 from collections import OrderedDict
 from random import Random
-from typing import Dict, Iterator, List, Optional, Union, Tuple
+from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Union, Tuple
 
 import numpy as np
 import pandas as pd
@@ -10,19 +11,265 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from rdkit import Chem
 
 from .scaler import StandardScaler, AtomBondScaler
-from chemprop.features import get_features_generator
+from chemprop.features import generate_features_batch, get_features_generator
 from chemprop.features import BatchMolGraph, MolGraph
 from chemprop.features import is_explicit_h, is_reaction, is_adding_hs, is_mol, is_keeping_atom_map
+from chemprop.features.featurization import reaction_mode
 from chemprop.rdkit import make_mol
 
 # Cache of graph featurizations
 CACHE_GRAPH = True
-SMILES_TO_GRAPH: Dict[str, MolGraph] = {}
+SMILES_TO_GRAPH: Dict[Tuple[object, ...], MolGraph] = {}
 
 
 # Cache of RDKit molecules
 CACHE_MOL = True
-SMILES_TO_MOL: Dict[str, Union[Chem.Mol, Tuple[Chem.Mol, Chem.Mol]]] = {}
+SMILES_TO_MOL: Dict[Tuple[object, ...], Union[Chem.Mol, Tuple[Chem.Mol, Chem.Mol]]] = {}
+
+
+# Small, bounded cache for duplicate-SMILES molecular descriptors. Keeping this
+# separate from the graph cache avoids retaining an unbounded number of large
+# dense feature vectors during long-running processes.
+MAX_FEATURE_CACHE_SIZE = 1024
+FEATURES_CACHE: "OrderedDict[Tuple[object, ...], np.ndarray]" = OrderedDict()
+FEATURES_CACHE_LOCK = threading.Lock()
+
+
+# Parsed selected-feature files are shared by all datapoints. The file metadata
+# is part of the key so editing a CSV invalidates the cached mapping.
+SELECTED_FEATURES_CACHE: Dict[Tuple[str, int, int], Dict[str, Tuple[str, ...]]] = {}
+SELECTED_FEATURES_CACHE_LOCK = threading.Lock()
+
+
+class _CallableIdentity:
+    """Hashable identity wrapper for arbitrary (even unhashable) callables."""
+
+    __slots__ = ('value',)
+
+    def __init__(self, value) -> None:
+        self.value = value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, _CallableIdentity) and self.value is other.value
+
+
+def load_selected_feature_columns(path: str) -> Dict[str, Tuple[str, ...]]:
+    """Loads a selected-feature CSV once and returns generator-to-column mappings."""
+    resolved_path = os.path.abspath(os.path.expanduser(path))
+    stat = os.stat(resolved_path)
+    cache_key = (resolved_path, stat.st_mtime_ns, stat.st_size)
+
+    with SELECTED_FEATURES_CACHE_LOCK:
+        cached = SELECTED_FEATURES_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    selected_features_df = pd.read_csv(resolved_path)
+    mapping = {
+        column: tuple(str(value) for value in selected_features_df[column].dropna().values)
+        for column in selected_features_df.columns
+    }
+
+    with SELECTED_FEATURES_CACHE_LOCK:
+        # Discard stale entries for the same file before storing the new version.
+        stale_keys = [key for key in SELECTED_FEATURES_CACHE if key[0] == resolved_path]
+        for key in stale_keys:
+            SELECTED_FEATURES_CACHE.pop(key, None)
+        SELECTED_FEATURES_CACHE[cache_key] = mapping
+
+    return mapping
+
+
+def _feature_cache_key(features_generator: str,
+                       generator,
+                       mol: Chem.Mol,
+                       selected_feature_columns: Optional[Sequence[str]]) -> Tuple[object, ...]:
+    # Custom registry functions may depend on RDKit atom order. Canonicalizing
+    # the key would incorrectly merge inputs such as ``CO`` and ``OC`` even
+    # though their atom-0 features differ.
+    smiles = Chem.MolToSmiles(mol, canonical=False, isomericSmiles=True)
+    selected = None if selected_feature_columns is None else tuple(selected_feature_columns)
+    # Include the callable because register_features_generator intentionally
+    # permits replacing a name during extension/plugin development.
+    return features_generator, _CallableIdentity(generator), selected, smiles
+
+
+def _generate_features(features_generator_name: str,
+                       mol: Chem.Mol,
+                       selected_feature_columns: Optional[Sequence[str]]) -> np.ndarray:
+    """Generates molecular features with a small duplicate-SMILES LRU cache."""
+    generator = get_features_generator(features_generator_name)
+    key = _feature_cache_key(
+        features_generator_name, generator, mol, selected_feature_columns
+    )
+    with FEATURES_CACHE_LOCK:
+        cached = FEATURES_CACHE.get(key)
+        if cached is not None:
+            FEATURES_CACHE.move_to_end(key)
+            return cached.copy()
+
+    generated = np.asarray(
+        generator(mol, selected_feature_columns=selected_feature_columns)
+    )
+
+    with FEATURES_CACHE_LOCK:
+        FEATURES_CACHE[key] = generated.copy()
+        FEATURES_CACHE.move_to_end(key)
+        while len(FEATURES_CACHE) > MAX_FEATURE_CACHE_SIZE:
+            FEATURES_CACHE.popitem(last=False)
+
+    return generated
+
+
+def generate_features_for_smiles_batch(
+    smiles_rows: Sequence[Sequence[str]],
+    features_generators: Sequence[str],
+    selected_feature_columns: Mapping[str, Sequence[str]] = None,
+    use_atom_mapping_for_hydrogens: Union[bool, Sequence[bool]] = False,
+) -> List[np.ndarray]:
+    """Generates dataset features in chunks while preserving v1 concatenation order.
+
+    The historical :class:`MoleculeDatapoint` path loops over generators, rows,
+    and molecule columns one molecule at a time. This bulk path applies the
+    same molecule/reaction/H2 rules, deduplicates atom-order-preserving SMILES
+    within the dataset, invokes native batch transforms where available, and
+    scatters the results back into ``generator -> molecule column`` order for
+    each row.
+    """
+    if not features_generators:
+        return [np.empty(0, dtype=float) for _ in smiles_rows]
+
+    selected_feature_columns = selected_feature_columns or {}
+    if isinstance(use_atom_mapping_for_hydrogens, bool):
+        atom_mapping_rows = [use_atom_mapping_for_hydrogens] * len(smiles_rows)
+    else:
+        atom_mapping_rows = list(use_atom_mapping_for_hydrogens)
+        if len(atom_mapping_rows) != len(smiles_rows):
+            raise ValueError(
+                'use_atom_mapping_for_hydrogens must contain one flag per SMILES row.'
+            )
+
+    parsed_rows = []
+    for smiles, use_atom_mapping in zip(smiles_rows, atom_mapping_rows):
+        is_mol_list = [is_mol(value) for value in smiles]
+        reaction_list = [is_reaction(value) for value in is_mol_list]
+        mols = make_mols(
+            smiles=list(smiles),
+            reaction_list=reaction_list,
+            keep_h_list=[
+                is_keeping_atom_map(value)
+                if use_atom_mapping
+                else is_explicit_h(value)
+                for value in is_mol_list
+            ],
+            add_h_list=[is_adding_hs(value) for value in is_mol_list],
+            keep_atom_map_list=[is_keeping_atom_map(value) for value in is_mol_list],
+        )
+        parsed_rows.append((mols, reaction_list))
+
+    # Molecule positions and duplicate keys do not depend on the generator.
+    # Computing them once avoids a full dataset traversal and SMILES
+    # serialization for every requested generator.
+    position_keys: List[List[Optional[str]]] = []
+    unique_molecules: "OrderedDict[str, Chem.Mol]" = OrderedDict()
+    has_hydrogen_only = False
+    for mols, reaction_list in parsed_rows:
+        row_keys: List[Optional[str]] = []
+        for mol, reaction in zip(mols, reaction_list):
+            candidate = None
+            if reaction:
+                if mol[0] is not None and mol[1] is not None:
+                    candidate = mol[0]
+            elif mol is not None:
+                candidate = mol
+
+            if candidate is None:
+                row_keys.append(None)
+            elif candidate.GetNumHeavyAtoms() == 0:
+                row_keys.append('__CHEMPROP_HYDROGEN_ONLY__')
+                has_hydrogen_only = True
+            else:
+                key = Chem.MolToSmiles(
+                    candidate, canonical=False, isomericSmiles=True
+                )
+                row_keys.append(key)
+                unique_molecules.setdefault(key, candidate)
+        position_keys.append(row_keys)
+
+    # Keep whole NumPy vectors rather than expanding every scalar into a
+    # Python list entry. Dense fingerprints otherwise create hundreds of
+    # millions of temporary Python objects on large datasets.
+    row_feature_parts: List[List[np.ndarray]] = [[] for _ in smiles_rows]
+    methane = Chem.MolFromSmiles('C')
+    keys = list(unique_molecules)
+    unique_molecule_values = list(unique_molecules.values())
+
+    for generator_name in features_generators:
+        selected = selected_feature_columns.get(generator_name)
+
+        generated_rows = generate_features_batch(
+            generator_name,
+            unique_molecule_values,
+            selected_feature_columns=selected,
+        )
+        generated_by_key = {
+            key: np.asarray(values) for key, values in zip(keys, generated_rows)
+        }
+
+        if has_hydrogen_only:
+            zero_template = np.asarray(generate_features_batch(
+                generator_name,
+                [methane],
+                selected_feature_columns=selected,
+            )[0])
+        else:
+            zero_template = None
+
+        expected_size = None
+        for values in list(generated_by_key.values()) + (
+            [zero_template] if zero_template is not None else []
+        ):
+            if values.ndim != 1:
+                raise ValueError(
+                    f'Features generator "{generator_name}" returned a '
+                    f'{values.ndim}-dimensional value; expected a 1-D vector.'
+                )
+            if expected_size is None:
+                expected_size = len(values)
+            elif len(values) != expected_size:
+                raise ValueError(
+                    f'Features generator "{generator_name}" returned inconsistent '
+                    f'lengths ({expected_size} and {len(values)}).'
+                )
+
+        zero_values = (
+            np.zeros(len(zero_template), dtype=float)
+            if zero_template is not None
+            else None
+        )
+        for row_index, row_keys in enumerate(position_keys):
+            for key in row_keys:
+                # Invalid inputs historically append no values and are filtered
+                # by get_data afterwards when skip_invalid_smiles is enabled.
+                if key is None:
+                    continue
+                values = (
+                    zero_values
+                    if key == '__CHEMPROP_HYDROGEN_ONLY__'
+                    else generated_by_key[key]
+                )
+                # Extending an empty vector historically had no influence on
+                # the final dtype, so omit it from NumPy concatenation too.
+                if values.size:
+                    row_feature_parts[row_index].append(values)
+
+    return [
+        np.concatenate(parts) if parts else np.empty(0, dtype=float)
+        for parts in row_feature_parts
+    ]
 
 
 def cache_graph() -> bool:
@@ -40,6 +287,10 @@ def empty_cache():
     r"""Empties the cache of :class:`~chemprop.features.MolGraph` and RDKit molecules."""
     SMILES_TO_GRAPH.clear()
     SMILES_TO_MOL.clear()
+    with FEATURES_CACHE_LOCK:
+        FEATURES_CACHE.clear()
+    with SELECTED_FEATURES_CACHE_LOCK:
+        SELECTED_FEATURES_CACHE.clear()
 
 
 def cache_mol() -> bool:
@@ -76,7 +327,9 @@ class MoleculeDatapoint:
                  raw_constraints: np.ndarray = None,
                  constraints: np.ndarray = None,
                  overwrite_default_atom_features: bool = False,
-                 overwrite_default_bond_features: bool = False):
+                 overwrite_default_bond_features: bool = False,
+                 selected_feature_columns: Mapping[str, Sequence[str]] = None,
+                 features_generator_precomputed: bool = False):
         """
         :param smiles: A list of the SMILES strings for the molecules.
         :param targets: A list of targets for the molecule (contains None for unknown target values).
@@ -88,6 +341,9 @@ class MoleculeDatapoint:
         :param lt_targets: Indicates whether the targets are an inequality regression target of the form "<x".
         :param features: A numpy array containing additional features (e.g., Morgan fingerprint).
         :param features_generator: A list of features generators to use.
+        :param features_generator_precomputed: Whether ``features`` already includes all requested generated features.
+        :param selected_features_path: Path to a CSV containing selected descriptor names.
+        :param selected_feature_columns: A preloaded mapping from generator names to selected descriptor names.
         :param phase_features: A one-hot vector indicating the phase of the data, as used in spectra data.
         :param atom_descriptors: A numpy array containing additional atom descriptors to featurize the molecule.
         :param bond_descriptors: A numpy array containing additional bond descriptors to featurize the molecule.
@@ -105,6 +361,13 @@ class MoleculeDatapoint:
         self.features = features
         self.features_generator = features_generator
         self.selected_features_path = selected_features_path
+        self.selected_feature_columns = (
+            dict(selected_feature_columns)
+            if selected_feature_columns is not None
+            else load_selected_feature_columns(selected_features_path)
+            if selected_features_path is not None
+            else {}
+        )
         self.phase_features = phase_features
         self.atom_descriptors = atom_descriptors
         self.bond_descriptors = bond_descriptors
@@ -128,34 +391,31 @@ class MoleculeDatapoint:
             self.lt_targets = lt_targets
 
         # Generate additional features if given a generator
-        if self.features_generator is not None:
+        if self.features_generator is not None and not features_generator_precomputed:
             if self.features is None:
                 self.features = []
             else:
                 self.features = list(self.features)
 
             for fg in self.features_generator:
-                selected_feature_columns = None
-                if self.selected_features_path is not None:
-                    selected_features_df = pd.read_csv(self.selected_features_path)
-                    if fg in selected_features_df.columns:
-                        selected_feature_columns = selected_features_df[fg].values
-                        selected_feature_columns = [x for x in selected_feature_columns if not pd.isnull(x) == True]
-
-                features_generator = get_features_generator(fg)
+                selected_feature_columns = self.selected_feature_columns.get(fg)
                 for m, reaction in zip(self.mol, self.is_reaction_list):
                     if not reaction:
                         if m is not None and m.GetNumHeavyAtoms() > 0:
-                            self.features.extend(features_generator(m, selected_feature_columns=selected_feature_columns))
+                            self.features.extend(_generate_features(fg, m, selected_feature_columns))
                         # for H2
                         elif m is not None and m.GetNumHeavyAtoms() == 0:
                             # not all features are equally long, so use methane as dummy molecule to determine length
-                            self.features.extend(np.zeros(len(features_generator(Chem.MolFromSmiles('C'), selected_feature_columns=selected_feature_columns))))
+                            self.features.extend(np.zeros(len(_generate_features(
+                                fg, Chem.MolFromSmiles('C'), selected_feature_columns
+                            ))))
                     else:
                         if m[0] is not None and m[1] is not None and m[0].GetNumHeavyAtoms() > 0:
-                            self.features.extend(features_generator(m[0]))
+                            self.features.extend(_generate_features(fg, m[0], selected_feature_columns))
                         elif m[0] is not None and m[1] is not None and m[0].GetNumHeavyAtoms() == 0:
-                            self.features.extend(np.zeros(len(features_generator(Chem.MolFromSmiles('C')))))   
+                            self.features.extend(np.zeros(len(_generate_features(
+                                fg, Chem.MolFromSmiles('C'), selected_feature_columns
+                            ))))
                     
 
             self.features = np.array(self.features)
@@ -205,10 +465,6 @@ class MoleculeDatapoint:
                             keep_h_list=self.is_explicit_h_list,
                             add_h_list=self.is_adding_hs_list,
                             keep_atom_map_list=self.is_keeping_atom_map_list)
-        if cache_mol():
-            for s, m in zip(self.smiles, mol):
-                SMILES_TO_MOL[s] = m
-
         return mol
 
     @property
@@ -429,9 +685,23 @@ class MoleculeDataset(Dataset):
             mol_graphs = []
             for d in self._data:
                 mol_graphs_list = []
-                for s, m in zip(d.smiles, d.mol):
-                    if s in SMILES_TO_GRAPH:
-                        mol_graph = SMILES_TO_GRAPH[s]
+                for mol_index, (s, m) in enumerate(zip(d.smiles, d.mol)):
+                    has_row_features = d.atom_features is not None or d.bond_features is not None
+                    keep_h = (
+                        d.is_keeping_atom_map_list[mol_index]
+                        if d.atom_targets is not None or d.bond_targets is not None
+                        else d.is_explicit_h_list[mol_index]
+                    )
+                    graph_key = (
+                        s,
+                        d.is_reaction_list[mol_index],
+                        keep_h,
+                        d.is_adding_hs_list[mol_index],
+                        d.is_keeping_atom_map_list[mol_index],
+                        reaction_mode(),
+                    )
+                    if cache_graph() and not has_row_features and graph_key in SMILES_TO_GRAPH:
+                        mol_graph = SMILES_TO_GRAPH[graph_key]
                     else:
                         if len(d.smiles) > 1 and (d.atom_features is not None or d.bond_features is not None):
                             raise NotImplementedError('Atom descriptors are currently only supported with one molecule '
@@ -440,8 +710,8 @@ class MoleculeDataset(Dataset):
                         mol_graph = MolGraph(m, d.atom_features, d.bond_features,
                                              overwrite_default_atom_features=d.overwrite_default_atom_features,
                                              overwrite_default_bond_features=d.overwrite_default_bond_features)
-                        if cache_graph():
-                            SMILES_TO_GRAPH[s] = mol_graph
+                        if cache_graph() and not has_row_features:
+                            SMILES_TO_GRAPH[graph_key] = mol_graph
                     mol_graphs_list.append(mol_graph)
                 mol_graphs.append(mol_graphs_list)
 
@@ -991,9 +1261,18 @@ def make_mols(smiles: List[str], reaction_list: List[bool], keep_h_list: List[bo
     """
     mol = []
     for s, reaction, keep_h, add_h, keep_atom_map in zip(smiles, reaction_list, keep_h_list, add_h_list, keep_atom_map_list):
-        if reaction:
-            mol.append(SMILES_TO_MOL[s] if s in SMILES_TO_MOL else (make_mol(s.split(">")[0], keep_h, add_h, keep_atom_map), make_mol(s.split(">")[-1], keep_h, add_h, keep_atom_map)))
+        cache_key = (s, reaction, keep_h, add_h, keep_atom_map)
+        if cache_mol() and cache_key in SMILES_TO_MOL:
+            parsed_mol = SMILES_TO_MOL[cache_key]
+        elif reaction:
+            parsed_mol = (
+                make_mol(s.split(">")[0], keep_h, add_h, keep_atom_map),
+                make_mol(s.split(">")[-1], keep_h, add_h, keep_atom_map),
+            )
         else:
-            mol.append(SMILES_TO_MOL[s] if s in SMILES_TO_MOL else make_mol(s, keep_h, add_h, keep_atom_map))
-    return mol
+            parsed_mol = make_mol(s, keep_h, add_h, keep_atom_map)
 
+        if cache_mol():
+            SMILES_TO_MOL[cache_key] = parsed_mol
+        mol.append(parsed_mol)
+    return mol

@@ -1,8 +1,7 @@
 from chemprop.args import HyperoptArgs
 import os
 import pickle
-from typing import List, Dict
-import csv
+from typing import List, Dict, Tuple
 import json
 import logging
 
@@ -10,7 +9,41 @@ from hyperopt import Trials, hp
 import numpy as np
 
 from chemprop.constants import HYPEROPT_SEED_FILE_NAME
-from chemprop.utils import makedirs
+from chemprop.utils import makedirs, multitask_mean
+
+
+def _load_manual_validation_scores(trial_dir: str, trial_args: Dict) -> Tuple[float, float]:
+    """Loads and aggregates validation scores for a manual hyperopt trial.
+
+    Test scores are intentionally never used as a fallback: doing so would
+    leak held-out labels into hyperparameter selection. Older manual runs must
+    be rerun (or supplied with their per-fold ``valid_scores.json`` files).
+    """
+    metric = trial_args["metric"]
+    fold_scores = []
+    for fold_num in range(trial_args["num_folds"]):
+        score_path = os.path.join(trial_dir, f"fold_{fold_num}", "valid_scores.json")
+        if not os.path.isfile(score_path):
+            raise FileNotFoundError(
+                f"Manual hyperopt trial {trial_dir} is missing validation scores at "
+                f"{score_path}. Test scores cannot be used for hyperparameter selection."
+            )
+        with open(score_path) as f:
+            scores = json.load(f)
+        if metric not in scores:
+            raise ValueError(
+                f'Manual hyperopt trial {trial_dir} has no validation metric "{metric}" '
+                f'in {score_path}.'
+            )
+        fold_scores.append(scores[metric])
+
+    average_fold_scores = multitask_mean(
+        scores=np.asarray(fold_scores, dtype=float),
+        metric=metric,
+        axis=1,
+        ignore_nan_metrics=trial_args.get("ignore_nan_metrics", False),
+    )
+    return float(np.mean(average_fold_scores)), float(np.std(average_fold_scores))
 
 
 def build_search_space(search_parameters: List[str], train_epochs: int = None) -> dict:
@@ -192,7 +225,8 @@ def load_manual_trials(
     Trials must be consistent with trials that would be generated in hyperparameter optimization.
     Parameters that are part of the search space do not have to match, but all others do.
 
-    :param manual_trials_dirs: A list of paths to save directories for the manual trials, as would include test_scores.csv and args.json.
+    :param manual_trials_dirs: A list of paths to save directories for manual trials,
+                              including args.json and per-fold valid_scores.json files.
     :param param_keys: A list of the parameters included in the hyperparameter optimization.
     :param hyperopt_args: The arguments for the hyperparameter optimization job.
     :return: A hyperopt trials object including all the loaded manual trials.
@@ -230,19 +264,14 @@ def load_manual_trials(
 
     manual_trials_data = []
     for i, trial_dir in enumerate(manual_trials_dirs):
-
-        # Extract trial data from test_scores.csv
-        with open(os.path.join(trial_dir, "test_scores.csv")) as f:
-            reader = csv.reader(f)
-            next(reader)
-            read_line = next(reader)
-        mean_score = float(read_line[1])
-        std_score = float(read_line[2])
-        loss = (1 if hyperopt_args.minimize_score else -1) * mean_score
-
         # Extract argument data from args.json
         with open(os.path.join(trial_dir, "args.json")) as f:
             trial_args = json.load(f)
+
+        # Select manual configurations from validation data only. Never fall
+        # back to the legacy test_scores.csv artifact.
+        mean_score, std_score = _load_manual_validation_scores(trial_dir, trial_args)
+        loss = (1 if hyperopt_args.minimize_score else -1) * mean_score
 
         # Check for differences in manual trials and hyperopt space
         if "linked_hidden_size" in param_keys:

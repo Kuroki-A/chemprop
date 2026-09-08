@@ -9,7 +9,7 @@ from tap import Tap  # pip install typed-argument-parser (https://github.com/swa
 from tqdm import tqdm
 from typing_extensions import Literal
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from chemprop.data import get_smiles, MoleculeDatapoint, MoleculeDataset, split_data
 from chemprop.utils import makedirs

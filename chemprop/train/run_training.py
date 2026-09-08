@@ -1,12 +1,7 @@
-import json
 from logging import Logger
 import os
-from typing import Dict, List
-from collections import defaultdict
-
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
-import warnings
-warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning) 
 import pandas as pd
 from tensorboardX import SummaryWriter
 import torch
@@ -27,10 +22,76 @@ from chemprop.utils import build_optimizer, build_lr_scheduler, load_checkpoint,
     save_checkpoint, save_smiles_splits, load_frzn_model, multitask_mean
 
 
+def _first_feature_schema_difference(expected: Any,
+                                     actual: Any,
+                                     path: str = 'features') -> Optional[str]:
+    """Returns the first semantic feature-schema difference, if any."""
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        expected_keys = set(expected)
+        actual_keys = set(actual)
+        if expected_keys != actual_keys:
+            missing = sorted(expected_keys - actual_keys)
+            extra = sorted(actual_keys - expected_keys)
+            return f'{path} keys differ (missing={missing}, extra={extra})'
+        for key in sorted(expected_keys):
+            difference = _first_feature_schema_difference(
+                expected[key], actual[key], f'{path}.{key}'
+            )
+            if difference is not None:
+                return difference
+        return None
+
+    if isinstance(expected, (list, tuple)) and isinstance(actual, (list, tuple)):
+        if len(expected) != len(actual):
+            return f'{path} length differs ({len(expected)} != {len(actual)})'
+        for index, (expected_value, actual_value) in enumerate(zip(expected, actual)):
+            difference = _first_feature_schema_difference(
+                expected_value, actual_value, f'{path}[{index}]'
+            )
+            if difference is not None:
+                return difference
+        return None
+
+    if expected != actual:
+        expected_text = repr(expected)
+        actual_text = repr(actual)
+        if len(expected_text) > 160:
+            expected_text = expected_text[:157] + '...'
+        if len(actual_text) > 160:
+            actual_text = actual_text[:157] + '...'
+        return f'{path} differs ({expected_text} != {actual_text})'
+    return None
+
+
+def validate_features_source_metadata(reference_data: MoleculeDataset,
+                                      candidate_data: MoleculeDataset,
+                                      candidate_name: str) -> None:
+    """Ensures a separate dataset uses the training data's feature schema.
+
+    Width-only checks cannot distinguish reordered descriptor columns, a
+    feature file from phase features, or incompatible ``save_features``
+    manifests. ``_features_source_metadata`` deliberately contains only
+    row-independent semantic information, so it is safe to compare strictly.
+    """
+    expected = getattr(reference_data, '_features_source_metadata', None)
+    actual = getattr(candidate_data, '_features_source_metadata', None)
+    difference = _first_feature_schema_difference(expected, actual)
+    if difference is not None:
+        raise ValueError(
+            f'The molecular feature schema for {candidate_name} does not match '
+            f'the main training data: {difference}. Use the same ordered '
+            'feature columns, phase-feature layout, generator configuration, '
+            'and feature manifest for every split.'
+        )
+
+
 def run_training(args: TrainArgs,
                  data: MoleculeDataset,
-                 fold_num: int,
-                 logger: Logger = None) -> Dict[str, List[float]]:
+                 fold_num: int = None,
+                 logger: Logger = None) -> Union[
+                     Dict[str, List[float]],
+                     Tuple[Dict[str, List[float]], Dict[str, List[float]]],
+                 ]:
     """
     Loads data, trains a Chemprop model, and returns test scores for the model checkpoint with the highest validation score.
 
@@ -38,22 +99,41 @@ def run_training(args: TrainArgs,
                  loading data and training the Chemprop model.
     :param data: A :class:`~chemprop.data.MoleculeDataset` containing the data.
     :param logger: A logger to record output.
-    :return: A dictionary mapping each metric in :code:`args.metrics` to a list of values for each task.
+    :return: For cross-validation callers, a ``(validation, test)`` tuple in
+             which each dictionary maps every metric in :code:`args.metrics`
+             to task-axis scores (one aggregate value for spectra). Legacy
+             callers receive only the test dictionary.
 
     """
+    # Backwards-compatible adapter for callers which historically passed the
+    # logger as the third positional argument and expected test scores only
+    # (notably the web application). Cross-validation always supplies an
+    # integer fold number and receives the uniform (valid, test) result tuple.
+    legacy_call = fold_num is None or not isinstance(fold_num, int)
+    if legacy_call and fold_num is not None and logger is None:
+        logger = fold_num
+
     if logger is not None:
         debug, info = logger.debug, logger.info
     else:
         debug = info = print
+
+    # Hyperparameter optimization must select configurations exclusively on
+    # validation scores. A separate held-out file is not even loaded in this
+    # mode; an in-memory split is constructed only long enough to preserve the
+    # train/validation split semantics and is then discarded.
+    skip_test_evaluation = bool(getattr(args, 'skip_test_evaluation', False))
 
     # Set pytorch seed for random initial weights
     torch.manual_seed(args.pytorch_seed)
 
     # Split data
     debug(f'Splitting data with seed {args.seed}')
-    if args.separate_test_path:
+    test_data = MoleculeDataset([])
+    if args.separate_test_path and not skip_test_evaluation:
         test_data = get_data(path=args.separate_test_path,
                              args=args,
+                             target_columns=args.task_names,
                              features_path=args.separate_test_features_path,
                              atom_descriptors_path=args.separate_test_atom_descriptors_path,
                              bond_descriptors_path=args.separate_test_bond_descriptors_path,
@@ -62,9 +142,11 @@ def run_training(args: TrainArgs,
                              smiles_columns=args.smiles_columns,
                              loss_function=args.loss_function,
                              logger=logger)
+        validate_features_source_metadata(data, test_data, 'separate test data')
     if args.separate_val_path:
         val_data = get_data(path=args.separate_val_path,
                             args=args,
+                            target_columns=args.task_names,
                             features_path=args.separate_val_features_path,
                             atom_descriptors_path=args.separate_val_atom_descriptors_path,
                             bond_descriptors_path=args.separate_val_bond_descriptors_path,
@@ -73,6 +155,7 @@ def run_training(args: TrainArgs,
                             smiles_columns=args.smiles_columns,
                             loss_function=args.loss_function,
                             logger=logger)
+        validate_features_source_metadata(data, val_data, 'separate validation data')
 
     if args.separate_val_path and args.separate_test_path:
         train_data = data
@@ -104,16 +187,19 @@ def run_training(args: TrainArgs,
                                                      args=args,
                                                      logger=logger)
 
+    if skip_test_evaluation:
+        test_data = MoleculeDataset([])
+
     if args.dataset_type == 'classification':
-        class_sizes = get_class_sizes(data)
-        debug('Class sizes')
+        class_sizes = get_class_sizes(train_data)
+        debug('Training class sizes')
         for i, task_class_sizes in enumerate(class_sizes):
             debug(f'{args.task_names[i]} '
                   f'{", ".join(f"{cls}: {size * 100:.2f}%" for cls, size in enumerate(task_class_sizes))}')
         train_class_sizes = get_class_sizes(train_data, proportion=False)
         args.train_class_sizes = train_class_sizes
 
-    if args.save_smiles_splits:
+    if args.save_smiles_splits and not skip_test_evaluation:
         save_smiles_splits(
             data_path=args.data_path,
             save_dir=args.save_dir,
@@ -131,41 +217,47 @@ def run_training(args: TrainArgs,
     if args.features_scaling:
         features_scaler = train_data.normalize_features(replace_nan_token=0)
         val_data.normalize_features(features_scaler)
-        test_data.normalize_features(features_scaler)
+        if not skip_test_evaluation:
+            test_data.normalize_features(features_scaler)
     else:
         features_scaler = None
 
     if args.atom_descriptor_scaling and args.atom_descriptors is not None:
         atom_descriptor_scaler = train_data.normalize_features(replace_nan_token=0, scale_atom_descriptors=True)
         val_data.normalize_features(atom_descriptor_scaler, scale_atom_descriptors=True)
-        test_data.normalize_features(atom_descriptor_scaler, scale_atom_descriptors=True)
+        if not skip_test_evaluation:
+            test_data.normalize_features(atom_descriptor_scaler, scale_atom_descriptors=True)
     else:
         atom_descriptor_scaler = None
 
     if args.bond_descriptor_scaling and args.bond_descriptors is not None:
         bond_descriptor_scaler = train_data.normalize_features(replace_nan_token=0, scale_bond_descriptors=True)
         val_data.normalize_features(bond_descriptor_scaler, scale_bond_descriptors=True)
-        test_data.normalize_features(bond_descriptor_scaler, scale_bond_descriptors=True)
+        if not skip_test_evaluation:
+            test_data.normalize_features(bond_descriptor_scaler, scale_bond_descriptors=True)
     else:
         bond_descriptor_scaler = None
 
     args.train_data_size = len(train_data)
 
-    debug(f'Total size = {len(data):,} | '
-          f'train size = {len(train_data):,} | val size = {len(val_data):,} | test size = {len(test_data):,}')
+    if skip_test_evaluation:
+        debug(f'Total size = {len(data):,} | '
+              f'train size = {len(train_data):,} | val size = {len(val_data):,}')
+    else:
+        debug(f'Total size = {len(data):,} | '
+              f'train size = {len(train_data):,} | val size = {len(val_data):,} | test size = {len(test_data):,}')
 
     if len(val_data) == 0:
         raise ValueError('The validation data split is empty. During normal chemprop training (non-sklearn functions), \
             a validation set is required to conduct early stopping according to the selected evaluation metric. This \
             may have occurred because validation data provided with `--separate_val_path` was empty or contained only invalid molecules.')
 
-    if len(test_data) == 0:
+    empty_test_set = len(test_data) == 0
+    evaluate_test = not skip_test_evaluation and not empty_test_set
+    if not skip_test_evaluation and empty_test_set:
         debug('The test data split is empty. This may be either because splitting with no test set was selected, \
             such as with `cv-no-test`, or because test data provided with `--separate_test_path` was empty or contained only invalid molecules. \
             Performance on the test set will not be evaluated and metric scores will return `nan` for each task.')
-        empty_test_set = True
-    else:
-        empty_test_set = False
 
 
     # Initialize scaler and scale training targets by subtracting mean and dividing standard deviation (regression only)
@@ -181,7 +273,10 @@ def run_training(args: TrainArgs,
     elif args.dataset_type == 'spectra':
         debug('Normalizing spectra and excluding spectra regions based on phase')
         args.spectra_phase_mask = load_phase_mask(args.spectra_phase_mask_path)
-        for dataset in [train_data, test_data, val_data]:
+        datasets_to_normalize = [train_data, val_data]
+        if evaluate_test:
+            datasets_to_normalize.append(test_data)
+        for dataset in datasets_to_normalize:
             data_targets = normalize_spectra(
                 spectra=dataset.targets(),
                 phase_features=dataset.phase_features(),
@@ -200,18 +295,42 @@ def run_training(args: TrainArgs,
     # Get loss function
     loss_func = get_loss_func(args)
 
-    # Set up test set evaluation
-    test_smiles, test_targets = test_data.smiles(), test_data.targets()
+    # Accumulate predictions from each member's best checkpoint. Validation
+    # scores must describe the final ensemble on the task axis, just like test
+    # scores from every other training backend; per-member early-stopping
+    # scores are not interchangeable with per-task scores.
+    val_smiles, val_targets = val_data.smiles(), val_data.targets()
     if args.dataset_type == 'multiclass':
-        sum_test_preds = np.zeros((len(test_smiles), args.num_tasks, args.multiclass_num_classes))
+        sum_val_preds = np.zeros(
+            (len(val_smiles), args.num_tasks, args.multiclass_num_classes)
+        )
     elif args.is_atom_bond_targets:
-        sum_test_preds = []
-        for tb in zip(*test_data.targets()):
-            tb = np.concatenate(tb)
-            sum_test_preds.append(np.zeros((tb.shape[0], 1)))
-        sum_test_preds = np.array(sum_test_preds, dtype=object)
+        sum_val_preds = np.array(
+            [
+                np.zeros((np.concatenate(task_targets).shape[0], 1))
+                for task_targets in zip(*val_data.targets())
+            ],
+            dtype=object,
+        )
     else:
-        sum_test_preds = np.zeros((len(test_smiles), args.num_tasks))
+        sum_val_preds = np.zeros((len(val_smiles), args.num_tasks))
+
+    # Set up held-out set evaluation only when explicitly enabled. Avoid even
+    # materializing held-out targets during hyperparameter trials.
+    test_targets = None
+    sum_test_preds = None
+    if evaluate_test:
+        test_smiles, test_targets = test_data.smiles(), test_data.targets()
+        if args.dataset_type == 'multiclass':
+            sum_test_preds = np.zeros((len(test_smiles), args.num_tasks, args.multiclass_num_classes))
+        elif args.is_atom_bond_targets:
+            sum_test_preds = []
+            for tb in zip(*test_data.targets()):
+                tb = np.concatenate(tb)
+                sum_test_preds.append(np.zeros((tb.shape[0], 1)))
+            sum_test_preds = np.array(sum_test_preds, dtype=object)
+        else:
+            sum_test_preds = np.zeros((len(test_smiles), args.num_tasks))
 
     # Automatically determine whether to cache
     if len(data) <= args.cache_cutoff:
@@ -235,16 +354,16 @@ def run_training(args: TrainArgs,
         batch_size=args.batch_size,
         num_workers=num_workers
     )
-    test_data_loader = MoleculeDataLoader(
-        dataset=test_data,
-        batch_size=args.batch_size,
-        num_workers=num_workers
-    )
+    test_data_loader = None
+    if evaluate_test:
+        test_data_loader = MoleculeDataLoader(
+            dataset=test_data,
+            batch_size=args.batch_size,
+            num_workers=num_workers
+        )
 
     if args.class_balance:
         debug(f'With class_balance, effective train size = {train_data_loader.iter_size:,}')
-
-    best_valid_scores = defaultdict(list)
 
     # Train ensemble of models
     for model_idx in range(args.ensemble_size):
@@ -253,7 +372,9 @@ def run_training(args: TrainArgs,
         makedirs(save_dir)
         try:
             writer = SummaryWriter(log_dir=save_dir)
-        except:
+        except TypeError:
+            # tensorboardX historically used ``logdir`` while newer releases
+            # accept the PyTorch-compatible ``log_dir`` spelling.
             writer = SummaryWriter(logdir=save_dir)
 
         # Load/build model
@@ -365,15 +486,29 @@ def run_training(args: TrainArgs,
                     debug(f'Early stopped at epoch {epoch}')
                     break
 
-        best_valid_scores[args.metric].append(best_score)
-
-        # Evaluate on test set using model with best validation score
+        # Evaluate validation and held-out data with this member's best
+        # checkpoint. Accumulating validation predictions here makes the
+        # returned validation payload independent of ensemble size and gives
+        # extra metrics the same semantics as test metrics.
         info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f} on epoch {best_epoch}')
-        model = load_checkpoint(os.path.join(save_dir, MODEL_FILE_NAME), device=args.device, logger=logger)
-
-        if empty_test_set:
-            info(f'Model {model_idx} provided with no test set, no metric evaluation will be performed.')
+        model = load_checkpoint(
+            os.path.join(save_dir, MODEL_FILE_NAME),
+            device=args.device,
+            logger=logger,
+        )
+        val_preds = predict(
+            model=model,
+            data_loader=val_data_loader,
+            scaler=scaler,
+            atom_bond_scaler=atom_bond_scaler,
+        )
+        if args.is_atom_bond_targets:
+            sum_val_preds += np.array(val_preds, dtype=object)
         else:
+            sum_val_preds += np.array(val_preds)
+
+        # Evaluate on the held-out set using the same best checkpoint.
+        if evaluate_test:
             test_preds = predict(
                 model=model,
                 data_loader=test_data_loader,
@@ -410,12 +545,44 @@ def run_training(args: TrainArgs,
                     for task_name, test_score in zip(task_names, scores):
                         info(f'Model {model_idx} test {task_name} {metric} = {test_score:.6f}')
                         writer.add_scalar(f'test_{task_name}_{metric}', test_score, n_iter)
+        elif not skip_test_evaluation:
+            info(f'Model {model_idx} provided with no test set, no metric evaluation will be performed.')
         writer.close()
 
+    # Evaluate the final ensemble on validation data. The result is always a
+    # complete ``args.metrics`` mapping whose values use the task axis (or the
+    # single aggregate spectra axis), matching LightGBM and sklearn callbacks.
+    avg_val_preds = (sum_val_preds / args.ensemble_size).tolist()
+    ensemble_valid_scores = evaluate_predictions(
+        preds=avg_val_preds,
+        targets=val_targets,
+        num_tasks=args.num_tasks,
+        metrics=args.metrics,
+        dataset_type=args.dataset_type,
+        is_atom_bond_targets=args.is_atom_bond_targets,
+        gt_targets=val_data.gt_targets(),
+        lt_targets=val_data.lt_targets(),
+        quantiles=args.quantiles,
+        logger=logger,
+    )
+    for metric, scores in ensemble_valid_scores.items():
+        mean_ensemble_valid_score = multitask_mean(
+            scores=scores,
+            metric=metric,
+            ignore_nan_metrics=args.ignore_nan_metrics,
+        )
+        info(
+            f'Ensemble validation {metric} = '
+            f'{mean_ensemble_valid_score:.6f}'
+        )
+
     # Evaluate ensemble on test set
-    if empty_test_set:
+    if skip_test_evaluation:
+        ensemble_test_scores = {}
+    elif empty_test_set:
+        score_width = 1 if args.dataset_type == 'spectra' else args.num_tasks
         ensemble_test_scores = {
-            metric: [np.nan for task in args.task_names] for metric in args.metrics
+            metric: [np.nan] * score_width for metric in args.metrics
         }
     else:
         avg_test_preds = (sum_test_preds / args.ensemble_size).tolist()
@@ -447,12 +614,8 @@ def run_training(args: TrainArgs,
             for task_name, ensemble_score in zip(task_names, scores):
                 info(f'Ensemble test {task_name} {metric} = {ensemble_score:.6f}')
 
-    # Save scores
-    with open(os.path.join(args.save_dir, 'test_scores.json'), 'w') as f:
-        json.dump(ensemble_test_scores, f, indent=4, sort_keys=True)
-
     # Optionally save test preds
-    if args.save_preds and not empty_test_set:
+    if args.save_preds and evaluate_test:
         test_preds_dataframe = pd.DataFrame(data={'smiles': test_data.smiles()})
 
         if args.is_atom_bond_targets:
@@ -467,7 +630,7 @@ def run_training(args: TrainArgs,
                 values = [list(v) for v in values]
                 test_preds_dataframe[bond_target] = values
         else:
-            if args.loss_function == "quantile_interval" and metric == "quantile":
+            if args.loss_function == "quantile_interval":
                 num_tasks = len(args.task_names) // 2
                 task_names = args.task_names[:num_tasks]
                 avg_test_preds = np.array(avg_test_preds)
@@ -486,4 +649,7 @@ def run_training(args: TrainArgs,
 
         test_preds_dataframe.to_csv(os.path.join(args.save_dir, 'test_preds.csv'), index=False)
 
-    return dict(best_valid_scores), ensemble_test_scores
+    if legacy_call:
+        return ensemble_test_scores
+
+    return ensemble_valid_scores, ensemble_test_scores

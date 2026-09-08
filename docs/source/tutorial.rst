@@ -21,7 +21,7 @@ The data file must be be a **CSV file with a header row**. For example:
 
 By default, it is assumed that the SMILES are in the first column and the targets are in the remaining columns. However, the specific columns containing the SMILES and targets can be specified using the :code:`--smiles_column <column>` and :code:`--target_columns <column_1> <column_2> ...` flags, respectively.
 
-Datasets from `MoleculeNet <https://moleculenet.org/>`_ and a 450K subset of ChEMBL from `<http://www.bioinf.jku.at/research/lsc/index.html>`_ have been preprocessed and are available in `data.tar.gz <https://github.com/chemprop/chemprop/blob/master/data.tar.gz>`_. To uncompress them, run :code:`tar xvzf data.tar.gz`.
+Datasets from `MoleculeNet <https://moleculenet.org/>`_ and a 450K subset of ChEMBL from `<http://www.bioinf.jku.at/research/lsc/index.html>`_ have been preprocessed and are available in `data.tar.gz <https://github.com/Kuroki-A/chemprop/blob/master/data.tar.gz>`_. To uncompress them, run :code:`tar xvzf data.tar.gz`.
 
 Training
 --------
@@ -74,6 +74,33 @@ Ensembling
 
 To train an ensemble, specify the number of models in the ensemble with :code:`--ensemble_size <n>`. The default is :code:`--ensemble_size 1`.
 
+LightGBM Heads
+^^^^^^^^^^^^^^
+
+For regression and binary classification, :code:`--model_type lgbm` trains
+one LightGBM head per task and stores each ensemble member together with its
+exact frozen encoder and feature scalers in a versioned :code:`.pkl` bundle.
+Missing multitask targets are supported. For a descriptor-only baseline, a
+deterministic fingerprint is recommended:
+
+.. code-block::
+
+   chemprop_train --data_path data.csv --dataset_type regression \
+      --model_type lgbm --features_generator morgan --features_only \
+      --save_dir lgbm_checkpoints
+   chemprop_predict --test_path test.csv --checkpoint_dir lgbm_checkpoints \
+      --features_generator morgan --preds_path predictions.csv
+
+Prediction infers LightGBM when a checkpoint source contains only
+:code:`.pkl` bundles. Boosting rounds, early stopping, learning rate, leaves,
+feature/bagging fractions, minimum leaf size, and CPU threads are configurable
+with the :code:`--lgbm_*` arguments documented in :ref:`args`. This backend
+currently supports mean-squared-error regression and binary-cross-entropy
+classification. Checkpoint warm-starting and :code:`chemprop_hyperopt` are
+rejected explicitly; use the :code:`--lgbm_*` options for tuning.
+:code:`--target_weights` is rejected because each target is trained by an
+independent booster; row-wise :code:`--data_weights_path` remains supported.
+
 Hyperparameter Optimization
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -94,7 +121,10 @@ Once hyperparameter optimization is complete, the optimal hyperparameters can be
 
    chemprop_train --data_path <data_path> --dataset_type <type> --config_path <config_path>
 
-Note that the hyperparameter optimization script sees all the data given to it. The intended use is to run the hyperparameter optimization script on a dataset with the eventual test set held out. If you need to optimize hyperparameters separately for several different cross validation splits, you should e.g. set up a bash script to run hyperparameter_optimization.py separately on each split's training and validation data with test held out.
+Hyperparameter trials are selected only from validation scores and skip test
+evaluation. Keep an independent final test set and evaluate it once after the
+search. For multiple cross-validation splits, run the optimizer separately for
+each training/validation split while retaining the corresponding test fold.
 
 Additional Features
 ^^^^^^^^^^^^^^^^^^^
@@ -106,12 +136,49 @@ Molecule-Level RDKit 2D Features
 
 As a starting point, we recommend using pre-normalized RDKit features by using the :code:`--features_generator rdkit_2d_normalized --no_features_scaling` flags. In general, we recommend NOT using the :code:`--no_features_scaling` flag (i.e. allow the code to automatically perform feature scaling), but in the case of :code:`rdkit_2d_normalized`, those features have been pre-normalized and don't require further scaling.
 
-The full list of available features for :code:`--features_generator` is as follows.
+The built-in families include:
 
-:code:`morgan` is binary Morgan fingerprints, radius 2 and 2048 bits.
-:code:`morgan_count` is count-based Morgan, radius 2 and 2048 bits.
-:code:`rdkit_2d` is an unnormalized version of 200 assorted rdkit descriptors. Full list can be found at the bottom of our paper: `<https://arxiv.org/pdf/1904.01561.pdf>`_
-:code:`rdkit_2d_normalized` is the CDF-normalized version of the 200 rdkit descriptors.
+* RDKit fingerprints: :code:`morgan`, :code:`morgan_count`, :code:`maccs`,
+  :code:`rdkit`, :code:`avalon`, :code:`atompair`, :code:`erg`, and
+  :code:`erg_float`.
+* RDKit/descriptastorus descriptors: :code:`rdkit_2d`,
+  :code:`rdkit_2d_normalized`, their :code:`_wo_fr` variants,
+  :code:`rdkit_2d_208`, :code:`rdkit_2d_400`,
+  :code:`rdkit_2d_autocorr`, :code:`rdkit_2d_bcut`, and
+  :code:`rdkit_2d_all`.
+* Molfeat 2D/scaffold/pharmacophore features: :code:`fcfp`,
+  :code:`fcfp_count`, :code:`topological`, :code:`topological_count`,
+  :code:`layered`, :code:`avalon_count`, :code:`rdkit_count`,
+  :code:`atompair_count`, :code:`pattern`, :code:`estate`, :code:`secfp`,
+  :code:`cats2d`, :code:`scaffoldkeys`, and :code:`pharm2d`.
+* Direct MAP4 implementations: legacy/Molfeat-compatible :code:`map4` and
+  native :code:`map4_v1_1`.
+* Optional :code:`mordred`, :code:`padelpy`, and Molfeat pretrained
+  representations shown by :code:`chemprop_train --help`.
+
+Install the :code:`features` extra for stable local backends. Use
+:code:`features-pretrained` only for registered pretrained Molfeat models,
+whose Transformer and DGL dependencies are intentionally isolated;
+:code:`features-all` remains a compatibility alias. Imports are lazy, and
+normal data loading uses ordered chunked generation with duplicate input
+reuse. :code:`scripts/save_features.py`
+provides native batching or bounded multiprocessing, restartable bounded
+chunks, disk-backed consolidation, and a schema/hash manifest next to its
+:code:`.npz` output. The conda environment supplies OpenJDK 17 for the
+:code:`padelpy` backend.
+
+:code:`map4` is the canonicalized, folded 2,048-bit MAP4 v1.0 definition
+expected by Molfeat 0.11. :code:`map4_v1_1` is the canonicalized native
+:code:`map4` 1.1.3 definition. They are not bit-compatible, so training and
+prediction must use the same name. For example, select the 1.1.3 definition
+with :code:`--features_generator map4_v1_1`; complete train, predict, and
+offline-generation commands are documented in :ref:`features`.
+
+.. warning::
+   Selected descriptor columns are now correctly applied to reaction
+   reactants. Legacy reaction checkpoints trained with a selected-feature CSV
+   may have the old full-width vector and should be retrained if a feature
+   width mismatch is reported.
 
 Molecule-Level Custom Features
 """"""""""""""""""""""""""""""

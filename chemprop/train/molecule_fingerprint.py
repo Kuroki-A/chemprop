@@ -6,11 +6,108 @@ import numpy as np
 from tqdm import tqdm
 
 from chemprop.args import FingerprintArgs, TrainArgs
-from chemprop.data import get_data, get_data_from_smiles, MoleculeDataLoader, MoleculeDataset
+from chemprop.data import get_data, get_data_from_smiles, is_valid_datapoint, load_selected_feature_columns, MoleculeDataLoader, MoleculeDataset
 from chemprop.utils import load_args, load_checkpoint, makedirs, timeit, load_scalers, update_prediction_args
-from chemprop.data import MoleculeDataLoader, MoleculeDataset
-from chemprop.features import set_reaction, set_explicit_h, set_adding_hs, set_keeping_atom_map, reset_featurization_parameters, set_extra_atom_fdim, set_extra_bond_fdim
+from chemprop.features import get_features_generators_metadata, set_reaction, set_explicit_h, set_adding_hs, set_keeping_atom_map, reset_featurization_parameters, set_extra_atom_fdim, set_extra_bond_fdim
 from chemprop.models import MoleculeModel
+from chemprop.train.make_predictions import (
+    _FFN_ENSEMBLE_COMPATIBILITY_FIELDS,
+    _feature_source_metadata_matches,
+    _validate_ensemble_train_args,
+)
+
+
+def restore_checkpoint_featurization(train_args: TrainArgs) -> None:
+    """Restores every process-global graph setting recorded by a checkpoint."""
+    reset_featurization_parameters()
+    set_explicit_h(train_args.explicit_h)
+    set_adding_hs(getattr(train_args, 'adding_h', False))
+    set_keeping_atom_map(getattr(train_args, 'keeping_atom_map', False))
+    if train_args.reaction:
+        set_reaction(True, train_args.reaction_mode)
+    elif train_args.reaction_solvent:
+        set_reaction(True, train_args.reaction_mode)
+    if train_args.atom_descriptors == 'feature':
+        set_extra_atom_fdim(train_args.atom_features_size)
+    if train_args.bond_descriptors == 'feature':
+        set_extra_bond_fdim(train_args.bond_features_size)
+
+
+def validate_checkpoint_feature_schema(
+    args: Union[FingerprintArgs, object],
+    train_args: TrainArgs,
+    data: MoleculeDataset,
+    valid_data: MoleculeDataset = None,
+) -> None:
+    """Validates generator identity, realized width, and feature-source layout."""
+    expected_generators = list(train_args.features_generator or [])
+    actual_generators = list(args.features_generator or [])
+    if actual_generators != expected_generators:
+        raise ValueError(
+            'Feature generators do not match the checkpoint: '
+            f'expected {expected_generators}, received {actual_generators}.'
+        )
+
+    # Invalid molecules may carry a zero-width placeholder even when the
+    # generator schema has a known width, so only validate a realized valid row.
+    width_data = data if valid_data is None else valid_data
+    actual_features_size = width_data.features_size() if len(width_data) > 0 else None
+    expected_features_size = getattr(train_args, 'features_size', None)
+    if (
+        actual_features_size is not None
+        and expected_features_size is not None
+        and actual_features_size != expected_features_size
+    ):
+        raise ValueError(
+            'Feature width does not match the checkpoint: '
+            f'generated {actual_features_size}, expected {expected_features_size}.'
+        )
+
+    expected_generator_metadata = getattr(
+        train_args, 'features_generator_metadata', None
+    )
+    if expected_generator_metadata is not None:
+        selected_feature_columns = (
+            load_selected_feature_columns(args.selected_features_path)
+            if args.selected_features_path is not None
+            else {}
+        )
+        actual_generator_metadata = get_features_generators_metadata(
+            actual_generators,
+            selected_feature_columns=selected_feature_columns,
+            total_dimension=(
+                actual_features_size
+                if actual_features_size is not None
+                else expected_generator_metadata.get('total_dimension')
+            ),
+        )
+        if actual_generator_metadata != expected_generator_metadata:
+            raise ValueError(
+                'Feature generator schema does not match the checkpoint. Use the '
+                'same ordered generators, selected columns, and dependency versions.'
+            )
+
+    expected_source_metadata = getattr(train_args, 'features_source_metadata', None)
+    actual_source_metadata = getattr(data, '_features_source_metadata', None)
+    if (
+        expected_source_metadata is not None
+        and not _feature_source_metadata_matches(
+            expected_source_metadata, actual_source_metadata
+        )
+    ):
+        raise ValueError(
+            'Feature sources do not match the checkpoint. Use the same ordered '
+            'external, phase, and generated feature layout.'
+        )
+
+
+def validate_checkpoint_ensemble(train_args_list: List[TrainArgs]) -> None:
+    """Rejects FFN checkpoints with incompatible architectures or feature schemas."""
+    _validate_ensemble_train_args(
+        train_args_list,
+        _FFN_ENSEMBLE_COMPATIBILITY_FIELDS,
+        'FFN',
+    )
 
 @timeit()
 def molecule_fingerprint(args: FingerprintArgs,
@@ -27,38 +124,30 @@ def molecule_fingerprint(args: FingerprintArgs,
     """
 
     print('Loading training args')
-    train_args = load_args(args.checkpoint_paths[0])
+    checkpoint_train_args = [load_args(path) for path in args.checkpoint_paths]
+    validate_checkpoint_ensemble(checkpoint_train_args)
+    train_args = checkpoint_train_args[0]
 
     # Update args with training arguments
-    if args.fingerprint_type == 'MPN': # only need to supply input features if using FFN latent representation and if model calls for them.
-        validate_feature_sources = False
-    else:
-        validate_feature_sources = True
-    update_prediction_args(predict_args=args, train_args=train_args, validate_feature_sources=validate_feature_sources)
+    # MPN fingerprints are truncated before being returned, but the current v1
+    # encoder still consumes and concatenates input features internally. Their
+    # exact schema is therefore required for both MPN and last_FFN outputs.
+    update_prediction_args(
+        predict_args=args,
+        train_args=train_args,
+        validate_feature_sources=True,
+    )
     args: Union[FingerprintArgs, TrainArgs]
 
-    #set explicit H option and reaction option
-    reset_featurization_parameters()
-    if args.atom_descriptors == 'feature':
-        set_extra_atom_fdim(train_args.atom_features_size)
-
-    if args.bond_descriptors == 'feature':
-        set_extra_bond_fdim(train_args.bond_features_size)
-
-    set_explicit_h(train_args.explicit_h)
-    set_adding_hs(args.adding_h)
-    set_keeping_atom_map(args.keeping_atom_map)
-    if train_args.reaction:
-        set_reaction(train_args.reaction, train_args.reaction_mode)
-    elif train_args.reaction_solvent:
-        set_reaction(True, train_args.reaction_mode)
+    restore_checkpoint_featurization(train_args)
 
     print('Loading data')
     if smiles is not None:
         full_data = get_data_from_smiles(
             smiles=smiles,
             skip_invalid_smiles=False,
-            features_generator=args.features_generator
+            features_generator=args.features_generator,
+            selected_features_path=args.selected_features_path,
         )
     else:
         full_data = get_data(path=args.test_path, smiles_columns=args.smiles_columns, target_columns=[], ignore_columns=[], skip_invalid_smiles=False,
@@ -68,29 +157,32 @@ def molecule_fingerprint(args: FingerprintArgs,
     full_to_valid_indices = {}
     valid_index = 0
     for full_index in range(len(full_data)):
-        if all(mol is not None for mol in full_data[full_index].mol):
+        if is_valid_datapoint(full_data[full_index]):
             full_to_valid_indices[full_index] = valid_index
             valid_index += 1
 
     test_data = MoleculeDataset([full_data[i] for i in sorted(full_to_valid_indices.keys())])
-
-    # Edge case if empty list of smiles is provided
-    if len(test_data) == 0:
-        return [None] * len(full_data)
+    validate_checkpoint_feature_schema(args, train_args, full_data, test_data)
 
     print(f'Test size = {len(test_data):,}')
 
     # Create data loader
-    test_data_loader = MoleculeDataLoader(
-        dataset=test_data,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers
+    test_data_loader = (
+        MoleculeDataLoader(
+            dataset=test_data,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        if len(test_data) > 0
+        else None
     )
 
     # Set fingerprint size
     if args.fingerprint_type == 'MPN':
         if args.atom_descriptors == "descriptor": # special case when we have 'descriptor' extra dimensions need to be added
-            total_fp_size = (args.hidden_size + test_data.atom_descriptors_size()) * args.number_of_molecules
+            total_fp_size = (
+                args.hidden_size + train_args.atom_descriptors_size
+            ) * args.number_of_molecules
         else:
             if args.reaction_solvent:
                 total_fp_size = args.hidden_size + args.hidden_size_solvent
@@ -111,6 +203,8 @@ def molecule_fingerprint(args: FingerprintArgs,
     print(f'Encoding smiles into a fingerprint vector from {len(args.checkpoint_paths)} models.')
 
     for index, checkpoint_path in enumerate(tqdm(args.checkpoint_paths, total=len(args.checkpoint_paths))):
+        if len(test_data) == 0:
+            break
         model = load_checkpoint(checkpoint_path, device=args.device)
         scaler, features_scaler, atom_descriptor_scaler, bond_descriptor_scaler, atom_bond_scaler = load_scalers(args.checkpoint_paths[index])
 
@@ -130,26 +224,30 @@ def molecule_fingerprint(args: FingerprintArgs,
             data_loader=test_data_loader,
             fingerprint_type=args.fingerprint_type
         )
-        if args.fingerprint_type == 'MPN' and (args.features_path is not None or args.features_generator): # truncate any features from MPN fingerprint
-            model_fp = np.array(model_fp)[:,:total_fp_size] 
+        if args.fingerprint_type == 'MPN' and (
+            args.features_path is not None
+            or getattr(args, 'phase_features_path', None) is not None
+            or args.features_generator
+        ):
+            # v1's MPN fingerprint path concatenates all input features. Keep
+            # only the graph representation requested by fingerprint_type=MPN.
+            model_fp = np.asarray(model_fp)[:, :total_fp_size]
         all_fingerprints[:,:,index] = model_fp
 
     # Save predictions
     print(f'Saving predictions to {args.preds_path}')
-    # assert len(test_data) == len(all_fingerprints) #TODO: add unit test for this
     makedirs(args.preds_path, isfile=True)
 
     # Set column names
     fingerprint_columns = []
     if args.fingerprint_type == 'MPN':
-        if len(args.checkpoint_paths) == 1:
-            for j in range(total_fp_size//args.number_of_molecules):
-                for k in range(args.number_of_molecules):
+        fingerprint_size_per_molecule = total_fp_size // args.number_of_molecules
+        for k in range(args.number_of_molecules):
+            for j in range(fingerprint_size_per_molecule):
+                if len(args.checkpoint_paths) == 1:
                     fingerprint_columns.append(f'fp_{j}_mol_{k}')
-        else:
-            for j in range(total_fp_size//args.number_of_molecules):
-                for i in range(len(args.checkpoint_paths)):
-                    for k in range(args.number_of_molecules):
+                else:
+                    for i in range(len(args.checkpoint_paths)):
                         fingerprint_columns.append(f'fp_{j}_mol_{k}_model_{i}')
 
     else: # args == 'last_FNN'

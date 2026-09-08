@@ -18,6 +18,13 @@ from chemprop.hyperopt_utils import merge_trials, load_trials, save_trials, \
     get_hyperopt_seed, load_manual_trials, build_search_space, save_config
 
 
+def _score_to_hyperopt_loss(mean_score: float, minimize_score: bool) -> float:
+    """Maps invalid validation scores to the worst possible Hyperopt loss."""
+    if not np.isfinite(mean_score):
+        return float('inf')
+    return (1 if minimize_score else -1) * float(mean_score)
+
+
 @timeit(logger_name=HYPEROPT_LOGGER_NAME)
 def hyperopt(args: HyperoptArgs) -> None:
     """
@@ -79,6 +86,12 @@ def hyperopt(args: HyperoptArgs) -> None:
         # Copy args
         hyper_args = deepcopy(args)
 
+        # Never use test labels to select a hyperparameter trial, even when
+        # objective() is called with a programmatically constructed args
+        # object which has not passed through HyperoptArgs.process_args().
+        hyper_args.data_type = "validation"
+        hyper_args.skip_test_evaluation = True
+
         # Update args with hyperparams
         if args.save_dir is not None:
             folder_name = f"trial_seed_{seed}"
@@ -107,16 +120,9 @@ def hyperopt(args: HyperoptArgs) -> None:
         logger.info(f"num params: {num_params:,}")
         logger.info(f"{mean_score} +/- {std_score} {hyper_args.metric}")
 
-        # Deal with nan
-        if np.isnan(mean_score):
-            if hyper_args.dataset_type == "classification":
-                mean_score = 0
-            else:
-                raise ValueError(
-                    "Can't handle nan score for non-classification dataset."
-                )
-
-        loss = (1 if hyper_args.minimize_score else -1) * mean_score
+        # Hyperopt minimizes ``loss``. Invalid validation metrics must never
+        # become attractive trials (for example NaN BCE used to become 0).
+        loss = _score_to_hyperopt_loss(mean_score, hyper_args.minimize_score)
 
         return {
             "loss": loss,
@@ -180,7 +186,14 @@ def hyperopt(args: HyperoptArgs) -> None:
         dir_path=args.hyperopt_checkpoint_dir, previous_trials=manual_trials
     )
     results = all_trials.results
-    results = [result for result in results if not np.isnan(result["mean_score"])]
+    results = [
+        result for result in results
+        if np.isfinite(result.get("mean_score", float('nan')))
+    ]
+    if not results:
+        raise ValueError(
+            'No hyperparameter trial produced a finite validation score.'
+        )
     best_result = min(
         results,
         key=lambda result: (1 if args.minimize_score else -1) * result["mean_score"],

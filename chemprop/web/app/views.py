@@ -1,17 +1,19 @@
 """Defines a number of routes/views for the flask app."""
 
 from functools import wraps
+import hmac
 import io
+import ipaddress
 import os
+import secrets
 import sys
 import shutil
 from tempfile import TemporaryDirectory, NamedTemporaryFile
-import time
 from typing import Callable, List, Tuple
 import multiprocessing as mp
 import zipfile
 
-from flask import json, jsonify, redirect, render_template, request, send_file, send_from_directory, url_for
+from flask import abort, json, jsonify, redirect, render_template, request, send_file, send_from_directory, session, url_for
 import numpy as np
 from rdkit import Chem
 from werkzeug.utils import secure_filename
@@ -28,6 +30,139 @@ from chemprop.utils import create_logger, load_task_names, load_args
 
 TRAINING = 0
 PROGRESS = mp.Value('d', 0.0)
+SAFE_RETURN_PAGES = {'home', 'train', 'predict', 'data', 'checkpoints'}
+
+
+def current_user_id() -> int:
+    """Returns the current signed-session user namespace."""
+    # The legacy schema has no per-user credentials. Remote deployments
+    # therefore use a single authenticated namespace instead of exposing the
+    # local profile switcher as an ownership bypass.
+    if not app.config.get('LOCAL_ONLY', True):
+        return int(app.config['DEFAULT_USER_ID'])
+
+    user_id = session.get('current_user_id', app.config['DEFAULT_USER_ID'])
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        user_id = app.config['DEFAULT_USER_ID']
+
+    if user_id not in db.get_all_users():
+        user_id = app.config['DEFAULT_USER_ID']
+    session['current_user_id'] = user_id
+    return user_id
+
+
+def csrf_token() -> str:
+    """Returns a per-session CSRF token used by all state-changing routes."""
+    token = session.get('_csrf_token')
+    if token is None:
+        token = secrets.token_urlsafe(32)
+        session['_csrf_token'] = token
+    return token
+
+
+app.jinja_env.globals['csrf_token'] = csrf_token
+
+
+@app.context_processor
+def inject_security_context():
+    return {'current_user_id': current_user_id()}
+
+
+@app.before_request
+def enforce_web_security():
+    """Keeps the unauthenticated legacy UI local and checks CSRF tokens."""
+    if app.config.get('LOCAL_ONLY', True):
+        try:
+            if not ipaddress.ip_address(request.remote_addr or '127.0.0.1').is_loopback:
+                abort(403, description='The Chemprop legacy web UI is configured for loopback access only.')
+        except ValueError:
+            abort(403)
+    else:
+        authorization = request.authorization
+        valid_credentials = (
+            authorization is not None
+            and hmac.compare_digest(authorization.username or '', app.config['WEB_USERNAME'])
+            and hmac.compare_digest(authorization.password or '', app.config.get('WEB_PASSWORD') or '')
+        )
+        if not valid_credentials:
+            return 'Authentication required.', 401, {'WWW-Authenticate': 'Basic realm="Chemprop"'}
+
+    if request.method in {'POST', 'PUT', 'PATCH', 'DELETE'} and not app.config.get('TESTING', False):
+        supplied = request.form.get('_csrf_token') or request.headers.get('X-CSRF-Token')
+        expected = session.get('_csrf_token')
+        if expected is None or supplied is None or not hmac.compare_digest(expected, supplied):
+            abort(400, description='Missing or invalid CSRF token.')
+
+
+@app.after_request
+def add_security_headers(response):
+    """Adds browser security controls to every web response."""
+    response.headers.setdefault(
+        'Content-Security-Policy',
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "connect-src 'self'; "
+        "font-src 'self' data: https://cdn.jsdelivr.net; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "frame-src 'self'; "
+        "img-src 'self' data: blob:; "
+        "object-src 'none'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://code.jquery.com https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "worker-src 'self' blob:"
+    )
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'no-referrer')
+    response.headers.setdefault('Permissions-Policy', 'camera=(), geolocation=(), microphone=()')
+    # Remote mode is contractually served through HTTPS. The backend request
+    # may still be plain HTTP after TLS termination, so preserve HSTS there
+    # without trusting spoofable forwarded-proto headers.
+    if request.is_secure or not app.config.get('LOCAL_ONLY', True):
+        response.headers.setdefault('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+    return response
+
+
+def _safe_checkpoint_paths_from_zip(zip_path: str, destination: str) -> List[str]:
+    """Extracts only regular ``.pt`` files while rejecting traversal and zip bombs."""
+    max_files = 100
+    max_uncompressed_size = 500 * 1024 * 1024
+    paths = []
+    total_size = 0
+
+    with zipfile.ZipFile(zip_path, mode='r') as archive:
+        members = [member for member in archive.infolist() if not member.is_dir()]
+        if len(members) > max_files:
+            raise ValueError(f'Checkpoint archive contains more than {max_files} files.')
+
+        for member in members:
+            normalized = os.path.normpath(member.filename)
+            file_type = (member.external_attr >> 16) & 0o170000
+            if normalized.startswith(('..', '/')) or file_type == 0o120000:
+                raise ValueError(f'Unsafe checkpoint archive member: {member.filename!r}')
+            if not normalized.lower().endswith('.pt'):
+                continue
+
+            total_size += member.file_size
+            if total_size > max_uncompressed_size:
+                raise ValueError('Checkpoint archive is too large after decompression.')
+
+            output_path = os.path.join(destination, f'model_{len(paths)}.pt')
+            with archive.open(member) as source, open(output_path, 'wb') as target:
+                shutil.copyfileobj(source, target)
+            paths.append(output_path)
+
+    return paths
+
+
+def _predictions_path() -> str:
+    return os.path.join(
+        app.config['TEMP_FOLDER'],
+        f'{current_user_id()}_{app.config["PREDICTIONS_FILENAME"]}',
+    )
 
 
 def check_not_demo(func: Callable) -> Callable:
@@ -46,7 +181,7 @@ def check_not_demo(func: Callable) -> Callable:
     return decorated_function
 
 
-def progress_bar(args: TrainArgs, progress: mp.Value):
+def progress_bar(args: TrainArgs, progress: mp.Value, stop_event) -> None:
     """
     Updates a progress bar displayed during training.
 
@@ -55,16 +190,14 @@ def progress_bar(args: TrainArgs, progress: mp.Value):
     """
     # no code to handle crashes in model training yet, though
     current_epoch = -1
-    while current_epoch < args.epochs - 1:
+    while current_epoch < args.epochs - 1 and not stop_event.is_set():
         if os.path.exists(os.path.join(args.save_dir, 'verbose.log')):
             with open(os.path.join(args.save_dir, 'verbose.log'), 'r') as f:
                 content = f.read()
                 if 'Epoch ' + str(current_epoch + 1) in content:
                     current_epoch += 1
                     progress.value = (current_epoch + 1) * 100 / args.epochs
-        else:
-            pass
-        time.sleep(0)
+        stop_event.wait(0.1)
 
 
 def find_unused_path(path: str) -> str:
@@ -150,6 +283,22 @@ def home():
     return render_template('home.html', users=db.get_all_users())
 
 
+@app.route('/select_user', methods=['POST'])
+@check_not_demo
+def select_user():
+    """Selects a local user namespace in the signed Flask session."""
+    if not app.config.get('LOCAL_ONLY', True):
+        abort(403)
+    try:
+        user_id = int(request.form['user_id'])
+    except (KeyError, TypeError, ValueError):
+        abort(400)
+    if user_id not in db.get_all_users():
+        abort(404)
+    session['current_user_id'] = user_id
+    return redirect(request.referrer or url_for('home'))
+
+
 @app.route('/create_user', methods=['GET', 'POST'])
 @check_not_demo
 def create_user():
@@ -173,7 +322,7 @@ def render_train(**kwargs):
     data_upload_warnings, data_upload_errors = get_upload_warnings_errors('data')
 
     return render_template('train.html',
-                           datasets=db.get_datasets(request.cookies.get('currentUser')),
+                           datasets=db.get_datasets(current_user_id()),
                            cuda=app.config['CUDA'],
                            gpus=app.config['GPUS'],
                            data_upload_warnings=data_upload_warnings,
@@ -197,7 +346,14 @@ def train():
     data_name, epochs, ensemble_size, checkpoint_name = \
         request.form['dataName'], int(request.form['epochs']), \
         int(request.form['ensembleSize']), request.form['checkpointName']
+    try:
+        data_name = int(data_name)
+    except (TypeError, ValueError):
+        abort(400)
     gpu = request.form.get('gpu')
+    dataset_row = db.get_dataset(data_name, user_id=current_user_id())
+    if dataset_row is None:
+        abort(404)
     data_path = os.path.join(app.config['DATA_FOLDER'], f'{data_name}.csv')
     dataset_type = request.form.get('datasetType', 'regression')
     use_progress_bar = request.form.get('useProgressBar', 'True') == 'True'
@@ -236,11 +392,7 @@ def train():
         else:
             args.gpu = int(gpu)
 
-    current_user = request.cookies.get('currentUser')
-
-    if not current_user:
-        # Use DEFAULT as current user if the client's cookie is not set.
-        current_user = app.config['DEFAULT_USER_ID']
+    current_user = current_user_id()
 
     ckpt_id, ckpt_name = db.insert_ckpt(checkpoint_name,
                                         current_user,
@@ -252,21 +404,30 @@ def train():
     with TemporaryDirectory() as temp_dir:
         args.save_dir = temp_dir
 
+        progress_stop_event = None
+        process = None
         if use_progress_bar:
-            process = mp.Process(target=progress_bar, args=(args, PROGRESS))
+            progress_stop_event = mp.Event()
+            process = mp.Process(target=progress_bar, args=(args, PROGRESS, progress_stop_event))
             process.start()
             TRAINING = 1
 
         # Run training
         logger = create_logger(name=TRAIN_LOGGER_NAME, save_dir=args.save_dir, quiet=args.quiet)
-        task_scores = run_training(args, data, logger)[args.metrics[0]]
+        try:
+            _, test_scores = run_training(args, data, 0, logger)
+            task_scores = test_scores[args.metrics[0]]
+        finally:
+            if process is not None:
+                progress_stop_event.set()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=1)
 
-        if use_progress_bar:
-            process.join()
-
-            # Reset globals
-            TRAINING = 0
-            PROGRESS = mp.Value('d', 0.0)
+                # Reset globals even after early stopping or a training error.
+                TRAINING = 0
+                PROGRESS = mp.Value('d', 0.0)
 
         # Check if name overlap
         if checkpoint_name != ckpt_name:
@@ -295,7 +456,7 @@ def render_predict(**kwargs):
     checkpoint_upload_warnings, checkpoint_upload_errors = get_upload_warnings_errors('checkpoint')
 
     return render_template('predict.html',
-                           checkpoints=db.get_ckpts(request.cookies.get('currentUser')),
+                           checkpoints=db.get_ckpts(current_user_id()),
                            cuda=app.config['CUDA'],
                            gpus=app.config['GPUS'],
                            checkpoint_upload_warnings=checkpoint_upload_warnings,
@@ -311,7 +472,10 @@ def predict():
         return render_predict()
 
     # Get arguments
-    ckpt_id = request.form['checkpointName']
+    try:
+        ckpt_id = int(request.form['checkpointName'])
+    except (TypeError, ValueError):
+        abort(400)
 
     if request.form['textSmiles'] != '':
         smiles = request.form['textSmiles'].split()
@@ -333,7 +497,11 @@ def predict():
 
     smiles = [[s] for s in smiles]
 
-    models = db.get_models(ckpt_id)
+    if db.get_ckpt(ckpt_id, user_id=current_user_id()) is None:
+        abort(404)
+    models = db.get_models(ckpt_id, user_id=current_user_id())
+    if not models:
+        abort(404)
     model_paths = [os.path.join(app.config['CHECKPOINT_FOLDER'], f'{model["id"]}.pt') for model in models]
 
     task_names = load_task_names(model_paths[0])
@@ -344,7 +512,7 @@ def predict():
     # Build arguments
     arguments = [
         '--test_path', 'None',
-        '--preds_path', os.path.join(app.config['TEMP_FOLDER'], app.config['PREDICTIONS_FILENAME']),
+        '--preds_path', _predictions_path(),
         '--checkpoint_paths', *model_paths
     ]
 
@@ -394,7 +562,15 @@ def predict():
 @app.route('/download_predictions')
 def download_predictions():
     """Downloads predictions as a .csv file."""
-    return send_from_directory(app.config['TEMP_FOLDER'], app.config['PREDICTIONS_FILENAME'], as_attachment=True, cache_timeout=-1)
+    predictions_path = _predictions_path()
+    if not os.path.isfile(predictions_path):
+        abort(404)
+    return send_from_directory(
+        app.config['TEMP_FOLDER'],
+        os.path.basename(predictions_path),
+        as_attachment=True,
+        max_age=0,
+    )
 
 
 @app.route('/data')
@@ -404,7 +580,7 @@ def data():
     data_upload_warnings, data_upload_errors = get_upload_warnings_errors('data')
 
     return render_template('data.html',
-                           datasets=db.get_datasets(request.cookies.get('currentUser')),
+                           datasets=db.get_datasets(current_user_id()),
                            data_upload_warnings=data_upload_warnings,
                            data_upload_errors=data_upload_errors,
                            users=db.get_all_users())
@@ -420,11 +596,9 @@ def upload_data(return_page: str):
     """
     warnings, errors = [], []
 
-    current_user = request.cookies.get('currentUser')
-
-    if not current_user:
-        # Use DEFAULT as current user if the client's cookie is not set.
-        current_user = app.config['DEFAULT_USER_ID']
+    if return_page not in SAFE_RETURN_PAGES:
+        abort(400)
+    current_user = current_user_id()
 
     dataset = request.files['dataset']
 
@@ -460,10 +634,14 @@ def download_data(dataset: int):
 
     :param dataset: The id of the dataset to download.
     """
-    return send_from_directory(app.config['DATA_FOLDER'], f'{dataset}.csv', as_attachment=True, cache_timeout=-1)
+    if db.get_dataset(dataset, user_id=current_user_id()) is None:
+        abort(404)
+    return send_from_directory(
+        app.config['DATA_FOLDER'], f'{dataset}.csv', as_attachment=True, max_age=0
+    )
 
 
-@app.route('/data/delete/<int:dataset>')
+@app.route('/data/delete/<int:dataset>', methods=['POST'])
 @check_not_demo
 def delete_data(dataset: int):
     """
@@ -471,8 +649,11 @@ def delete_data(dataset: int):
 
     :param dataset: The id of the dataset to delete.
     """
-    db.delete_dataset(dataset)
-    os.remove(os.path.join(app.config['DATA_FOLDER'], f'{dataset}.csv'))
+    if not db.delete_dataset(dataset, user_id=current_user_id()):
+        abort(404)
+    path = os.path.join(app.config['DATA_FOLDER'], f'{dataset}.csv')
+    if os.path.isfile(path):
+        os.remove(path)
     return redirect(url_for('data'))
 
 
@@ -483,7 +664,7 @@ def checkpoints():
     checkpoint_upload_warnings, checkpoint_upload_errors = get_upload_warnings_errors('checkpoint')
 
     return render_template('checkpoints.html',
-                           checkpoints=db.get_ckpts(request.cookies.get('currentUser')),
+                           checkpoints=db.get_ckpts(current_user_id()),
                            checkpoint_upload_warnings=checkpoint_upload_warnings,
                            checkpoint_upload_errors=checkpoint_upload_errors,
                            users=db.get_all_users())
@@ -499,43 +680,49 @@ def upload_checkpoint(return_page: str):
     """
     warnings, errors = [], []
 
-    current_user = request.cookies.get('currentUser')
-
-    if not current_user:
-        # Use DEFAULT as current user if the client's cookie is not set.
-        current_user = app.config['DEFAULT_USER_ID']
+    if not app.config.get('ALLOW_CHECKPOINT_UPLOADS', False):
+        abort(403, description='Checkpoint upload is disabled because PyTorch v1 checkpoints use unsafe pickle loading.')
+    if return_page not in SAFE_RETURN_PAGES:
+        abort(400)
+    current_user = current_user_id()
 
     ckpt = request.files['checkpoint']
 
     ckpt_name = request.form['checkpointName']
-    ckpt_ext = os.path.splitext(ckpt.filename)[1]
+    ckpt_ext = os.path.splitext(secure_filename(ckpt.filename))[1].lower()
 
     # Collect paths to all uploaded checkpoints (and unzip if necessary)
     temp_dir = TemporaryDirectory()
     ckpt_paths = []
 
-    if ckpt_ext.endswith('.pt'):
+    if ckpt_ext == '.pt':
         ckpt_path = os.path.join(temp_dir.name, MODEL_FILE_NAME)
         ckpt.save(ckpt_path)
         ckpt_paths = [ckpt_path]
 
-    elif ckpt_ext.endswith('.zip'):
+    elif ckpt_ext == '.zip':
         ckpt_dir = os.path.join(temp_dir.name, 'models')
+        os.makedirs(ckpt_dir)
         zip_path = os.path.join(temp_dir.name, 'models.zip')
         ckpt.save(zip_path)
-
-        with zipfile.ZipFile(zip_path, mode='r') as z:
-            z.extractall(ckpt_dir)
-
-        for root, _, fnames in os.walk(ckpt_dir):
-            ckpt_paths += [os.path.join(root, fname) for fname in fnames if fname.endswith('.pt')]
+        try:
+            ckpt_paths = _safe_checkpoint_paths_from_zip(zip_path, ckpt_dir)
+        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
+            errors.append(str(error))
 
     else:
         errors.append(f'Uploaded checkpoint(s) file must be either .pt or .zip but got {ckpt_ext}')
 
     # Insert checkpoints into database
-    if len(ckpt_paths) > 0:
-        ckpt_args = load_args(ckpt_paths[0])
+    if len(ckpt_paths) > 0 and not errors:
+        try:
+            # This is intentionally reachable only after the explicit
+            # allow_checkpoint_uploads trust opt-in above.
+            ckpt_args = load_args(ckpt_paths[0])
+        except Exception as error:
+            errors.append(f'Unable to load trusted checkpoint metadata: {error}')
+
+    if len(ckpt_paths) > 0 and not errors:
         ckpt_id, new_ckpt_name = db.insert_ckpt(ckpt_name,
                                                 current_user,
                                                 ckpt_args.dataset_type,
@@ -567,8 +754,10 @@ def download_checkpoint(checkpoint: int):
 
     :param checkpoint: The name of the checkpoint to download.
     """
-    ckpt = db.query_db(f'SELECT * FROM ckpt WHERE id = {checkpoint}', one=True)
-    models = db.get_models(checkpoint)
+    ckpt = db.get_ckpt(checkpoint, user_id=current_user_id())
+    if ckpt is None:
+        abort(404)
+    models = db.get_models(checkpoint, user_id=current_user_id())
 
     model_data = io.BytesIO()
 
@@ -583,12 +772,12 @@ def download_checkpoint(checkpoint: int):
         model_data,
         mimetype='application/zip',
         as_attachment=True,
-        attachment_filename=f'{ckpt["ckpt_name"]}.zip',
-        cache_timeout=-1
+        download_name=f'{ckpt["ckpt_name"]}.zip',
+        max_age=0,
     )
 
 
-@app.route('/checkpoints/delete/<int:checkpoint>')
+@app.route('/checkpoints/delete/<int:checkpoint>', methods=['POST'])
 @check_not_demo
 def delete_checkpoint(checkpoint: int):
     """
@@ -596,5 +785,6 @@ def delete_checkpoint(checkpoint: int):
 
     :param checkpoint: The id of the checkpoint to delete.
     """
-    db.delete_ckpt(checkpoint)
+    if not db.delete_ckpt(checkpoint, user_id=current_user_id()):
+        abort(404)
     return redirect(url_for('checkpoints'))

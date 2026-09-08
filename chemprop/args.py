@@ -2,7 +2,7 @@ import json
 import os
 from tempfile import TemporaryDirectory
 import pickle
-from typing import List, Optional
+from typing import Dict, List, Optional
 from typing_extensions import Literal
 from packaging import version
 from warnings import warn
@@ -58,7 +58,10 @@ def get_checkpoint_paths(checkpoint_path: Optional[str] = None,
         if len(checkpoint_paths) == 0:
             raise ValueError(f'Failed to find any checkpoints with extension "{ext}" in directory "{checkpoint_dir}"')
 
-        return checkpoint_paths
+        # ``os.walk`` does not guarantee traversal order. A stable checkpoint
+        # order is important because ensemble member indices are exposed in
+        # prediction outputs.
+        return sorted(checkpoint_paths)
 
     return None
 
@@ -80,6 +83,10 @@ class CommonArgs(Tap):
     """List of paths to model checkpoints (:code:`.pt` files)."""
     selected_features_path: str = None
     """Path to selected features csv (:code:`.csv` file)."""    
+    features_generator_metadata: Dict = None
+    """Ordered feature schema metadata stored in new checkpoints for prediction validation."""
+    features_source_metadata: Dict = None
+    """Structure of generated, external, and phase feature inputs stored in new checkpoints."""
     no_cuda: bool = False
     """Turn off cuda (i.e., use CPU instead of GPU)."""
     gpu: int = None
@@ -89,7 +96,10 @@ class CommonArgs(Tap):
     data_type: Literal['validation', 'test'] = 'test'
     """Output scores of cross_validate.py."""
     use_cache: bool = False
-    """Whether to use cache or not before training."""
+    """Whether to cache loaded datasets in a content-addressed ``.chemprop_cache`` directory.
+    Set ``CHEMPROP_CACHE_DIR`` to choose a private user-owned cache location.
+    Cached datasets use trusted Python pickle data and must never be shared with
+    untrusted users."""
     features_generator: List[str] = None
     """Method(s) of generating additional features."""
     features_path: List[str] = None
@@ -213,22 +223,42 @@ class CommonArgs(Tap):
         self._bond_descriptors_size = bond_descriptors_size
 
     def configure(self) -> None:
+        """Registers runtime-dependent command-line choices."""
         self.add_argument('--gpu', choices=list(range(torch.cuda.device_count())))
         self.add_argument('--features_generator', choices=get_available_features_generators())
 
     def process_args(self) -> None:
+        # LightGBM bundles use ``.pkl`` while neural-network checkpoints use
+        # ``.pt``. Infer the model type when the supplied source is
+        # unambiguous, so prediction from a LightGBM checkpoint directory does
+        # not require a redundant ``--model_type lgbm`` flag.
+        if hasattr(self, 'model_type') and self.model_type == 'FFN':
+            checkpoint_extensions = set()
+            if self.checkpoint_path is not None:
+                checkpoint_extensions.add(os.path.splitext(self.checkpoint_path)[1].lower())
+            elif self.checkpoint_paths is not None:
+                checkpoint_extensions.update(
+                    os.path.splitext(path)[1].lower() for path in self.checkpoint_paths
+                )
+            elif self.checkpoint_dir is not None:
+                for _, _, files in os.walk(self.checkpoint_dir):
+                    checkpoint_extensions.update(
+                        os.path.splitext(filename)[1].lower()
+                        for filename in files
+                        if os.path.splitext(filename)[1].lower() in {'.pt', '.pkl'}
+                    )
+            if checkpoint_extensions == {'.pkl'}:
+                self.model_type = 'lgbm'
+
         # Load checkpoint paths
-        if self.model_type == 'lgbm':
+        # Not every CommonArgs subclass has a model_type (for example,
+        # InterpretArgs). Default those callers to the standard FFN path.
+        if getattr(self, 'model_type', 'FFN') == 'lgbm':
             self.checkpoint_paths = get_checkpoint_paths(
                 checkpoint_path=self.checkpoint_path,
                 checkpoint_paths=self.checkpoint_paths,
                 checkpoint_dir=self.checkpoint_dir,
-                ext = '.pkl'
-            )
-            self.checkpoint_paths_scaler = get_checkpoint_paths(
-                checkpoint_path=self.checkpoint_path,
-                checkpoint_paths=None, #self.checkpoint_paths,
-                checkpoint_dir=self.checkpoint_dir,
+                ext='.pkl',
             )
         else:
             self.checkpoint_paths = get_checkpoint_paths(
@@ -359,6 +389,8 @@ class TrainArgs(CommonArgs):
     Whether to resume the experiment.
     Loads test results from any folds that have already been completed and skips training those folds.
     """
+    skip_test_evaluation: bool = False
+    """Withhold test-set evaluation and artifacts. Enabled automatically for hyperparameter optimization."""
 
     # Model arguments
     bias: bool = False
@@ -417,7 +449,25 @@ class TrainArgs(CommonArgs):
     """
     ensemble_size: int = 1
     """Number of models in ensemble."""
-    aggregation: Literal['sum', 'norm', 'mean', 'max', 'lstm', 'gru', 'gm', 'eq', 'ds', 'attn'] = 'mean'
+    lgbm_num_boost_round: int = 500
+    """Maximum number of boosting rounds for each LightGBM task head."""
+    lgbm_early_stopping_rounds: int = 30
+    """Validation rounds without improvement before stopping; 0 disables early stopping."""
+    lgbm_learning_rate: float = 0.05
+    """LightGBM shrinkage rate."""
+    lgbm_num_leaves: int = 31
+    """Maximum leaves in each LightGBM tree."""
+    lgbm_feature_fraction: float = 0.8
+    """Fraction of encoded features sampled for each LightGBM model."""
+    lgbm_bagging_fraction: float = 0.8
+    """Fraction of training rows sampled by LightGBM bagging."""
+    lgbm_bagging_freq: int = 1
+    """Boosting-iteration frequency for LightGBM bagging; 0 disables it."""
+    lgbm_min_data_in_leaf: int = 20
+    """Minimum number of training rows in a LightGBM leaf."""
+    lgbm_num_threads: int = None
+    """LightGBM CPU threads; defaults to max(1, --num_workers)."""
+    aggregation: Literal['sum', 'norm', 'mean'] = 'mean'
     """Aggregation scheme for atomic vectors into molecular vectors"""
     aggregation_norm: int = 100
     """For norm aggregation, number by which to divide summed up atomic features"""
@@ -544,7 +594,7 @@ class TrainArgs(CommonArgs):
     @property
     def minimize_score(self) -> bool:
         """Whether the model should try to minimize the score metric or maximize it."""
-        return self.metric in {'rmse', 'mae', 'mse', 'cross_entropy', 'binary_cross_entropy', 'sid', 'wasserstein', 'bounded_mse', 'bounded_mae', 'bounded_rmse'}
+        return self.metric in {'rmse', 'mae', 'mse', 'cross_entropy', 'binary_cross_entropy', 'sid', 'wasserstein', 'bounded_mse', 'bounded_mae', 'bounded_rmse', 'quantile'}
 
     @property
     def use_input_features(self) -> bool:
@@ -756,7 +806,7 @@ class TrainArgs(CommonArgs):
                              f'Please only include it once.')
 
         for metric in self.metrics:
-            if not any([(self.dataset_type == 'classification' and metric in ['auc', 'prc-auc', 'accuracy', 'binary_cross_entropy', 'f1', 'mcc', 'recall', 'precision', 'balanced_accuracy', 'confusion_matrix']),
+            if not any([(self.dataset_type == 'classification' and metric in ['auc', 'prc-auc', 'accuracy', 'binary_cross_entropy', 'f1', 'mcc', 'recall', 'precision', 'balanced_accuracy']),
                         (self.dataset_type == 'regression' and metric in ['rmse', 'mae', 'mse', 'r2', 'bounded_rmse', 'bounded_mae', 'bounded_mse', 'quantile']),
                         (self.dataset_type == 'multiclass' and metric in ['cross_entropy', 'accuracy', 'f1', 'mcc']),
                         (self.dataset_type == 'spectra' and metric in ['sid', 'wasserstein'])]):
@@ -904,10 +954,17 @@ class TrainArgs(CommonArgs):
 
         # normalize target weights
         if self.target_weights is not None:
-            avg_weight = sum(self.target_weights)/len(self.target_weights)
-            self.target_weights = [w/avg_weight for w in self.target_weights]
-            if min(self.target_weights) < 0:
+            target_weights = np.asarray(self.target_weights, dtype=float)
+            if target_weights.size == 0:
+                raise ValueError('At least one target weight must be provided.')
+            if not np.all(np.isfinite(target_weights)):
+                raise ValueError('Provided target weights must be finite.')
+            if np.any(target_weights < 0):
                 raise ValueError('Provided target weights must be non-negative.')
+            if float(target_weights.sum()) <= 0:
+                raise ValueError('At least one target weight must be positive.')
+            target_weights /= float(target_weights.mean())
+            self.target_weights = target_weights.tolist()
 
         # check if key molecule index is outside of the number of molecules
         if self.split_key_molecule >= self.number_of_molecules:
@@ -919,6 +976,70 @@ class TrainArgs(CommonArgs):
             raise ValueError(
                 "quantile_loss_alpha should be in the range [0, 0.5]"
             )
+
+        if not isinstance(self.ensemble_size, int) or self.ensemble_size < 1:
+            raise ValueError('ensemble_size must be a positive integer.')
+
+        if self.model_type == 'lgbm':
+            if self.dataset_type not in {'classification', 'regression'}:
+                raise ValueError('LightGBM supports only classification and regression datasets.')
+            if self.is_atom_bond_targets:
+                raise NotImplementedError('LightGBM does not support atom/bond target mode.')
+            supported_primary_metrics = {
+                'classification': {'auc', 'prc-auc', 'binary_cross_entropy'},
+                'regression': {'rmse', 'mae', 'mse'},
+            }[self.dataset_type]
+            if self.metric not in supported_primary_metrics:
+                raise NotImplementedError(
+                    f'LightGBM cannot use --metric {self.metric} for early stopping. '
+                    f'Supported primary metrics are '
+                    f'{", ".join(sorted(supported_primary_metrics))}; other metrics '
+                    'may still be requested with --extra_metrics for post-training evaluation.'
+                )
+            if self.target_weights is not None:
+                raise NotImplementedError(
+                    'LightGBM does not support --target_weights because each target '
+                    'is trained by an independent booster.'
+                )
+            supported_loss = {
+                'regression': 'mse',
+                'classification': 'binary_cross_entropy',
+            }[self.dataset_type]
+            if self.loss_function != supported_loss:
+                raise ValueError(
+                    f'LightGBM {self.dataset_type} supports only '
+                    f'--loss_function {supported_loss}; received {self.loss_function}.'
+                )
+            if self.checkpoint_paths is not None or self.checkpoint_frzn is not None:
+                raise NotImplementedError(
+                    'LightGBM warm-start/frozen checkpoints are not supported. '
+                    'Train a new bundle without checkpoint arguments.'
+                )
+            if self.test:
+                raise NotImplementedError(
+                    'LightGBM --test mode is not supported; use chemprop_predict '
+                    'with the saved .pkl bundle.'
+                )
+            if not isinstance(self.lgbm_num_boost_round, int) or self.lgbm_num_boost_round < 1:
+                raise ValueError('lgbm_num_boost_round must be a positive integer.')
+            if not isinstance(self.lgbm_early_stopping_rounds, int) or self.lgbm_early_stopping_rounds < 0:
+                raise ValueError('lgbm_early_stopping_rounds must be non-negative.')
+            if self.lgbm_learning_rate <= 0:
+                raise ValueError('lgbm_learning_rate must be greater than 0.')
+            if not isinstance(self.lgbm_num_leaves, int) or self.lgbm_num_leaves < 2:
+                raise ValueError('lgbm_num_leaves must be at least 2.')
+            if not 0 < self.lgbm_feature_fraction <= 1:
+                raise ValueError('lgbm_feature_fraction must be in (0, 1].')
+            if not 0 < self.lgbm_bagging_fraction <= 1:
+                raise ValueError('lgbm_bagging_fraction must be in (0, 1].')
+            if not isinstance(self.lgbm_bagging_freq, int) or self.lgbm_bagging_freq < 0:
+                raise ValueError('lgbm_bagging_freq must be non-negative.')
+            if not isinstance(self.lgbm_min_data_in_leaf, int) or self.lgbm_min_data_in_leaf < 1:
+                raise ValueError('lgbm_min_data_in_leaf must be positive.')
+            if self.lgbm_num_threads is None:
+                self.lgbm_num_threads = max(1, self.num_workers)
+            elif not isinstance(self.lgbm_num_threads, int) or self.lgbm_num_threads < 1:
+                raise ValueError('lgbm_num_threads must be positive.')
 
 
 class PredictArgs(CommonArgs):
@@ -1134,22 +1255,39 @@ class HyperoptArgs(TrainArgs):
     """The model parameters over which to search for an optimal hyperparameter configuration.
     Some options are bundles of parameters or otherwise special parameter operations.
 
-    Special keywords:
-        basic - the default set of hyperparameters for search: depth, ffn_num_layers, dropout, and linked_hidden_size.
-        linked_hidden_size - search for hidden_size and ffn_hidden_size, but constrained for them to have the same value.
-            If either of the component words are entered in separately, both are searched independently.
-        learning_rate - search for max_lr, init_lr, final_lr, and warmup_epochs. The search for init_lr and final_lr values
-            are defined as fractions of the max_lr value. The search for warmup_epochs is as a fraction of the total epochs used.
-        all - include search for all 13 inidividual keyword options
+    Special keywords are:
 
-    Individual supported parameters:
-        activation, aggregation, aggregation_norm, batch_size, depth,
-        dropout, ffn_hidden_size, ffn_num_layers, final_lr, hidden_size,
-        init_lr, max_lr, warmup_epochs
+    * ``basic``: the default search over depth, FFN layer count, dropout, and
+      linked hidden size.
+    * ``linked_hidden_size``: search hidden and FFN hidden sizes while keeping
+      them equal. Specifying either component separately searches them
+      independently.
+    * ``learning_rate``: search maximum, initial, and final learning rates plus
+      warmup epochs. Initial/final rates are fractions of the maximum rate, and
+      warmup is a fraction of total epochs.
+    * ``all``: include all thirteen individual parameter keywords.
+
+    Individual parameters are ``activation``, ``aggregation``,
+    ``aggregation_norm``, ``batch_size``, ``depth``, ``dropout``,
+    ``ffn_hidden_size``, ``ffn_num_layers``, ``final_lr``, ``hidden_size``,
+    ``init_lr``, ``max_lr``, and ``warmup_epochs``.
     """
 
     def process_args(self) -> None:
         super(HyperoptArgs, self).process_args()
+
+        if self.model_type != 'FFN':
+            raise NotImplementedError(
+                'chemprop_hyperopt currently supports only --model_type FFN. '
+                'Tune LightGBM with its --lgbm_* training arguments or an '
+                'external validation-only search.'
+            )
+
+        # Hyperparameters must be selected exclusively on validation data.
+        # Evaluating trials on the test split leaks test labels into model
+        # selection and invalidates the final test estimate.
+        self.data_type = 'validation'
+        self.skip_test_evaluation = True
 
         # Assign log and checkpoint directories if none provided
         if self.log_dir is None:

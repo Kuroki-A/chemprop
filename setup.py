@@ -1,27 +1,105 @@
+"""Setuptools configuration for the maintained Chemprop v1 fork.
+
+``environment.yml`` is the reproducible CUDA 12.4 environment used by this
+repository. The ranges below are intentionally less specific: Python package
+metadata must not select a CUDA build of PyTorch, and compatible patch releases
+should remain installable.
+"""
+
 from setuptools import find_packages, setup
+from setuptools.command.build_py import build_py
 
-__version__ = "1.7.1"
 
-# Load README
-with open("README.md", encoding="utf-8") as f:
-    long_description = f.read()
+class ChempropBuildPy(build_py):
+    """Excludes local comparison-only modules from distributions."""
+
+    def find_package_modules(self, package, package_dir):
+        modules = super().find_package_modules(package, package_dir)
+        if package == "chemprop.features":
+            modules = [module for module in modules if module[1] != "_features_generators"]
+        return modules
+
+
+VERSION = "1.7.1+kuroki.1"
+
+CORE_REQUIREMENTS = [
+    "Flask>=3.1.3,<3.2",
+    "Werkzeug>=3.1.8,<3.2",
+    "hyperopt>=0.2.7,<0.4",
+    "lightgbm>=4.6,<5",
+    "matplotlib>=3.8,<3.11",
+    "numpy>=1.26.4,<2.3",
+    "packaging>=24.2,<27",
+    "pandas>=2.2.3,<2.4",
+    "pandas-flavor>=0.6,<0.9",
+    "rdkit>=2024.9.6,<2027",
+    "scikit-learn>=1.6.1,<1.8",
+    "scipy>=1.15.2,<1.16",
+    "tensorboardX>=2.6.2,<2.7",
+    # CUDA variants cannot be expressed in package metadata. For GPU use,
+    # install the desired official PyTorch wheel before installing Chemprop.
+    "torch>=2.6,<2.7",
+    "tqdm>=4.67,<5",
+    "typed-argument-parser>=1.10,<2",
+    "typing-extensions>=4.12,<5",
+    "descriptastorus>=2.8,<2.9",
+]
+
+FEATURE_REQUIREMENTS = [
+    "datamol>=0.12.5,<0.13",
+    "map4>=1.1.3,<1.2",
+    "mhfp>=1.9.6,<2",
+    "molfeat>=0.11,<0.12",
+    "mordredcommunity>=2.0.7,<2.1",
+    "padelpy>=0.1.17,<0.2",
+]
+
+# Molfeat 0.11's pretrained backends have stricter and partly historical
+# dependency requirements. They remain opt-in so the main environment can use
+# the newest stable numerical stack without pulling several large frameworks.
+PRETRAINED_FEATURE_REQUIREMENTS = [
+    "molfeat[dgl,graphormer,fcd,pyg]>=0.11,<0.12",
+    "dgl>=1.1.1,<=2.0.0",
+    "dgllife>=0.3.2,<0.4",
+    "graphormer-pretrained>=0.2.3,<0.3",
+    "tokenizers>=0.13,<0.13.2",
+    "transformers>=4.24,<4.25",
+    "sentencepiece>=0.2,<0.3",
+]
+
+TEST_REQUIREMENTS = [
+    "parameterized>=0.9,<1",
+    "pytest>=8.4,<10",
+]
+
+DOCS_REQUIREMENTS = [
+    "sphinx>=8.1,<8.2",
+    "sphinx-rtd-theme>=3.1,<3.2",
+]
+
+
+with open("README.md", encoding="utf-8") as readme_file:
+    long_description = readme_file.read()
+
 
 setup(
     name="chemprop",
+    version=VERSION,
     author="The Chemprop Development Team (see LICENSE.txt)",
     author_email="chemprop@mit.edu",
     description="Molecular Property Prediction with Message Passing Neural Networks",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/chemprop/chemprop",
-    download_url=f"https://github.com/chemprop/chemprop/v_{__version__}.tar.gz",
+    url="https://github.com/Kuroki-A/chemprop",
+    download_url=f"https://github.com/Kuroki-A/chemprop/archive/refs/tags/v{VERSION}.tar.gz",
     project_urls={
-        "Documentation": "https://chemprop.readthedocs.io/en/latest/",
-        "Source": "https://github.com/chemprop/chemprop",
-        "PyPi": "https://pypi.org/project/chemprop/",
+        "Documentation": "https://github.com/Kuroki-A/chemprop/tree/master/docs",
+        "Source": "https://github.com/Kuroki-A/chemprop",
     },
     license="MIT",
     packages=find_packages(),
+    cmdclass={"build_py": ChempropBuildPy},
+    include_package_data=True,
     package_data={"chemprop": ["py.typed"]},
     entry_points={
         "console_scripts": [
@@ -35,37 +113,23 @@ setup(
             "sklearn_predict=chemprop.sklearn_predict:sklearn_predict",
         ]
     },
-    install_requires=[
-        "flask>=1.1.2,<=2.1.3",
-        "Werkzeug<3",
-        "hyperopt>=0.2.3",
-        "matplotlib>=3.1.3",
-        "numpy>=1.18.1",
-        "pandas>=1.0.3",
-        "pandas-flavor>=0.2.0",
-        "scikit-learn>=0.22.2.post1",
-        "sphinx>=3.1.2",
-        "sphinx-rtd-theme>=2.0.0",
-        "tensorboardX>=2.0",
-        "torch>=1.4.0",
-        "tqdm>=4.45.0",
-        "typed-argument-parser>=1.6.1",
-        "rdkit>=2020.03.1.0",
-        "scipy<1.11 ; python_version=='3.7'",
-        "descriptastorus<2.6.1 ; python_version=='3.7'",
-        "scipy>=1.9 ; python_version>='3.8'",
-        "descriptastorus>=2.6.1 ; python_version>='3.8'",
-        "mordred",
-        "padelpy",
-        "lightgbm",
-        "notebook"
-    ],
-    extras_require={"test": ["pytest>=6.2.2", "parameterized>=0.8.1"]},
-    python_requires=">=3.7,<3.11",
+    install_requires=CORE_REQUIREMENTS,
+    extras_require={
+        "test": TEST_REQUIREMENTS,
+        "features": FEATURE_REQUIREMENTS,
+        "features-pretrained": FEATURE_REQUIREMENTS + PRETRAINED_FEATURE_REQUIREMENTS,
+        # Backward-compatible alias for the former all-in-one extra.
+        "features-all": FEATURE_REQUIREMENTS + PRETRAINED_FEATURE_REQUIREMENTS,
+        "web": ["gunicorn>=25,<27"],
+        "scripts": ["h5py>=3.12,<4"],
+        "notebooks": ["notebook>=7.5,<8"],
+        "docs": DOCS_REQUIREMENTS,
+    },
+    python_requires=">=3.10,<3.11",
     classifiers=[
-        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.10",
         "License :: OSI Approved :: MIT License",
-        "Operating System :: OS Independent",
+        "Operating System :: POSIX :: Linux",
     ],
     keywords=[
         "chemistry",

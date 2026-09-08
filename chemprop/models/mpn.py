@@ -6,8 +6,6 @@ from rdkit import Chem
 import torch
 import torch.nn as nn
 
-#from torch_geometric.nn import aggr
-
 from chemprop.args import TrainArgs
 from chemprop.features import BatchMolGraph, get_atom_fdim, get_bond_fdim, mol2graph
 from chemprop.nn_utils import index_select_ND, get_activation_function
@@ -74,35 +72,6 @@ class MPNEncoder(nn.Module):
             self.bond_descriptors_size = args.bond_descriptors_size
             self.bond_descriptors_layer = nn.Linear(self.hidden_size + self.bond_descriptors_size,
                                                     self.hidden_size + self.bond_descriptors_size,)
-        '''    
-        if self.aggregation == 'sum':
-            self.agg_layer = aggr.SumAggregation()
-        if self.aggregation == 'norm':
-            self.agg_layer = aggr.SumAggregation()
-        elif self.aggregation == 'mean':
-            self.agg_layer = aggr.MeanAggregation()
-        elif self.aggregation == 'max':
-            self.agg_layer = aggr.MaxAggregation()
-        elif self.aggregation == 'lstm':
-            agg = aggr.LSTMAggregation(in_channels=self.hidden_size, out_channels=self.hidden_size)
-            self.agg_layer = agg.to(self.device)
-        elif self.aggregation == 'gru':
-            agg = aggr.GRUAggregation(in_channels=self.hidden_size, out_channels=self.hidden_size)
-            self.agg_layer = agg.to(self.device)
-        elif self.aggregation == 'gm':
-            agg = aggr.GraphMultisetTransformer(channels=self.hidden_size, k=self.hidden_size)
-            self.agg_layer = agg.to(self.device)
-        elif self.aggregation == 'eq':
-            agg = aggr.EquilibriumAggregation(in_channels=self.hidden_size, out_channels=self.hidden_size, num_layers=[2])
-            self.agg_layer = agg.to(self.device)
-        elif self.aggregation == 'ds':
-            agg = aggr.DeepSetsAggregation()
-            self.agg_layer = agg.to(self.device)
-        elif self.aggregation == 'attn':
-            agg = aggr.SetTransformerAggregation(channels=self.hidden_size)
-            self.agg_layer = agg.to(self.device)
-        '''
-        
     def forward(self,
                 mol_graph: BatchMolGraph,
                 atom_descriptors_batch: List[np.ndarray] = None,
@@ -217,6 +186,11 @@ class MPNEncoder(nn.Module):
                     mol_vec = mol_vec.sum(dim=0)
                 elif self.aggregation == 'norm':
                     mol_vec = mol_vec.sum(dim=0) / self.aggregation_norm
+                else:
+                    raise ValueError(
+                        f'Aggregation "{self.aggregation}" is not supported. '
+                        'Choose one of "mean", "sum", or "norm".'
+                    )
                 mol_vecs.append(mol_vec)
                 '''
                 if self.aggregation == 'norm':

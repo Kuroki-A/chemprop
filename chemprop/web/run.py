@@ -8,7 +8,7 @@ import os
 from tap import Tap  # pip install typed-argument-parser (https://github.com/swansonk14/typed-argument-parser)
 
 from chemprop.web.app import app, db
-from chemprop.web.utils import clear_temp_folder, set_root_folder
+from chemprop.web.utils import clear_temp_folder, set_root_folder, validate_web_security_config
 
 
 class WebArgs(Tap):
@@ -18,10 +18,19 @@ class WebArgs(Tap):
     demo: bool = False  # Display only demo features
     initdb: bool = False  # Initialize Database
     root_folder: str = None  # Root folder where web data and checkpoints will be saved (defaults to chemprop/web/app)
+    allow_remote: bool = False  # Allow non-loopback clients (requires deployment-layer authentication)
+    allow_checkpoint_uploads: bool = False  # Trust and load uploaded pickle-based PyTorch checkpoints
 
 
 def run_web(args: WebArgs) -> None:
     app.config['DEMO'] = args.demo
+    app.config['LOCAL_ONLY'] = not args.allow_remote
+    app.config['ALLOW_CHECKPOINT_UPLOADS'] = args.allow_checkpoint_uploads
+    app.config['SESSION_COOKIE_SECURE'] = args.allow_remote
+
+    if args.host not in {'127.0.0.1', 'localhost', '::1'} and not args.allow_remote:
+        raise ValueError('Refusing to expose the unauthenticated legacy web UI. Pass --allow_remote only behind authentication.')
+    validate_web_security_config(app, allow_remote=args.allow_remote, debug=args.debug)
 
     # Set up root folder and subfolders
     set_root_folder(
