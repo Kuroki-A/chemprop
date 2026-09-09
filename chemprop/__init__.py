@@ -10,7 +10,7 @@ from importlib import import_module
 from typing import List
 
 
-__version__ = "1.7.1+kuroki.2"
+__version__ = "1.7.1+kuroki.3"
 
 _LAZY_SUBMODULES = {
     "args",

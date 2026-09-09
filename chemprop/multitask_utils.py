@@ -228,7 +228,7 @@ def reshape_values(
     test_data: MoleculeDataset,
     natom_targets: int,
     nbond_targets: int,
-) -> List[List[List[float]]]:
+) -> np.ndarray:
     """
     Reshape the input from shape (num_tasks, number of atomic/bond properties for each task, 1)
     to shape (data_size, num_tasks, number of atomic/bond properties for this data in each task).
@@ -238,8 +238,9 @@ def reshape_values(
     :param test_data: A :class:`~chemprop.data.MoleculeDataset` containing valid datapoints.
     :param natom_targets: The number of atomic targets.
     :param nbond_targets: The number of bond targets.
-    :return: List of atomic/bond properties with shape
-             (data_size, num_tasks, number of atomic/bond properties for this data in each task).
+    :return: A two-dimensional object array with shape ``(data_size, num_tasks)``.
+             Each cell is a one-dimensional numeric array whose length is the
+             atom or bond count for that datapoint and task.
     """
     num_atom_bond_tasks = _validate_task_counts(natom_targets, nbond_targets)
     if len(values) != num_atom_bond_tasks:
@@ -287,7 +288,7 @@ def reshape_individual_preds(
     natom_targets: int,
     nbond_targets: int,
     num_models: int,
-) -> List[List[List[List[float]]]]:
+) -> np.ndarray:
     """
     Reshape the input from shape (num_tasks, number of atomic/bond properties for each task, 1, num_models)
     to shape (data_size, num_tasks, num_models, number of atomic/bond properties for this data in each task).
@@ -298,8 +299,8 @@ def reshape_individual_preds(
     :param natom_targets: The number of atomic targets.
     :param nbond_targets: The number of bond targets.
     :param num_models: Number of models.
-    :return: List of atomic/bond properties with shape
-             (data_size, num_tasks, num_models, number of atomic/bond properties for this data in each task).
+    :return: A two-dimensional object array with shape ``(data_size, num_tasks)``.
+             Each cell has shape ``(num_models, num_elements)``.
     """
     num_atom_bond_tasks = _validate_task_counts(natom_targets, nbond_targets)
     if not isinstance(num_models, Integral) or isinstance(num_models, bool) or num_models <= 0:

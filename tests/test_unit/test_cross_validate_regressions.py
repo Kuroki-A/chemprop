@@ -67,6 +67,10 @@ def test_dataset_cache_is_content_addressed_and_round_trips(tmp_path: Path, monk
     config_manifest = cross_validate_module._dataset_cache_manifest(args)
     assert config_manifest != changed_selected_manifest
 
+    args.save_smiles_splits = True
+    save_split_manifest = cross_validate_module._dataset_cache_manifest(args)
+    assert save_split_manifest != config_manifest
+
     features_path = tmp_path / "features.npz"
     np.savez_compressed(features_path, features=np.ones((2, 3)))
     args.features_path = [str(features_path)]
@@ -117,6 +121,163 @@ def test_dataset_cache_rejects_insecure_paths_before_unpickling(
     with pytest.raises(ValueError, match="symbolic link"):
         cross_validate_module._load_dataset_cache(str(cache_symlink), manifest)
     assert load_called is False
+
+
+def test_dataset_cache_rejects_parent_symlink_before_pickle_access(
+    tmp_path: Path, monkeypatch,
+):
+    cross_validate_module = importlib.import_module("chemprop.train.cross_validate")
+    dataset = MoleculeDataset([MoleculeDatapoint(smiles=["CC"], targets=[2.0])])
+    manifest = {"schema_version": 1}
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    real_cache_dir = real_parent / "cache"
+    real_cache_dir.mkdir(mode=0o700)
+    parent_symlink = tmp_path / "parent-link"
+    parent_symlink.symlink_to(real_parent, target_is_directory=True)
+    cache_path = parent_symlink / "cache" / "cache.pt"
+
+    load_called = False
+    save_called = False
+
+    def fail_if_loaded(*args, **kwargs):
+        nonlocal load_called
+        load_called = True
+        raise AssertionError("torch.load must not inspect an unsafe cache")
+
+    def fail_if_saved(*args, **kwargs):
+        nonlocal save_called
+        save_called = True
+        raise AssertionError("torch.save must not write through an unsafe path")
+
+    monkeypatch.setattr(cross_validate_module.torch, "load", fail_if_loaded)
+    monkeypatch.setattr(cross_validate_module.torch, "save", fail_if_saved)
+    with pytest.raises(ValueError, match="symbolic-link components"):
+        cross_validate_module._load_dataset_cache(str(cache_path), manifest)
+    with pytest.raises(ValueError, match="symbolic-link components"):
+        cross_validate_module._save_dataset_cache(
+            str(cache_path), manifest, dataset,
+        )
+    assert load_called is False
+    assert save_called is False
+
+
+def test_dataset_cache_load_is_anchored_across_directory_swap(
+    tmp_path: Path, monkeypatch,
+):
+    cross_validate_module = importlib.import_module("chemprop.train.cross_validate")
+    if not cross_validate_module._supports_secure_cache_dir_fd():
+        pytest.skip("descriptor-relative no-follow cache access is unavailable")
+
+    manifest = {"schema_version": 1}
+    safe_dataset = MoleculeDataset(
+        [MoleculeDatapoint(smiles=["CC"], targets=[2.0])]
+    )
+    attacker_dataset = MoleculeDataset(
+        [MoleculeDatapoint(smiles=["N"], targets=[999.0])]
+    )
+    cache_dir = tmp_path / "cache"
+    attacker_dir = tmp_path / "attacker"
+    cache_path = cache_dir / "cache.pt"
+    attacker_path = attacker_dir / "cache.pt"
+    cross_validate_module._save_dataset_cache(
+        str(cache_path), manifest, safe_dataset,
+    )
+    cross_validate_module._save_dataset_cache(
+        str(attacker_path), manifest, attacker_dataset,
+    )
+
+    original_open = cross_validate_module.os.open
+    swapped_cache_dir = tmp_path / "cache-before-swap"
+    swapped = False
+
+    def swap_before_file_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "cache.pt" and dir_fd is not None and not swapped:
+            cache_dir.rename(swapped_cache_dir)
+            cache_dir.symlink_to(attacker_dir, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(cross_validate_module.os, "open", swap_before_file_open)
+    monkeypatch.setattr(
+        cross_validate_module, "_supports_secure_cache_dir_fd", lambda: True,
+    )
+    loaded = cross_validate_module._load_dataset_cache(str(cache_path), manifest)
+
+    assert swapped is True
+    assert loaded.smiles() == [["CC"]]
+    assert loaded.targets() == [[2.0]]
+
+
+def test_dataset_cache_portable_fallback_round_trips(tmp_path: Path, monkeypatch):
+    cross_validate_module = importlib.import_module("chemprop.train.cross_validate")
+    monkeypatch.setattr(
+        cross_validate_module, "_supports_secure_cache_dir_fd", lambda: False,
+    )
+    manifest = {"schema_version": 1}
+    dataset = MoleculeDataset(
+        [MoleculeDatapoint(smiles=["CO"], targets=[3.0])]
+    )
+    cache_path = tmp_path / "portable-cache" / "cache.pt"
+
+    cross_validate_module._save_dataset_cache(
+        str(cache_path), manifest, dataset,
+    )
+    loaded = cross_validate_module._load_dataset_cache(
+        str(cache_path), manifest,
+    )
+
+    assert loaded.smiles() == [["CO"]]
+    assert loaded.targets() == [[3.0]]
+
+
+def test_dataset_cache_save_is_anchored_across_directory_swap(
+    tmp_path: Path, monkeypatch,
+):
+    cross_validate_module = importlib.import_module("chemprop.train.cross_validate")
+    if not cross_validate_module._supports_secure_cache_dir_fd():
+        pytest.skip("descriptor-relative no-follow cache access is unavailable")
+
+    manifest = {"schema_version": 1}
+    dataset = MoleculeDataset(
+        [MoleculeDatapoint(smiles=["CN"], targets=[4.0])]
+    )
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(mode=0o700)
+    attacker_dir = tmp_path / "attacker"
+    attacker_dir.mkdir(mode=0o700)
+    cache_path = cache_dir / "cache.pt"
+    swapped_cache_dir = tmp_path / "cache-before-swap"
+
+    original_open = cross_validate_module.os.open
+    swapped = False
+
+    def swap_before_temp_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if (
+            isinstance(path, str)
+            and path.startswith(".dataset-")
+            and dir_fd is not None
+            and not swapped
+        ):
+            cache_dir.rename(swapped_cache_dir)
+            cache_dir.symlink_to(attacker_dir, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(cross_validate_module.os, "open", swap_before_temp_open)
+    monkeypatch.setattr(
+        cross_validate_module, "_supports_secure_cache_dir_fd", lambda: True,
+    )
+    cross_validate_module._save_dataset_cache(
+        str(cache_path), manifest, dataset,
+    )
+
+    assert swapped is True
+    assert (swapped_cache_dir / "cache.pt").is_file()
+    assert not (attacker_dir / "cache.pt").exists()
 
 
 def test_resume_manifest_tracks_separate_feature_sidecars(tmp_path: Path):

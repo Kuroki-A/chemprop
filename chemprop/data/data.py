@@ -2,8 +2,9 @@ import csv
 import os
 import threading
 from collections import OrderedDict
+from itertools import chain
 from random import Random
-from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Union, Tuple
+from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Union, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,7 +13,8 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from rdkit import Chem
 
 from .scaler import StandardScaler, AtomBondScaler
-from chemprop.features import generate_features_batch, get_features_generator
+from chemprop.features import generate_features_batch, get_features_generator, \
+    is_builtin_features_generator
 from chemprop.features import BatchMolGraph, MolGraph
 from chemprop.features import is_explicit_h, is_reaction, is_adding_hs, is_mol, is_keeping_atom_map
 from chemprop.features.featurization import reaction_mode
@@ -157,6 +159,8 @@ def generate_features_for_smiles_batch(
     features_generators: Sequence[str],
     selected_feature_columns: Mapping[str, Sequence[str]] = None,
     use_atom_mapping_for_hydrogens: Union[bool, Sequence[bool]] = False,
+    generator_overrides: Mapping[str, Callable] = None,
+    auto_detect_reactions: bool = False,
 ) -> List[np.ndarray]:
     """Generates dataset features in chunks while preserving v1 concatenation order.
 
@@ -171,6 +175,22 @@ def generate_features_for_smiles_batch(
         return [np.empty(0, dtype=float) for _ in smiles_rows]
 
     selected_feature_columns = selected_feature_columns or {}
+    generator_overrides = generator_overrides or {}
+    effective_generators = {}
+    for name in features_generators:
+        override = generator_overrides.get(name)
+        effective_generators[name] = (
+            get_features_generator(name) if override is None else override
+        )
+    # Managed generators are defined to be invariant to atom order and atom-map
+    # identifiers.  A canonical, map-free key therefore merges equivalent
+    # non-canonical/mapped input strings.  Custom generators may deliberately
+    # inspect atom 0 or atom maps, so retain the legacy order-preserving key as
+    # soon as any effective callable is not Chemprop's original built-in.
+    canonical_deduplication = all(
+        is_builtin_features_generator(name, effective_generators[name])
+        for name in features_generators
+    )
     if isinstance(use_atom_mapping_for_hydrogens, bool):
         atom_mapping_rows = [use_atom_mapping_for_hydrogens] * len(smiles_rows)
     else:
@@ -180,31 +200,48 @@ def generate_features_for_smiles_batch(
                 'use_atom_mapping_for_hydrogens must contain one flag per SMILES row.'
             )
 
-    parsed_rows = []
+    # Parse and index one row at a time.  Retaining ``parsed_rows`` for a
+    # second traversal adds another full-dataset owner and, when the global
+    # molecule cache is disabled for large jobs, unnecessarily keeps every
+    # unused reaction product alive.  The ordered keys and one representative
+    # per unique reactant are all later stages need.
+    position_keys: List[List[Optional[str]]] = []
+    unique_molecules: "OrderedDict[str, Chem.Mol]" = OrderedDict()
+    has_hydrogen_only = False
     for smiles, use_atom_mapping in zip(smiles_rows, atom_mapping_rows):
         is_mol_list = [is_mol(value) for value in smiles]
-        reaction_list = [is_reaction(value) for value in is_mol_list]
-        mols = make_mols(
-            smiles=list(smiles),
-            reaction_list=reaction_list,
-            keep_h_list=[
+        reaction_list = [
+            (not value if auto_detect_reactions else is_reaction(value))
+            for value in is_mol_list
+        ]
+        if auto_detect_reactions:
+            # ``save_features`` is a standalone command.  Its output must not
+            # depend on process-global graph settings left by an earlier
+            # in-process train/predict call.  These values match a fresh CLI
+            # process: remove explicit H, do not add H, and retain atom maps
+            # only while parsing reactions (molecular generators remove the
+            # map labels from their private feature copy where appropriate).
+            keep_h_list = [False] * len(is_mol_list)
+            add_h_list = [False] * len(is_mol_list)
+            keep_atom_map_list = reaction_list
+        else:
+            keep_h_list = [
                 is_keeping_atom_map(value)
                 if use_atom_mapping
                 else is_explicit_h(value)
                 for value in is_mol_list
-            ],
-            add_h_list=[is_adding_hs(value) for value in is_mol_list],
-            keep_atom_map_list=[is_keeping_atom_map(value) for value in is_mol_list],
+            ]
+            add_h_list = [is_adding_hs(value) for value in is_mol_list]
+            keep_atom_map_list = [
+                is_keeping_atom_map(value) for value in is_mol_list
+            ]
+        mols = make_mols(
+            smiles=list(smiles),
+            reaction_list=reaction_list,
+            keep_h_list=keep_h_list,
+            add_h_list=add_h_list,
+            keep_atom_map_list=keep_atom_map_list,
         )
-        parsed_rows.append((mols, reaction_list))
-
-    # Molecule positions and duplicate keys do not depend on the generator.
-    # Computing them once avoids a full dataset traversal and SMILES
-    # serialization for every requested generator.
-    position_keys: List[List[Optional[str]]] = []
-    unique_molecules: "OrderedDict[str, Chem.Mol]" = OrderedDict()
-    has_hydrogen_only = False
-    for mols, reaction_list in parsed_rows:
         row_keys: List[Optional[str]] = []
         for mol, reaction in zip(mols, reaction_list):
             candidate = None
@@ -220,12 +257,33 @@ def generate_features_for_smiles_batch(
                 row_keys.append('__CHEMPROP_HYDROGEN_ONLY__')
                 has_hydrogen_only = True
             else:
-                key = Chem.MolToSmiles(
-                    candidate, canonical=False, isomericSmiles=True
-                )
+                if canonical_deduplication:
+                    mapped = any(
+                        atom.GetAtomMapNum() for atom in candidate.GetAtoms()
+                    )
+                    feature_candidate = Chem.Mol(candidate) if mapped else candidate
+                    if mapped:
+                        for atom in feature_candidate.GetAtoms():
+                            atom.SetAtomMapNum(0)
+                    key = Chem.MolToSmiles(
+                        feature_candidate, canonical=True, isomericSmiles=True,
+                    )
+                    candidate = feature_candidate
+                else:
+                    key = Chem.MolToSmiles(
+                        candidate, canonical=False, isomericSmiles=True,
+                    )
                 row_keys.append(key)
                 unique_molecules.setdefault(key, candidate)
         position_keys.append(row_keys)
+        # Drop function-local references to unused products and duplicate
+        # molecules immediately. With ``--no_cache_mol`` this releases them;
+        # with the process-wide molecule cache enabled it still avoids an
+        # unnecessary second owner. The loop variable otherwise retains at
+        # most the final component, not the entire dataset.
+        if mols:
+            del mol
+        del mols
 
     # Keep whole NumPy vectors rather than expanding every scalar into a
     # Python list entry. Dense fingerprints otherwise create hundreds of
@@ -237,11 +295,13 @@ def generate_features_for_smiles_batch(
 
     for generator_name in features_generators:
         selected = selected_feature_columns.get(generator_name)
+        generator = effective_generators[generator_name]
 
         generated_rows = generate_features_batch(
             generator_name,
             unique_molecule_values,
             selected_feature_columns=selected,
+            generator=generator,
         )
         generated_by_key = {
             key: np.asarray(values) for key, values in zip(keys, generated_rows)
@@ -252,14 +312,17 @@ def generate_features_for_smiles_batch(
                 generator_name,
                 [methane],
                 selected_feature_columns=selected,
+                generator=generator,
             )[0])
         else:
             zero_template = None
 
         expected_size = None
-        for values in list(generated_by_key.values()) + (
-            [zero_template] if zero_template is not None else []
-        ):
+        validation_values = chain(
+            generated_by_key.values(),
+            () if zero_template is None else (zero_template,),
+        )
+        for values in validation_values:
             if values.ndim != 1:
                 raise ValueError(
                     f'Features generator "{generator_name}" returned a '
@@ -274,7 +337,7 @@ def generate_features_for_smiles_batch(
                 )
 
         zero_values = (
-            np.zeros(len(zero_template), dtype=float)
+            np.zeros_like(zero_template)
             if zero_template is not None
             else None
         )
@@ -294,10 +357,28 @@ def generate_features_for_smiles_batch(
                 if values.size:
                     row_feature_parts[row_index].append(values)
 
-    return [
-        np.concatenate(parts) if parts else np.empty(0, dtype=float)
-        for parts in row_feature_parts
-    ]
+        # The arrays now live in ``row_feature_parts``.  Drop the two temporary
+        # containers before processing another generator (and, for the final
+        # generator, before materializing the concatenated result).
+        del generated_rows, generated_by_key
+
+    # RDKit molecules can be much larger than their fingerprints.  They are no
+    # longer needed once every generator has run, so do not retain them during
+    # final dense-array allocation.
+    unique_molecules.clear()
+    del unique_molecule_values, keys
+
+    # Replace each list of vector parts in place.  A separate result-list
+    # comprehension retains *all* parts while allocating *all* concatenated
+    # rows, temporarily approaching twice the feature-matrix memory for an
+    # all-unique dataset.  In-place replacement lets each row's source vectors
+    # be released as soon as its final array has been created.
+    for row_index, parts in enumerate(row_feature_parts):
+        row_feature_parts[row_index] = (
+            np.concatenate(parts) if parts else np.empty(0, dtype=float)
+        )
+
+    return row_feature_parts
 
 
 def cache_graph() -> bool:
@@ -336,6 +417,7 @@ def _sanitize_feature_array(
     values: np.ndarray,
     name: str,
     expected_ndim: int,
+    copy_if_valid: bool = True,
 ) -> np.ndarray:
     """Returns a numeric feature array with NaNs replaced and no infinities."""
     array = np.asarray(values)
@@ -353,7 +435,14 @@ def _sanitize_feature_array(
         raise ValueError(f'{name} contains an infinite value.')
 
     # Preserve the historical behavior of treating missing descriptors as 0.
-    return np.where(np.isnan(array), 0, array)
+    # ``np.where`` always copies.  Precomputed generated feature rows are
+    # already private arrays, so callers may reuse them and avoid doubling
+    # resident feature memory while a dataset is being constructed.  Keep the
+    # historical copy semantics for public/direct inputs by default.
+    missing = np.isnan(array)
+    if np.any(missing):
+        return np.where(missing, 0, array)
+    return np.array(array, copy=True) if copy_if_valid else array
 
 
 class MoleculeDatapoint:
@@ -458,16 +547,16 @@ class MoleculeDatapoint:
                         # for H2
                         elif m is not None and m.GetNumHeavyAtoms() == 0:
                             # not all features are equally long, so use methane as dummy molecule to determine length
-                            self.features.extend(np.zeros(len(_generate_features(
+                            self.features.extend(np.zeros_like(_generate_features(
                                 fg, Chem.MolFromSmiles('C'), selected_feature_columns
-                            ))))
+                            )))
                     else:
                         if m[0] is not None and m[1] is not None and m[0].GetNumHeavyAtoms() > 0:
                             self.features.extend(_generate_features(fg, m[0], selected_feature_columns))
                         elif m[0] is not None and m[1] is not None and m[0].GetNumHeavyAtoms() == 0:
-                            self.features.extend(np.zeros(len(_generate_features(
+                            self.features.extend(np.zeros_like(_generate_features(
                                 fg, Chem.MolFromSmiles('C'), selected_feature_columns
-                            ))))
+                            )))
                     
 
             self.features = np.array(self.features)
@@ -478,7 +567,10 @@ class MoleculeDatapoint:
         # activations and fitted scalers.
         if self.features is not None:
             self.features = _sanitize_feature_array(
-                self.features, 'Molecular features', expected_ndim=1,
+                self.features,
+                'Molecular features',
+                expected_ndim=1,
+                copy_if_valid=not features_generator_precomputed,
             )
 
         if self.atom_descriptors is not None:
@@ -1033,39 +1125,50 @@ class MoleculeDataset(Dataset):
                  is provided as a parameter, this is the same :class:`~chemprop.data.StandardScaler`. Otherwise,
                  this is a new :class:`~chemprop.data.StandardScaler` that has been fit on this dataset.
         """
-        if len(self._data) == 0 or \
-                (self._data[0].features is None and not scale_bond_descriptors and not scale_atom_descriptors):
+        if scale_atom_descriptors and scale_bond_descriptors:
+            raise ValueError(
+                'Only one atom or bond feature channel can be normalized at a time.'
+            )
+        if len(self._data) == 0:
             return None
 
-        if scaler is None:
-            if scale_atom_descriptors and not self._data[0].atom_descriptors is None:
-                features = np.vstack([d.raw_atom_descriptors for d in self._data])
-            elif scale_atom_descriptors and not self._data[0].atom_features is None:
-                features = np.vstack([d.raw_atom_features for d in self._data])
-            elif scale_bond_descriptors and not self._data[0].bond_descriptors is None:
-                features = np.vstack([d.raw_bond_descriptors for d in self._data])
-            elif scale_bond_descriptors and not self._data[0].bond_features is None:
-                features = np.vstack([d.raw_bond_features for d in self._data])
+        first_datapoint = self._data[0]
+        reshape_molecular_features = False
+        if scale_atom_descriptors:
+            if first_datapoint.atom_descriptors is not None:
+                raw_features = [d.raw_atom_descriptors for d in self._data]
+                set_features = MoleculeDatapoint.set_atom_descriptors
+            elif first_datapoint.atom_features is not None:
+                raw_features = [d.raw_atom_features for d in self._data]
+                set_features = MoleculeDatapoint.set_atom_features
             else:
-                features = np.vstack([d.raw_features for d in self._data])
-            scaler = StandardScaler(replace_nan_token=replace_nan_token)
-            scaler.fit(features)
-
-        if scale_atom_descriptors and not self._data[0].atom_descriptors is None:
-            for d in self._data:
-                d.set_atom_descriptors(scaler.transform(d.raw_atom_descriptors))
-        elif scale_atom_descriptors and not self._data[0].atom_features is None:
-            for d in self._data:
-                d.set_atom_features(scaler.transform(d.raw_atom_features))
-        elif scale_bond_descriptors and not self._data[0].bond_descriptors is None:
-            for d in self._data:
-                d.set_bond_descriptors(scaler.transform(d.raw_bond_descriptors))
-        elif scale_bond_descriptors and not self._data[0].bond_features is None:
-            for d in self._data:
-                d.set_bond_features(scaler.transform(d.raw_bond_features))
+                return None
+        elif scale_bond_descriptors:
+            if first_datapoint.bond_descriptors is not None:
+                raw_features = [d.raw_bond_descriptors for d in self._data]
+                set_features = MoleculeDatapoint.set_bond_descriptors
+            elif first_datapoint.bond_features is not None:
+                raw_features = [d.raw_bond_features for d in self._data]
+                set_features = MoleculeDatapoint.set_bond_features
+            else:
+                return None
         else:
-            for d in self._data:
-                d.set_features(scaler.transform(d.raw_features.reshape(1, -1))[0])
+            if first_datapoint.features is None:
+                return None
+            raw_features = [d.raw_features for d in self._data]
+            set_features = MoleculeDatapoint.set_features
+            reshape_molecular_features = True
+
+        if scaler is None:
+            scaler = StandardScaler(replace_nan_token=replace_nan_token)
+            scaler.fit(np.vstack(raw_features))
+
+        for datapoint, values in zip(self._data, raw_features):
+            if reshape_molecular_features:
+                transformed = scaler.transform(values.reshape(1, -1))[0]
+            else:
+                transformed = scaler.transform(values)
+            set_features(datapoint, transformed)
 
         return scaler
 

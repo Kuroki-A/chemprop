@@ -6,6 +6,7 @@ from chemprop.args import TrainArgs
 from chemprop.data import MoleculeDataset, scaffold_split
 from chemprop.features import get_atom_fdim, get_bond_fdim, mol2graph
 from chemprop.models.ffn import FFNAtten, MultiReadout, build_ffn
+from chemprop.models.model import MoleculeModel
 from chemprop.models.mpn import MPN, MPNEncoder
 from chemprop.multitask_utils import (
     flatten_atom_bond_value_sets,
@@ -208,6 +209,35 @@ def test_mpn_rejects_ragged_molecule_counts_before_graph_creation():
 
     with pytest.raises(ValueError, match="exactly 1 molecule"):
         mpn([["CC"], ["CC", "O"]])
+
+
+@pytest.mark.parametrize("use_graph_batch", [False, True])
+def test_shared_mpn_fingerprint_accepts_one_molecule_without_weakening_forward(
+    use_graph_batch,
+):
+    args = _train_args()
+    args.number_of_molecules = 2
+    args.mpn_shared = True
+    args.task_names = ["target"]
+    model = MoleculeModel(args)
+    batch = [mol2graph(["CC"])] if use_graph_batch else [["CC"]]
+
+    fingerprint = model.fingerprint(batch, fingerprint_type="MPN")
+
+    assert fingerprint.shape == (1, args.hidden_size)
+    with pytest.raises(ValueError, match="exactly 2 molecule|Expected 2 molecular"):
+        model(batch)
+
+
+def test_nonshared_mpn_fingerprint_still_rejects_one_molecule():
+    args = _train_args()
+    args.number_of_molecules = 2
+    args.mpn_shared = False
+    args.task_names = ["target"]
+    model = MoleculeModel(args)
+
+    with pytest.raises(ValueError, match="exactly 2 molecule"):
+        model.fingerprint([["CC"]], fingerprint_type="MPN")
 
 
 @pytest.mark.parametrize(

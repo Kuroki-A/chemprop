@@ -29,6 +29,12 @@ BatchFeaturesGenerator = Callable[[Sequence[Molecule]], Sequence[np.ndarray]]
 
 FEATURES_GENERATOR_REGISTRY: Dict[str, FeaturesGenerator] = {}
 
+# Version 2 replaces the v1 whole-module implementation hash with a stable,
+# per-generator semantic revision for Chemprop's built-ins.  This intentionally
+# causes one compatibility transition from v1 metadata; subsequent unrelated
+# edits to this module do not invalidate every built-in generator.
+FEATURE_GENERATOR_METADATA_SCHEMA_VERSION = 2
+
 
 def register_features_generator(features_generator_name: str) -> Callable[[FeaturesGenerator], FeaturesGenerator]:
     """Registers a feature generator under its command-line name."""
@@ -65,7 +71,21 @@ def _as_mol(mol: Molecule) -> Chem.Mol:
 
 
 def _as_smiles(mol: Molecule) -> str:
-    return mol if isinstance(mol, str) else Chem.MolToSmiles(_as_mol(mol), isomericSmiles=True)
+    """Returns a canonical, atom-map-independent SMILES for molecular features.
+
+    Feature generation receives raw strings in ``save_features`` but parsed
+    ``Chem.Mol`` objects during training and prediction.  Canonicalizing both
+    paths prevents text-based featurizers from producing different vectors for
+    equivalent inputs.  Atom-map numbers are identifiers rather than molecular
+    structure, so remove them on a copy without mutating the graph used by
+    reaction or atom/bond models.
+    """
+    feature_mol = Chem.Mol(_as_mol(mol))
+    for atom in feature_mol.GetAtoms():
+        atom.SetAtomMapNum(0)
+    return Chem.MolToSmiles(
+        feature_mol, canonical=True, isomericSmiles=True,
+    )
 
 
 def _selection_tuple(selected_feature_columns: Optional[Sequence[str]]) -> Optional[Tuple[str, ...]]:
@@ -155,6 +175,101 @@ def _select_indexed_features(
     return array[..., list(indices)]
 
 
+def _rdkit_fingerprint_batch_num_threads(batch_size: int) -> int:
+    """Returns a conservative affinity-aware thread count for RDKit batches."""
+    if batch_size <= 1:
+        return 1
+    try:
+        available_cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, NotImplementedError, OSError):
+        available_cpus = os.cpu_count() or 1
+    return max(1, min(batch_size, available_cpus, 4))
+
+
+def _rdkit_binary_fingerprints_batch(
+    mols: Sequence[Molecule],
+    kind: str,
+    prefix: str,
+    dtype,
+    selected_feature_columns: Optional[Sequence[str]] = None,
+    **generator_kwargs,
+) -> np.ndarray:
+    """Generates dense binary fingerprints through RDKit's native batch API."""
+    width = generator_kwargs["fpSize"]
+    selected = _selection_tuple(selected_feature_columns)
+    if selected is not None:
+        _indexed_feature_selection(prefix, width, selected)
+    if not mols:
+        output_width = width if selected is None else len(selected)
+        return np.empty((0, output_width), dtype=dtype)
+
+    parsed_mols = [_as_mol(mol) for mol in mols]
+    generator = _get_rdkit_fp_generator(kind, **generator_kwargs)
+    fingerprints = generator.GetFingerprints(
+        parsed_mols,
+        numThreads=_rdkit_fingerprint_batch_num_threads(len(parsed_mols)),
+    )
+
+    # ToBitString is an index-ordered public representation.  Converting the
+    # whole bounded batch at once avoids one Python/C++ NumPy conversion per
+    # molecule while preserving the historical dense dtype exactly.
+    bit_text = b"".join(
+        fingerprint.ToBitString().encode("ascii")
+        for fingerprint in fingerprints
+    )
+    features = np.frombuffer(bit_text, dtype=np.uint8).reshape(
+        len(fingerprints), width,
+    ) - ord("0")
+    features = _select_indexed_features(
+        features, prefix, selected_feature_columns,
+    )
+    return features.astype(dtype, copy=False)
+
+
+def _rdkit_count_fingerprints_batch(
+    mols: Sequence[Molecule],
+    kind: str,
+    prefix: str,
+    dtype,
+    selected_feature_columns: Optional[Sequence[str]] = None,
+    **generator_kwargs,
+) -> np.ndarray:
+    """Generates dense count fingerprints through RDKit's native batch API."""
+    width = generator_kwargs["fpSize"]
+    selected = _selection_tuple(selected_feature_columns)
+    selected_indices = (
+        None
+        if selected is None
+        else _indexed_feature_selection(prefix, width, selected)
+    )
+    output_width = width if selected_indices is None else len(selected_indices)
+    if not mols:
+        return np.empty((0, output_width), dtype=dtype)
+
+    parsed_mols = [_as_mol(mol) for mol in mols]
+    generator = _get_rdkit_fp_generator(kind, **generator_kwargs)
+    fingerprints = generator.GetCountFingerprints(
+        parsed_mols,
+        numThreads=_rdkit_fingerprint_batch_num_threads(len(parsed_mols)),
+    )
+    features = np.zeros((len(fingerprints), output_width), dtype=dtype)
+    for row_index, fingerprint in enumerate(fingerprints):
+        counts = fingerprint.GetNonzeroElements()
+        if selected_indices is not None:
+            features[row_index] = tuple(
+                counts.get(index, 0) for index in selected_indices
+            )
+        elif counts:
+            indices = np.fromiter(
+                counts, dtype=np.intp, count=len(counts),
+            )
+            values = np.fromiter(
+                counts.values(), dtype=dtype, count=len(counts),
+            )
+            features[row_index, indices] = values
+    return features
+
+
 @register_features_generator("morgan")
 def morgan_binary_features_generator(
     mol: Molecule, radius: int = MORGAN_RADIUS, num_bits: int = MORGAN_NUM_BITS,
@@ -205,6 +320,47 @@ def atom_pair_features_generator(mol: Molecule, selected_feature_columns: list =
     generator = _get_rdkit_fp_generator("atompair", fpSize=2048)
     features = generator.GetFingerprintAsNumPy(_as_mol(mol)).astype(int, copy=False)
     return _select_indexed_features(features, "bit", selected_feature_columns)
+
+
+for _generator, _batch_transform in (
+    (
+        morgan_binary_features_generator,
+        functools.partial(
+            _rdkit_binary_fingerprints_batch,
+            kind="morgan", prefix="bit", dtype=float,
+            radius=MORGAN_RADIUS, fpSize=MORGAN_NUM_BITS,
+        ),
+    ),
+    (
+        morgan_counts_features_generator,
+        functools.partial(
+            _rdkit_count_fingerprints_batch,
+            kind="morgan", prefix="count", dtype=float,
+            radius=MORGAN_RADIUS, fpSize=MORGAN_NUM_BITS,
+        ),
+    ),
+    (
+        rdkit_fingerprint_features_generator,
+        functools.partial(
+            _rdkit_binary_fingerprints_batch,
+            kind="rdkit", prefix="bit", dtype=int, fpSize=2048,
+        ),
+    ),
+    (
+        atom_pair_features_generator,
+        functools.partial(
+            _rdkit_binary_fingerprints_batch,
+            kind="atompair", prefix="bit", dtype=int, fpSize=2048,
+        ),
+    ),
+):
+    _generator.batch_transform = _batch_transform
+    _generator.batch_supports_selected_columns = True
+    _generator.preferred_batch_size = 256
+    # Offline SMILES parsing benefits more from the existing process pool.
+    # Runtime datasets already contain parsed, deduplicated molecules and use
+    # the native batch directly.
+    _generator.save_features_process_pool_by_default = True
 
 
 @register_features_generator("erg")
@@ -295,14 +451,19 @@ def _descriptastorus_batch_features(
     if not columns:
         return [np.empty(0, dtype=float) for _ in mols]
     generator = _get_descriptastorus_generator(normalized, columns)
-    smiles = [_as_smiles(mol) for mol in mols]
     if normalized:
         # Descriptastorus normally invokes SciPy's scalar CDF once per
         # molecule and descriptor.  Descriptor evaluation is still molecule
         # based, but applying each CDF to a complete column removes thousands
         # of Python→SciPy calls for a dataset-sized batch.
         rd_descriptors, rd_normalized_descriptors = _load_descriptastorus()
-        rd_mols = [_as_mol(mol) for mol in mols]
+        # Match the scalar ``generator.process(_as_smiles(mol))`` path exactly.
+        # Reparsing canonical SMILES removes explicit-H graph representation
+        # details which would otherwise change several descriptors.
+        canonical_smiles = [_as_smiles(mol) for mol in mols]
+        rd_mols = [Chem.MolFromSmiles(smiles) for smiles in canonical_smiles]
+        if any(rd_mol is None for rd_mol in rd_mols):
+            raise ValueError('Could not reconstruct a canonical molecule for RDKit2D.')
         normalized_matrix = np.zeros((len(mols), len(columns)), dtype=float)
         for column_index, column in enumerate(columns):
             raw_values = [
@@ -331,6 +492,7 @@ def _descriptastorus_batch_features(
                 normalized_matrix[valid_indices, column_index] = normalized_values
         return normalized_matrix
 
+    smiles = [_as_smiles(mol) for mol in mols]
     processed_rows = generator.processSmiles(smiles, keep_mols=False)
     output = []
     for index, processed in enumerate(processed_rows):
@@ -649,8 +811,11 @@ def _canonical_map4_mol(mol: Molecule) -> Chem.Mol:
     fragments are retained so Chemprop's molecule semantics do not silently
     change for salts and other disconnected inputs.
     """
+    feature_mol = Chem.Mol(_as_mol(mol))
+    for atom in feature_mol.GetAtoms():
+        atom.SetAtomMapNum(0)
     canonical_smiles = Chem.MolToSmiles(
-        _as_mol(mol), canonical=True, isomericSmiles=False,
+        feature_mol, canonical=True, isomericSmiles=False,
     )
     canonical_mol = Chem.MolFromSmiles(canonical_smiles)
     if canonical_mol is None:  # Defensive: the source molecule already parsed.
@@ -862,7 +1027,7 @@ def _get_molfeat_transformer(kind: str, length: int, **params):
         raise ImportError(
             f"The {kind} generator could not import Molfeat or one of its optional "
             f"dependencies: {detail}. Install compatible versions with "
-            "`pip install 'molfeat[all]'`."
+            "`python -m pip install -e '.[features]'` from this checkout."
         ) from exc
     with _MOLFEAT_TRANSFORMER_LOCK:
         transformer = _MOLFEAT_TRANSFORMER_CACHE.get(key)
@@ -894,7 +1059,8 @@ def _molfeat_features(
         transformed = np.asarray(transformer([_as_smiles(mol)]), dtype=float)
     except ImportError as exc:
         raise ImportError(
-            f"The {kind} generator is unavailable: {exc}. Install `molfeat[all]` and its optional dependency."
+            f"The {kind} generator is unavailable: {exc}. Install this checkout "
+            "with `python -m pip install -e '.[features]'`."
         ) from exc
     if transformed.ndim != 2 or transformed.shape[0] != 1:
         raise RuntimeError(
@@ -922,7 +1088,8 @@ def _molfeat_batch_features(
         features = np.asarray(transformer([_as_smiles(mol) for mol in mols]), dtype=float)
     except ImportError as exc:
         raise ImportError(
-            f"The {kind} generator is unavailable: {exc}. Install `molfeat[all]` and its optional dependency."
+            f"The {kind} generator is unavailable: {exc}. Install this checkout "
+            "with `python -m pip install -e '.[features]'`."
         ) from exc
     if features.ndim != 2 or features.shape[0] != len(mols):
         raise RuntimeError(
@@ -1119,8 +1286,9 @@ def _load_pretrained_transformer_class(transformer_type: str):
             return GraphormerTransformer
     except ImportError as exc:
         raise ImportError(
-            f"The {transformer_type} pretrained generator requires `pip install 'molfeat[all]'` "
-            "and its model backend."
+            f"The {transformer_type} pretrained generator requires this checkout's "
+            "`features-pretrained` extra and its model backend. Install it with "
+            "`python -m pip install -e '.[features-pretrained]'`."
         ) from exc
     raise ValueError(f"Unknown pretrained transformer type: {transformer_type}")
 
@@ -1300,6 +1468,102 @@ for _generator, _transformer_type, _kind, _batch_size, _kwargs in (
     _configure_pretrained_batch(_generator, _transformer_type, _kind, _batch_size, **_kwargs)
 
 
+# Increment only the affected entry when a built-in generator's output meaning
+# changes: values, ordering, width, dtype, canonicalization, or value-affecting
+# defaults.  Exact-equivalent performance/refactoring changes do not require a
+# revision bump. Dependency versions and generator configuration are recorded
+# separately in metadata, so they remain independent compatibility constraints.
+_BUILTIN_FEATURES_GENERATOR_SEMANTIC_REVISIONS: Dict[str, int] = {
+    "morgan": 1,
+    "morgan_count": 1,
+    "maccs": 1,
+    "rdkit": 1,
+    "avalon": 1,
+    "atompair": 1,
+    "erg": 1,
+    "erg_float": 1,
+    "rdkit_2d": 1,
+    "rdkit_2d_normalized": 1,
+    "rdkit_2d_wo_fr": 1,
+    "rdkit_2d_normalized_wo_fr": 1,
+    "rdkit_2d_208": 1,
+    "rdkit_2d_400": 1,
+    "rdkit_2d_autocorr": 1,
+    "rdkit_2d_bcut": 1,
+    "rdkit_2d_all": 1,
+    "mordred": 1,
+    "padelpy": 1,
+    "fcfp": 1,
+    "fcfp_count": 1,
+    "topological": 1,
+    "topological_count": 1,
+    "layered": 1,
+    "avalon_count": 1,
+    "rdkit_count": 1,
+    "atompair_count": 1,
+    "pattern": 1,
+    "estate": 1,
+    "secfp": 1,
+    "map4": 1,
+    "map4_v1_1": 1,
+    "cats2d": 1,
+    "scaffoldkeys": 1,
+    "pharm2d": 1,
+    "Roberta-Zinc480M-102M": 1,
+    "GPT2-Zinc480M-87M": 1,
+    "MolT5": 1,
+    "ChemBERTa-77M-MTR": 1,
+    "ChemBERTa-77M-MLM": 1,
+    "ChemGPT-19M": 1,
+    "ChemGPT-4.7M": 1,
+    "gin_supervised_masking": 1,
+    "gin_supervised_infomax": 1,
+    "gin_supervised_edgepred": 1,
+    "jtvae_zinc_no_kl": 1,
+    "gin_supervised_contextpred": 1,
+    "pcqm4mv2_graphormer_base": 1,
+}
+
+# Retaining each original callable prevents a plugin/custom generator which
+# replaces a built-in name from inheriting that built-in's semantic revision.
+# Such replacements are identified by their own source hash instead.
+if (
+    set(_BUILTIN_FEATURES_GENERATOR_SEMANTIC_REVISIONS)
+    != set(FEATURES_GENERATOR_REGISTRY)
+    or any(
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 1
+        for revision in _BUILTIN_FEATURES_GENERATOR_SEMANTIC_REVISIONS.values()
+    )
+):
+    raise RuntimeError(
+        "Every built-in feature generator must declare exactly one positive "
+        "integer semantic revision."
+    )
+_BUILTIN_FEATURES_GENERATORS = {
+    name: FEATURES_GENERATOR_REGISTRY[name]
+    for name in _BUILTIN_FEATURES_GENERATOR_SEMANTIC_REVISIONS
+}
+
+
+def is_builtin_features_generator(
+    features_generator_name: str,
+    generator: Optional[Callable] = None,
+) -> bool:
+    """Returns whether the effective callable is Chemprop's managed built-in."""
+    effective_generator = (
+        FEATURES_GENERATOR_REGISTRY.get(features_generator_name)
+        if generator is None
+        else generator
+    )
+    return (
+        effective_generator is not None
+        and _BUILTIN_FEATURES_GENERATORS.get(features_generator_name)
+        is effective_generator
+    )
+
+
 def clear_pretrained_transformer_cache() -> None:
     """Releases references to process-local pretrained transformers."""
     with _PRETRAINED_TRANSFORMER_CACHE_LOCK:
@@ -1336,6 +1600,7 @@ def generate_features_batch(
     mols: Sequence[Molecule],
     selected_feature_columns: Optional[Sequence[str]] = None,
     batch_size: Optional[int] = None,
+    generator: Callable = None,
 ) -> Sequence[np.ndarray]:
     """Generates an ordered molecule batch using a native batch API when safe.
 
@@ -1344,7 +1609,11 @@ def generate_features_batch(
     passing molecules here.  Supplying selected columns deliberately falls
     back to scalar calls unless the generator can preserve that exact schema.
     """
-    generator = get_features_generator(features_generator_name)
+    generator = (
+        get_features_generator(features_generator_name)
+        if generator is None
+        else generator
+    )
     batch_transform = getattr(generator, "batch_transform", None)
     effective_batch_size = (
         getattr(generator, "preferred_batch_size", 256)
@@ -1515,7 +1784,13 @@ def get_features_generator_config(
 
 
 def _features_generator_implementation_sha256(generator: FeaturesGenerator) -> str:
-    """Hashes the module implementing a generator, with a dynamic fallback."""
+    """Conservatively hashes the module implementing a custom/plugin generator.
+
+    Unlike managed built-ins, an external callable has no Chemprop-maintained
+    semantic revision. Hashing its full source module also detects changes to
+    helper functions on which the callable may depend. Dynamic and extension
+    callables fall back to their inspectable source or qualified identity.
+    """
     candidates = [generator]
     if isinstance(generator, functools.partial):
         candidates.append(generator.func)
@@ -1551,6 +1826,24 @@ def _features_generator_implementation_sha256(generator: FeaturesGenerator) -> s
         f"{getattr(generator, '__qualname__', getattr(generator, '__name__', callable_type.__qualname__))}"
     ).encode("utf-8")
     return hashlib.sha256(identity + b"\0" + implementation).hexdigest()
+
+
+def _features_generator_identity(
+    features_generator_name: str,
+    generator: FeaturesGenerator,
+) -> Dict[str, object]:
+    """Returns a stable built-in revision or custom/plugin source hash."""
+    if _BUILTIN_FEATURES_GENERATORS.get(features_generator_name) is generator:
+        return {
+            "semantic_revision": _BUILTIN_FEATURES_GENERATOR_SEMANTIC_REVISIONS[
+                features_generator_name
+            ],
+        }
+    return {
+        "implementation_sha256": _features_generator_implementation_sha256(
+            generator
+        ),
+    }
 
 
 def _features_dependency_versions(
@@ -1595,6 +1888,8 @@ def _features_dependency_versions(
         dependency_names.add("padelpy")
     if names & molfeat_names:
         dependency_names.update({"molfeat", "datamol"})
+    if "pharm2d" in names:
+        dependency_names.add("pmapper")
     if "map4" in names:
         dependency_names.add("mhfp")
     if "map4_v1_1" in names:
@@ -1602,11 +1897,15 @@ def _features_dependency_versions(
     if "secfp" in names:
         dependency_names.add("mhfp")
     if names & hf_pretrained_names:
-        dependency_names.update({"torch", "transformers"})
+        dependency_names.update({"torch", "tokenizers", "transformers"})
+    if "MolT5" in names:
+        dependency_names.add("sentencepiece")
+    if names & {"ChemGPT-19M", "ChemGPT-4.7M"}:
+        dependency_names.add("selfies")
     if names & dgl_pretrained_names:
-        dependency_names.update({"torch", "dgllife"})
+        dependency_names.update({"torch", "dgl", "dgllife"})
     if "pcqm4mv2_graphormer_base" in names:
-        dependency_names.add("torch")
+        dependency_names.update({"torch", "graphormer-pretrained"})
 
     return {
         dependency: (
@@ -1640,11 +1939,11 @@ def get_features_generators_metadata(
             "config": get_features_generator_config(
                 name, selected_feature_columns.get(name),
             ),
-            "implementation_sha256": _features_generator_implementation_sha256(generator),
+            **_features_generator_identity(name, generator),
         })
 
     return {
-        "schema_version": 1,
+        "schema_version": FEATURE_GENERATOR_METADATA_SCHEMA_VERSION,
         "generators": generator_entries,
         "versions": versions,
         "total_dimension": total_dimension,
@@ -1730,6 +2029,12 @@ def get_features_generator_schema(
     elif features_generator_name == "padelpy":
         if _PADEL_COLUMNS is not None:
             names = _validate_columns(selected, _PADEL_COLUMNS)
+        elif selected is not None:
+            # PaDEL exposes its columns only after the first Java result.  A
+            # selected-feature manifest nevertheless has a known output width
+            # before that first call; validity is checked against the realized
+            # PaDEL columns as soon as a row is generated.
+            names = selected
     elif features_generator_name in {"cats2d", "scaffoldkeys"}:
         kind, length = (
             ("cats2D", 189) if features_generator_name == "cats2d" else ("scaffoldkeys", 42)
@@ -1774,8 +2079,9 @@ def get_features_generator_schema(
             f"the generated vector has {dimension} values."
         )
 
+    generator = get_features_generator(features_generator_name)
     return {
-        "schema_version": 1,
+        "schema_version": FEATURE_GENERATOR_METADATA_SCHEMA_VERSION,
         "generator": features_generator_name,
         "feature_names": list(names),
         "dimension": dimension,
@@ -1783,9 +2089,7 @@ def get_features_generator_schema(
         "generator_config": get_features_generator_config(
             features_generator_name, selected_feature_columns,
         ),
-        "implementation_sha256": _features_generator_implementation_sha256(
-            get_features_generator(features_generator_name)
-        ),
+        **_features_generator_identity(features_generator_name, generator),
         "versions": _features_dependency_versions([features_generator_name]),
     }
 

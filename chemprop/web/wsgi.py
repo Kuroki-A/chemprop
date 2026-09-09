@@ -27,9 +27,9 @@ def build_app(*args, **kwargs):
         root_folder=kwargs.get('root_folder', None),
         create_folders=True
     )
-    clear_temp_folder(app=app)
     if allow_remote:
         validate_web_storage_config(app)
+    clear_temp_folder(app=app)
 
     db.init_app(app)
     if kwargs.get('init_db', False):

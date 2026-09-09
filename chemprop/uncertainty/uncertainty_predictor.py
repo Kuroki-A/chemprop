@@ -10,6 +10,159 @@ from chemprop.spectra_utils import normalize_spectra, roundrobin_sid
 from chemprop.multitask_utils import reshape_values, reshape_individual_preds
 
 
+def _atom_bond_task_arrays(values, label: str) -> List[np.ndarray]:
+    """Coerces task-major atom/bond values without forming a ragged array."""
+    try:
+        task_values = list(values)
+    except TypeError as error:
+        raise ValueError(f'{label} must contain one array per atom/bond task.') from error
+
+    arrays = []
+    for task_index, value in enumerate(task_values):
+        try:
+            array = np.array(value, dtype=float, copy=True)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f'{label} task {task_index} must be a numeric array.'
+            ) from error
+        if array.ndim == 0:
+            raise ValueError(
+                f'{label} task {task_index} must have at least one dimension.'
+            )
+        arrays.append(array)
+    return arrays
+
+
+def _numeric_values(values, is_atom_bond: bool, label: str):
+    """Returns either one dense array or a list of independent task arrays."""
+    if is_atom_bond:
+        return _atom_bond_task_arrays(values, label)
+    return np.array(values, dtype=float, copy=True)
+
+
+def _accumulate_numeric_values(total, values, is_atom_bond: bool, label: str):
+    """Adds a model/sample result to an accumulator with shape validation."""
+    numeric = _numeric_values(values, is_atom_bond, label)
+    if not is_atom_bond:
+        if total.shape != numeric.shape:
+            raise ValueError(
+                f'{label} shape changed from {total.shape} to {numeric.shape}.'
+            )
+        total += numeric
+        return total
+
+    if len(total) != len(numeric):
+        raise ValueError(
+            f'{label} task count changed from {len(total)} to {len(numeric)}.'
+        )
+    for task_index, (total_task, task_values) in enumerate(zip(total, numeric)):
+        if total_task.shape != task_values.shape:
+            raise ValueError(
+                f'{label} task {task_index} shape changed from '
+                f'{total_task.shape} to {task_values.shape}.'
+            )
+        total_task += task_values
+    return total
+
+
+def _zeros_like_numeric(values, is_atom_bond: bool, label: str):
+    """Creates zero-valued dense or task-major accumulators."""
+    numeric = _numeric_values(values, is_atom_bond, label)
+    if is_atom_bond:
+        return [np.zeros_like(value, dtype=float) for value in numeric]
+    return np.zeros_like(numeric, dtype=float)
+
+
+def _validate_numeric_alignment(
+    reference, values, is_atom_bond: bool, label: str,
+) -> None:
+    """Validates that uncertainty parameters align exactly with predictions."""
+    reference_numeric = _numeric_values(reference, is_atom_bond, 'Predictions')
+    values_numeric = _numeric_values(values, is_atom_bond, label)
+    if not is_atom_bond:
+        if reference_numeric.shape != values_numeric.shape:
+            raise ValueError(
+                f'{label} shape {values_numeric.shape} does not match prediction '
+                f'shape {reference_numeric.shape}.'
+            )
+        return
+
+    if len(reference_numeric) != len(values_numeric):
+        raise ValueError(
+            f'{label} has {len(values_numeric)} tasks but predictions have '
+            f'{len(reference_numeric)}.'
+        )
+    for task_index, (prediction, value) in enumerate(
+        zip(reference_numeric, values_numeric)
+    ):
+        if prediction.shape != value.shape:
+            raise ValueError(
+                f'{label} task {task_index} shape {value.shape} does not match '
+                f'prediction shape {prediction.shape}.'
+            )
+
+
+def _update_running_moments(
+    running_mean,
+    running_m2,
+    values,
+    count: int,
+    is_atom_bond: bool,
+    label: str,
+):
+    """Updates population moments with Welford's numerically stable method."""
+    numeric = _numeric_values(values, is_atom_bond, label)
+    if not is_atom_bond:
+        if running_mean.shape != numeric.shape:
+            raise ValueError(
+                f'{label} shape changed from {running_mean.shape} to {numeric.shape}.'
+            )
+        delta = numeric - running_mean
+        running_mean += delta / count
+        running_m2 += delta * (numeric - running_mean)
+        return running_mean, running_m2
+
+    if len(running_mean) != len(numeric):
+        raise ValueError(
+            f'{label} task count changed from {len(running_mean)} to {len(numeric)}.'
+        )
+    for task_index, (mean_task, m2_task, task_values) in enumerate(
+        zip(running_mean, running_m2, numeric)
+    ):
+        if mean_task.shape != task_values.shape:
+            raise ValueError(
+                f'{label} task {task_index} shape changed from '
+                f'{mean_task.shape} to {task_values.shape}.'
+            )
+        delta = task_values - mean_task
+        mean_task += delta / count
+        m2_task += delta * (task_values - mean_task)
+    return running_mean, running_m2
+
+
+def _atom_bond_elementwise(label: str, operation, *value_sets) -> List[np.ndarray]:
+    """Applies an operation independently to aligned ragged task arrays."""
+    arrays = [
+        _atom_bond_task_arrays(values, label)
+        for values in value_sets
+    ]
+    if not arrays:
+        return []
+    task_count = len(arrays[0])
+    if any(len(values) != task_count for values in arrays[1:]):
+        raise ValueError(f'{label} atom/bond parameter task counts do not match.')
+
+    results = []
+    for task_index, task_values in enumerate(zip(*arrays)):
+        reference_shape = task_values[0].shape
+        if any(value.shape != reference_shape for value in task_values[1:]):
+            raise ValueError(
+                f'{label} parameter shapes do not match for task {task_index}.'
+            )
+        results.append(operation(*task_values))
+    return results
+
+
 def predict(*args, **kwargs):
     """Imports the training predictor lazily to avoid package import cycles."""
     from chemprop.train.predict import predict as train_predict
@@ -96,6 +249,112 @@ class UncertaintyPredictor(ABC):
                 )
 
         return tqdm(validated_pairs(), total=self.num_models)
+
+    def _record_train_class_sizes(self, model, model_index: int, predictions) -> None:
+        """Validates and records classification counts for Bayesian calibration.
+
+        Legacy checkpoints may not contain ``train_class_sizes``.  An ensemble
+        must not silently mix those checkpoints with newer members because the
+        Bayesian calibrator sums this metadata across models.
+        """
+        raw_sizes = getattr(model, 'train_class_sizes', None)
+        has_sizes = raw_sizes is not None
+        if model_index == 0:
+            self._ensemble_has_train_class_sizes = has_sizes
+        elif has_sizes != self._ensemble_has_train_class_sizes:
+            first_state = (
+                'contains' if self._ensemble_has_train_class_sizes else 'does not contain'
+            )
+            current_state = 'contains' if has_sizes else 'does not contain'
+            raise ValueError(
+                'Classification ensemble checkpoints have inconsistent '
+                'train_class_sizes metadata: checkpoint 0 '
+                f'{first_state} it, while checkpoint {model_index} '
+                f'{current_state} it. Do not mix legacy and current '
+                'classification checkpoints when using uncertainty calibration.'
+            )
+
+        if not has_sizes:
+            return
+
+        try:
+            object_sizes = np.asarray(raw_sizes)
+            sizes = np.asarray(raw_sizes, dtype=float)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f'Checkpoint {model_index} train_class_sizes must be a '
+                'rectangular two-dimensional numeric count matrix.'
+            ) from error
+        if object_sizes.dtype == np.bool_ or any(
+            isinstance(value, (bool, np.bool_)) for value in object_sizes.flat
+        ):
+            raise ValueError(
+                f'Checkpoint {model_index} train_class_sizes must contain '
+                'integer class counts, not booleans.'
+            )
+        if sizes.ndim != 2 or 0 in sizes.shape:
+            raise ValueError(
+                f'Checkpoint {model_index} train_class_sizes must be a non-empty '
+                f'two-dimensional task-by-class matrix; got shape {sizes.shape}.'
+            )
+        if (
+            not np.all(np.isfinite(sizes))
+            or np.any(sizes < 0)
+            or not np.all(sizes == np.floor(sizes))
+        ):
+            raise ValueError(
+                f'Checkpoint {model_index} train_class_sizes must contain only '
+                'finite non-negative integer class counts.'
+            )
+
+        if model.is_atom_bond_targets:
+            expected_tasks = len(predictions)
+        else:
+            prediction_values = np.asarray(predictions)
+            expected_tasks = (
+                prediction_values.shape[1]
+                if prediction_values.ndim >= 2
+                else None
+            )
+        expected_classes = 2 if self.dataset_type == 'classification' else None
+        if self.dataset_type == 'multiclass':
+            if model.is_atom_bond_targets:
+                first_task = np.asarray(predictions[0]) if predictions else None
+                expected_classes = (
+                    first_task.shape[-1]
+                    if first_task is not None and first_task.ndim >= 2
+                    else None
+                )
+            else:
+                prediction_values = np.asarray(predictions)
+                expected_classes = (
+                    prediction_values.shape[2]
+                    if prediction_values.ndim >= 3
+                    else None
+                )
+        expected_shape = (
+            (expected_tasks, expected_classes)
+            if expected_tasks is not None and expected_classes is not None
+            else None
+        )
+        if expected_shape is not None and sizes.shape != expected_shape:
+            raise ValueError(
+                f'Checkpoint {model_index} train_class_sizes has shape '
+                f'{sizes.shape}; predictions require task-by-class shape '
+                f'{expected_shape}.'
+            )
+
+        if model_index == 0:
+            self._train_class_sizes_shape = sizes.shape
+            self.train_class_sizes = []
+        elif sizes.shape != self._train_class_sizes_shape:
+            raise ValueError(
+                'Classification ensemble checkpoints have incompatible '
+                'train_class_sizes shapes: checkpoint 0 has shape '
+                f'{self._train_class_sizes_shape}, while checkpoint '
+                f'{model_index} has shape {sizes.shape}.'
+            )
+        self.train_class_sizes.append(sizes.tolist())
 
     @property
     @abstractmethod
@@ -203,10 +462,9 @@ class NoUncertaintyPredictor(UncertaintyPredictor):
                     excluded_sub_value=float("nan"),
                 )
             if i == 0:
-                if model.is_atom_bond_targets:
-                    sum_preds = np.array(preds, dtype=object)
-                else:
-                    sum_preds = np.array(preds)
+                sum_preds = _numeric_values(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
 
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
@@ -228,10 +486,9 @@ class NoUncertaintyPredictor(UncertaintyPredictor):
                     else:
                         individual_preds = np.expand_dims(np.array(preds), axis=-1)
             else:
-                if model.is_atom_bond_targets:
-                    sum_preds += np.array(preds, dtype=object)
-                else:
-                    sum_preds += np.array(preds)
+                sum_preds = _accumulate_numeric_values(
+                    sum_preds, preds, model.is_atom_bond_targets, 'Predictions',
+                )
 
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
@@ -243,7 +500,7 @@ class NoUncertaintyPredictor(UncertaintyPredictor):
                         )
 
         if model.is_atom_bond_targets:
-            uncal_preds = sum_preds / self.num_models
+            uncal_preds = [pred / self.num_models for pred in sum_preds]
             self.uncal_preds = reshape_values(
                 uncal_preds,
                 self.test_data,
@@ -318,6 +575,11 @@ class ConformalQuantileRegressionPredictor(UncertaintyPredictor):
 
     def calculate_predictions(self):
         for i, (model, scaler_list) in enumerate(self._model_scaler_pairs()):
+            if model.is_atom_bond_targets:
+                raise NotImplementedError(
+                    'Conformal quantile and conformal regression uncertainty '
+                    'are not supported for atom/bond property prediction.'
+                )
             (
                 scaler,
                 features_scaler,
@@ -381,16 +643,11 @@ class ConformalQuantileRegressionPredictor(UncertaintyPredictor):
                             individual_preds, np.expand_dims(preds, axis=-1), axis=-1
                         )
 
-        if model.is_atom_bond_targets:
-            raise NotImplementedError(
-                "Uncertainty predictor type ConformalQuantileRegressionPredictor and ConformalRegressionPredictor are not currently supported for atom and bond properties prediction."
-            )
-        else:
-            uncal_preds = sum_preds / self.num_models
-            self.uncal_intervals = self.make_intervals(uncal_preds)
-            if self.individual_ensemble_predictions:
-                self.individual_preds = individual_preds.tolist()
-            self.uncal_preds = self.reformat_preds(uncal_preds)
+        uncal_preds = sum_preds / self.num_models
+        self.uncal_intervals = self.make_intervals(uncal_preds)
+        if self.individual_ensemble_predictions:
+            self.individual_preds = individual_preds.tolist()
+        self.uncal_preds = self.reformat_preds(uncal_preds)
 
     def get_uncal_output(self):
         return self.uncal_intervals
@@ -547,10 +804,19 @@ class MVEPredictor(UncertaintyPredictor):
                 atom_bond_scaler=atom_bond_scaler,
                 return_unc_parameters=True,
             )
+            _validate_numeric_alignment(
+                preds, var, model.is_atom_bond_targets, 'MVE variances',
+            )
             if i == 0:
-                sum_preds = np.array(preds)
-                sum_squared = np.square(preds)
-                sum_vars = np.array(var)
+                mean_preds = _numeric_values(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                prediction_m2 = _zeros_like_numeric(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                sum_vars = _numeric_values(
+                    var, model.is_atom_bond_targets, 'MVE variances',
+                )
                 individual_vars = [var]
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
@@ -572,9 +838,17 @@ class MVEPredictor(UncertaintyPredictor):
                     else:
                         individual_preds = np.expand_dims(np.array(preds), axis=-1)
             else:
-                sum_preds += np.array(preds)
-                sum_squared += np.square(preds)
-                sum_vars += np.array(var)
+                mean_preds, prediction_m2 = _update_running_moments(
+                    mean_preds,
+                    prediction_m2,
+                    preds,
+                    i + 1,
+                    model.is_atom_bond_targets,
+                    'Predictions',
+                )
+                sum_vars = _accumulate_numeric_values(
+                    sum_vars, var, model.is_atom_bond_targets, 'MVE variances',
+                )
                 individual_vars.append(var)
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
@@ -587,10 +861,10 @@ class MVEPredictor(UncertaintyPredictor):
 
         if model.is_atom_bond_targets:
             uncal_preds, uncal_vars = [], []
-            for pred, squared, var in zip(sum_preds, sum_squared, sum_vars):
-                uncal_pred = pred / self.num_models
-                uncal_var = (var + squared) / self.num_models - np.square(
-                    pred / self.num_models
+            for pred, m2, var in zip(mean_preds, prediction_m2, sum_vars):
+                uncal_pred = pred
+                uncal_var = np.maximum(
+                    (var + m2) / self.num_models, 0,
                 )
                 uncal_preds.append(uncal_pred)
                 uncal_vars.append(uncal_var)
@@ -616,9 +890,9 @@ class MVEPredictor(UncertaintyPredictor):
                     self.num_models,
                 )
         else:
-            uncal_preds = sum_preds / self.num_models
-            uncal_vars = (sum_vars + sum_squared) / self.num_models - np.square(
-                sum_preds / self.num_models
+            uncal_preds = mean_preds
+            uncal_vars = np.maximum(
+                (sum_vars + prediction_m2) / self.num_models, 0,
             )
             self.uncal_preds, self.uncal_vars = (
                 uncal_preds.tolist(),
@@ -686,11 +960,43 @@ class EvidentialTotalPredictor(UncertaintyPredictor):
                 atom_bond_scaler=atom_bond_scaler,
                 return_unc_parameters=True,
             )
-            var = np.array(betas) * (1 + 1 / np.array(lambdas)) / (np.array(alphas) - 1)
+            for parameter_label, parameter_values in (
+                ('Evidential lambdas', lambdas),
+                ('Evidential alphas', alphas),
+                ('Evidential betas', betas),
+            ):
+                _validate_numeric_alignment(
+                    preds,
+                    parameter_values,
+                    model.is_atom_bond_targets,
+                    parameter_label,
+                )
+            if model.is_atom_bond_targets:
+                var = _atom_bond_elementwise(
+                    'Evidential parameters',
+                    lambda beta, weight, alpha: (
+                        beta * (1 + 1 / weight) / (alpha - 1)
+                    ),
+                    betas,
+                    lambdas,
+                    alphas,
+                )
+            else:
+                var = (
+                    np.asarray(betas)
+                    * (1 + 1 / np.asarray(lambdas))
+                    / (np.asarray(alphas) - 1)
+                )
             if i == 0:
-                sum_preds = np.array(preds)
-                sum_squared = np.square(preds)
-                sum_vars = np.array(var)
+                mean_preds = _numeric_values(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                prediction_m2 = _zeros_like_numeric(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                sum_vars = _numeric_values(
+                    var, model.is_atom_bond_targets, 'Evidential variances',
+                )
                 individual_vars = [var]
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
@@ -712,9 +1018,20 @@ class EvidentialTotalPredictor(UncertaintyPredictor):
                     else:
                         individual_preds = np.expand_dims(np.array(preds), axis=-1)
             else:
-                sum_preds += np.array(preds)
-                sum_squared += np.square(preds)
-                sum_vars += np.array(var)
+                mean_preds, prediction_m2 = _update_running_moments(
+                    mean_preds,
+                    prediction_m2,
+                    preds,
+                    i + 1,
+                    model.is_atom_bond_targets,
+                    'Predictions',
+                )
+                sum_vars = _accumulate_numeric_values(
+                    sum_vars,
+                    var,
+                    model.is_atom_bond_targets,
+                    'Evidential variances',
+                )
                 individual_vars.append(var)
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
@@ -727,10 +1044,10 @@ class EvidentialTotalPredictor(UncertaintyPredictor):
 
         if model.is_atom_bond_targets:
             uncal_preds, uncal_vars = [], []
-            for pred, squared, var in zip(sum_preds, sum_squared, sum_vars):
-                uncal_pred = pred / self.num_models
-                uncal_var = (var + squared) / self.num_models - np.square(
-                    pred / self.num_models
+            for pred, m2, var in zip(mean_preds, prediction_m2, sum_vars):
+                uncal_pred = pred
+                uncal_var = np.maximum(
+                    (var + m2) / self.num_models, 0,
                 )
                 uncal_preds.append(uncal_pred)
                 uncal_vars.append(uncal_var)
@@ -756,9 +1073,9 @@ class EvidentialTotalPredictor(UncertaintyPredictor):
                     self.num_models,
                 )
         else:
-            uncal_preds = sum_preds / self.num_models
-            uncal_vars = (sum_vars + sum_squared) / self.num_models - np.square(
-                sum_preds / self.num_models
+            uncal_preds = mean_preds
+            uncal_vars = np.maximum(
+                (sum_vars + prediction_m2) / self.num_models, 0,
             )
             self.uncal_preds, self.uncal_vars = (
                 uncal_preds.tolist(),
@@ -826,11 +1143,36 @@ class EvidentialAleatoricPredictor(UncertaintyPredictor):
                 atom_bond_scaler=atom_bond_scaler,
                 return_unc_parameters=True,
             )
-            var = np.array(betas) / (np.array(alphas) - 1)
+            for parameter_label, parameter_values in (
+                ('Evidential lambdas', lambdas),
+                ('Evidential alphas', alphas),
+                ('Evidential betas', betas),
+            ):
+                _validate_numeric_alignment(
+                    preds,
+                    parameter_values,
+                    model.is_atom_bond_targets,
+                    parameter_label,
+                )
+            if model.is_atom_bond_targets:
+                var = _atom_bond_elementwise(
+                    'Evidential parameters',
+                    lambda beta, alpha: beta / (alpha - 1),
+                    betas,
+                    alphas,
+                )
+            else:
+                var = np.asarray(betas) / (np.asarray(alphas) - 1)
             if i == 0:
-                sum_preds = np.array(preds)
-                sum_squared = np.square(preds)
-                sum_vars = np.array(var)
+                mean_preds = _numeric_values(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                prediction_m2 = _zeros_like_numeric(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                sum_vars = _numeric_values(
+                    var, model.is_atom_bond_targets, 'Evidential variances',
+                )
                 individual_vars = [var]
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
@@ -852,9 +1194,20 @@ class EvidentialAleatoricPredictor(UncertaintyPredictor):
                     else:
                         individual_preds = np.expand_dims(np.array(preds), axis=-1)
             else:
-                sum_preds += np.array(preds)
-                sum_squared += np.square(preds)
-                sum_vars += np.array(var)
+                mean_preds, prediction_m2 = _update_running_moments(
+                    mean_preds,
+                    prediction_m2,
+                    preds,
+                    i + 1,
+                    model.is_atom_bond_targets,
+                    'Predictions',
+                )
+                sum_vars = _accumulate_numeric_values(
+                    sum_vars,
+                    var,
+                    model.is_atom_bond_targets,
+                    'Evidential variances',
+                )
                 individual_vars.append(var)
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
@@ -867,10 +1220,10 @@ class EvidentialAleatoricPredictor(UncertaintyPredictor):
 
         if model.is_atom_bond_targets:
             uncal_preds, uncal_vars = [], []
-            for pred, squared, var in zip(sum_preds, sum_squared, sum_vars):
-                uncal_pred = pred / self.num_models
-                uncal_var = (var + squared) / self.num_models - np.square(
-                    pred / self.num_models
+            for pred, m2, var in zip(mean_preds, prediction_m2, sum_vars):
+                uncal_pred = pred
+                uncal_var = np.maximum(
+                    (var + m2) / self.num_models, 0,
                 )
                 uncal_preds.append(uncal_pred)
                 uncal_vars.append(uncal_var)
@@ -896,9 +1249,9 @@ class EvidentialAleatoricPredictor(UncertaintyPredictor):
                     self.num_models,
                 )
         else:
-            uncal_preds = sum_preds / self.num_models
-            uncal_vars = (sum_vars + sum_squared) / self.num_models - np.square(
-                sum_preds / self.num_models
+            uncal_preds = mean_preds
+            uncal_vars = np.maximum(
+                (sum_vars + prediction_m2) / self.num_models, 0,
             )
             self.uncal_preds, self.uncal_vars = (
                 uncal_preds.tolist(),
@@ -966,11 +1319,42 @@ class EvidentialEpistemicPredictor(UncertaintyPredictor):
                 atom_bond_scaler=atom_bond_scaler,
                 return_unc_parameters=True,
             )
-            var = np.array(betas) / (np.array(lambdas) * (np.array(alphas) - 1))
+            for parameter_label, parameter_values in (
+                ('Evidential lambdas', lambdas),
+                ('Evidential alphas', alphas),
+                ('Evidential betas', betas),
+            ):
+                _validate_numeric_alignment(
+                    preds,
+                    parameter_values,
+                    model.is_atom_bond_targets,
+                    parameter_label,
+                )
+            if model.is_atom_bond_targets:
+                var = _atom_bond_elementwise(
+                    'Evidential parameters',
+                    lambda beta, weight, alpha: (
+                        beta / (weight * (alpha - 1))
+                    ),
+                    betas,
+                    lambdas,
+                    alphas,
+                )
+            else:
+                var = (
+                    np.asarray(betas)
+                    / (np.asarray(lambdas) * (np.asarray(alphas) - 1))
+                )
             if i == 0:
-                sum_preds = np.array(preds)
-                sum_squared = np.square(preds)
-                sum_vars = np.array(var)
+                mean_preds = _numeric_values(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                prediction_m2 = _zeros_like_numeric(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                sum_vars = _numeric_values(
+                    var, model.is_atom_bond_targets, 'Evidential variances',
+                )
                 individual_vars = [var]
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
@@ -992,9 +1376,20 @@ class EvidentialEpistemicPredictor(UncertaintyPredictor):
                     else:
                         individual_preds = np.expand_dims(np.array(preds), axis=-1)
             else:
-                sum_preds += np.array(preds)
-                sum_squared += np.square(preds)
-                sum_vars += np.array(var)
+                mean_preds, prediction_m2 = _update_running_moments(
+                    mean_preds,
+                    prediction_m2,
+                    preds,
+                    i + 1,
+                    model.is_atom_bond_targets,
+                    'Predictions',
+                )
+                sum_vars = _accumulate_numeric_values(
+                    sum_vars,
+                    var,
+                    model.is_atom_bond_targets,
+                    'Evidential variances',
+                )
                 individual_vars.append(var)
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
@@ -1007,10 +1402,10 @@ class EvidentialEpistemicPredictor(UncertaintyPredictor):
 
         if model.is_atom_bond_targets:
             uncal_preds, uncal_vars = [], []
-            for pred, squared, var in zip(sum_preds, sum_squared, sum_vars):
-                uncal_pred = pred / self.num_models
-                uncal_var = (var + squared) / self.num_models - np.square(
-                    pred / self.num_models
+            for pred, m2, var in zip(mean_preds, prediction_m2, sum_vars):
+                uncal_pred = pred
+                uncal_var = np.maximum(
+                    (var + m2) / self.num_models, 0,
                 )
                 uncal_preds.append(uncal_pred)
                 uncal_vars.append(uncal_var)
@@ -1036,9 +1431,9 @@ class EvidentialEpistemicPredictor(UncertaintyPredictor):
                     self.num_models,
                 )
         else:
-            uncal_preds = sum_preds / self.num_models
-            uncal_vars = (sum_vars + sum_squared) / self.num_models - np.square(
-                sum_preds / self.num_models
+            uncal_preds = mean_preds
+            uncal_vars = np.maximum(
+                (sum_vars + prediction_m2) / self.num_models, 0,
             )
             self.uncal_preds, self.uncal_vars = (
                 uncal_preds.tolist(),
@@ -1108,9 +1503,14 @@ class EnsemblePredictor(UncertaintyPredictor):
                     phase_mask=self.spectra_phase_mask,
                     excluded_sub_value=float("nan"),
                 )
+            self._record_train_class_sizes(model, i, preds)
             if i == 0:
-                sum_preds = np.array(preds)
-                sum_squared = np.square(preds)
+                mean_preds = _numeric_values(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                prediction_m2 = _zeros_like_numeric(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
                         n_atoms, n_bonds = (
@@ -1130,11 +1530,15 @@ class EnsemblePredictor(UncertaintyPredictor):
                             individual_preds[j][:, :, i] = pred
                     else:
                         individual_preds = np.expand_dims(np.array(preds), axis=-1)
-                if model.train_class_sizes is not None:
-                    self.train_class_sizes = [model.train_class_sizes]
             else:
-                sum_preds += np.array(preds)
-                sum_squared += np.square(preds)
+                mean_preds, prediction_m2 = _update_running_moments(
+                    mean_preds,
+                    prediction_m2,
+                    preds,
+                    i + 1,
+                    model.is_atom_bond_targets,
+                    'Predictions',
+                )
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
                         for j, pred in enumerate(preds):
@@ -1143,17 +1547,12 @@ class EnsemblePredictor(UncertaintyPredictor):
                         individual_preds = np.append(
                             individual_preds, np.expand_dims(preds, axis=-1), axis=-1
                         )
-                if model.train_class_sizes is not None:
-                    self.train_class_sizes.append(model.train_class_sizes)
 
         if model.is_atom_bond_targets:
             uncal_preds, uncal_vars = [], []
-            for pred, squared in zip(sum_preds, sum_squared):
-                uncal_pred = pred / self.num_models
-                uncal_var = (
-                    squared / self.num_models - np.square(pred) / self.num_models**2
-                )
-                uncal_var = np.maximum(uncal_var, 0)
+            for pred, m2 in zip(mean_preds, prediction_m2):
+                uncal_pred = pred
+                uncal_var = np.maximum(m2 / self.num_models, 0)
                 uncal_preds.append(uncal_pred)
                 uncal_vars.append(uncal_var)
             self.uncal_preds = reshape_values(
@@ -1178,12 +1577,8 @@ class EnsemblePredictor(UncertaintyPredictor):
                     self.num_models,
                 )
         else:
-            uncal_preds = sum_preds / self.num_models
-            uncal_vars = (
-                sum_squared / self.num_models
-                - np.square(sum_preds) / self.num_models**2
-            )
-            uncal_vars = np.maximum(uncal_vars, 0)
+            uncal_preds = mean_preds
+            uncal_vars = np.maximum(prediction_m2 / self.num_models, 0)
             self.uncal_preds, self.uncal_vars = (
                 uncal_preds.tolist(),
                 uncal_vars.tolist(),
@@ -1255,21 +1650,29 @@ class DropoutPredictor(UncertaintyPredictor):
                 dropout_prob=self.uncertainty_dropout_p,
             )
             if i == 0:
-                sum_preds = np.array(preds)
-                sum_squared = np.square(preds)
+                mean_preds = _numeric_values(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                prediction_m2 = _zeros_like_numeric(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
             else:
-                sum_preds += np.array(preds)
-                sum_squared += np.square(preds)
+                mean_preds, prediction_m2 = _update_running_moments(
+                    mean_preds,
+                    prediction_m2,
+                    preds,
+                    i + 1,
+                    model.is_atom_bond_targets,
+                    'Predictions',
+                )
 
         if model.is_atom_bond_targets:
             uncal_preds, uncal_vars = [], []
-            for pred, square in zip(sum_preds, sum_squared):
-                uncal_pred = pred / self.dropout_sampling_size
-                uncal_var = (
-                    square / self.dropout_sampling_size
-                    - np.square(pred) / self.dropout_sampling_size**2
+            for pred, m2 in zip(mean_preds, prediction_m2):
+                uncal_pred = pred
+                uncal_var = np.maximum(
+                    m2 / self.dropout_sampling_size, 0,
                 )
-                uncal_var = np.maximum(uncal_var, 0)
                 uncal_preds.append(uncal_pred)
                 uncal_vars.append(uncal_var)
             self.uncal_preds = reshape_values(
@@ -1285,12 +1688,10 @@ class DropoutPredictor(UncertaintyPredictor):
                 len(model.bond_targets),
             )
         else:
-            uncal_preds = sum_preds / self.dropout_sampling_size
-            uncal_vars = (
-                sum_squared / self.dropout_sampling_size
-                - np.square(sum_preds) / self.dropout_sampling_size**2
+            uncal_preds = mean_preds
+            uncal_vars = np.maximum(
+                prediction_m2 / self.dropout_sampling_size, 0,
             )
-            uncal_vars = np.maximum(uncal_vars, 0)
             self.uncal_preds, self.uncal_vars = (
                 uncal_preds.tolist(),
                 uncal_vars.tolist(),
@@ -1350,8 +1751,11 @@ class ClassPredictor(UncertaintyPredictor):
                 atom_bond_scaler=atom_bond_scaler,
                 return_unc_parameters=False,
             )
+            self._record_train_class_sizes(model, i, preds)
             if i == 0:
-                sum_preds = np.array(preds)
+                sum_preds = _numeric_values(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
                         n_atoms, n_bonds = (
@@ -1371,10 +1775,10 @@ class ClassPredictor(UncertaintyPredictor):
                             individual_preds[j][:, :, i] = pred
                     else:
                         individual_preds = np.expand_dims(np.array(preds), axis=-1)
-                if model.train_class_sizes is not None:
-                    self.train_class_sizes = [model.train_class_sizes]
             else:
-                sum_preds += np.array(preds)
+                sum_preds = _accumulate_numeric_values(
+                    sum_preds, preds, model.is_atom_bond_targets, 'Predictions',
+                )
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
                         for j, pred in enumerate(preds):
@@ -1383,11 +1787,9 @@ class ClassPredictor(UncertaintyPredictor):
                         individual_preds = np.append(
                             individual_preds, np.expand_dims(preds, axis=-1), axis=-1
                         )
-                if model.train_class_sizes is not None:
-                    self.train_class_sizes.append(model.train_class_sizes)
 
         if model.is_atom_bond_targets:
-            uncal_preds = sum_preds / self.num_models
+            uncal_preds = [pred / self.num_models for pred in sum_preds]
             self.uncal_preds = reshape_values(
                 uncal_preds,
                 self.test_data,
@@ -1468,14 +1870,39 @@ class DirichletPredictor(UncertaintyPredictor):
                 return_unc_parameters=True,
             )
 
-            alphas = np.array(alphas)
-            S = np.sum(alphas, axis=2)
-            num_classes = alphas.shape[2]
-            u =  num_classes / S
+            if model.is_atom_bond_targets:
+                alpha_values = _atom_bond_task_arrays(
+                    alphas, 'Dirichlet parameters',
+                )
+                u = []
+                for task_index, alpha in enumerate(alpha_values):
+                    if alpha.ndim != 3:
+                        raise ValueError(
+                            'Dirichlet parameter task '
+                            f'{task_index} must be 3-D; got shape {alpha.shape}.'
+                        )
+                    u.append(alpha.shape[2] / np.sum(alpha, axis=2))
+            else:
+                alpha_values = np.asarray(alphas)
+                if alpha_values.ndim != 3:
+                    raise ValueError(
+                        'Dirichlet parameters must be a 3-D array; got shape '
+                        f'{alpha_values.shape}.'
+                    )
+                u = alpha_values.shape[2] / np.sum(alpha_values, axis=2)
+
+            _validate_numeric_alignment(
+                preds, u, model.is_atom_bond_targets, 'Dirichlet uncertainty',
+            )
+            self._record_train_class_sizes(model, i, preds)
 
             if i == 0:
-                sum_preds = np.array(preds)
-                sum_u = u
+                sum_preds = _numeric_values(
+                    preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                sum_u = _numeric_values(
+                    u, model.is_atom_bond_targets, 'Dirichlet uncertainty',
+                )
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
                         n_atoms, n_bonds = (
@@ -1495,11 +1922,16 @@ class DirichletPredictor(UncertaintyPredictor):
                             individual_preds[j][:, :, i] = pred
                     else:
                         individual_preds = np.expand_dims(np.array(preds), axis=-1)
-                if model.train_class_sizes is not None:
-                    self.train_class_sizes = [model.train_class_sizes]
             else:
-                sum_preds += np.array(preds)
-                sum_u += u
+                sum_preds = _accumulate_numeric_values(
+                    sum_preds, preds, model.is_atom_bond_targets, 'Predictions',
+                )
+                sum_u = _accumulate_numeric_values(
+                    sum_u,
+                    u,
+                    model.is_atom_bond_targets,
+                    'Dirichlet uncertainty',
+                )
                 if self.individual_ensemble_predictions:
                     if model.is_atom_bond_targets:
                         for j, pred in enumerate(preds):
@@ -1508,12 +1940,10 @@ class DirichletPredictor(UncertaintyPredictor):
                         individual_preds = np.append(
                             individual_preds, np.expand_dims(preds, axis=-1), axis=-1
                         )
-                if model.train_class_sizes is not None:
-                    self.train_class_sizes.append(model.train_class_sizes)
 
         if model.is_atom_bond_targets:
-            uncal_preds = sum_preds / self.num_models
-            uncal_u = sum_u / self.num_models
+            uncal_preds = [pred / self.num_models for pred in sum_preds]
+            uncal_u = [uncertainty / self.num_models for uncertainty in sum_u]
             self.uncal_preds = reshape_values(
                 uncal_preds,
                 self.test_data,

@@ -253,6 +253,48 @@ def test_prediction_rejects_silently_unused_auxiliary_output_args(tmp_path):
 
 
 @pytest.mark.parametrize(
+    'constraint_args',
+    [
+        ['--constraints_path', 'prediction_constraints.csv'],
+        ['--calibration_constraints_path', 'calibration_constraints.csv'],
+    ],
+)
+def test_prediction_calibration_requires_both_constraint_files(
+    tmp_path, constraint_args,
+):
+    with pytest.raises(ValueError, match='constraints_path.*either both'):
+        PredictArgs().parse_args(
+            _predict_cli_args(tmp_path)
+            + [
+                '--calibration_method',
+                'zscaling',
+                '--calibration_path',
+                'calibration.csv',
+            ]
+            + constraint_args
+        )
+
+
+def test_prediction_calibration_accepts_matching_constraint_files(tmp_path):
+    args = PredictArgs().parse_args(
+        _predict_cli_args(tmp_path)
+        + [
+            '--calibration_method',
+            'zscaling',
+            '--calibration_path',
+            'calibration.csv',
+            '--constraints_path',
+            'prediction_constraints.csv',
+            '--calibration_constraints_path',
+            'calibration_constraints.csv',
+        ]
+    )
+
+    assert args.constraints_path == 'prediction_constraints.csv'
+    assert args.calibration_constraints_path == 'calibration_constraints.csv'
+
+
+@pytest.mark.parametrize(
     "option,value,message",
     [
         ("--uncertainty_dropout_p", "0", "dropout probability"),

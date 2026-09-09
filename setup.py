@@ -6,6 +6,8 @@ metadata must not select a CUDA build of PyTorch, and compatible patch releases
 should remain installable.
 """
 
+from pathlib import Path
+
 from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py
 
@@ -20,7 +22,19 @@ class ChempropBuildPy(build_py):
         return modules
 
 
-VERSION = "1.7.1+kuroki.2"
+VERSION = "1.7.1+kuroki.3"
+
+# Keep Web assets explicit rather than relying on ``include_package_data`` to
+# interpret data-only directories as namespace packages. Newer Setuptools
+# warns that the latter is ambiguous and may change behavior in the future.
+WEB_APP_ROOT = Path(__file__).parent / "chemprop" / "web" / "app"
+WEB_PACKAGE_DATA = [
+    path.relative_to(WEB_APP_ROOT).as_posix()
+    for directory in (WEB_APP_ROOT / "templates", WEB_APP_ROOT / "static")
+    for path in sorted(directory.rglob("*"))
+    if path.is_file()
+]
+WEB_PACKAGE_DATA.append("schema.sql")
 
 CORE_REQUIREMENTS = [
     "Flask>=3.1.3,<3.2",
@@ -52,6 +66,7 @@ FEATURE_REQUIREMENTS = [
     "molfeat>=0.11,<0.12",
     "mordredcommunity>=2.0.7,<2.1",
     "padelpy>=0.1.17,<0.2",
+    "pmapper>=1.1.3,<1.2",
 ]
 
 # Molfeat 0.11's pretrained backends have stricter and partly historical
@@ -65,6 +80,7 @@ PRETRAINED_FEATURE_REQUIREMENTS = [
     "tokenizers>=0.13,<0.13.2",
     "transformers>=4.24,<4.25",
     "sentencepiece>=0.2,<0.3",
+    "selfies>=2.2,<2.3",
 ]
 
 TEST_REQUIREMENTS = [
@@ -99,8 +115,11 @@ setup(
     license="MIT",
     packages=find_packages(),
     cmdclass={"build_py": ChempropBuildPy},
-    include_package_data=True,
-    package_data={"chemprop": ["py.typed"]},
+    include_package_data=False,
+    package_data={
+        "chemprop": ["py.typed"],
+        "chemprop.web.app": WEB_PACKAGE_DATA,
+    },
     entry_points={
         "console_scripts": [
             "chemprop_train=chemprop.train:chemprop_train",

@@ -5,6 +5,7 @@ from typing import Dict
 
 
 _FEATURE_GENERATOR_EXPORTS = {
+    "FEATURE_GENERATOR_METADATA_SCHEMA_VERSION",
     "clear_features_generator_caches",
     "clear_pretrained_transformer_cache",
     "generate_features_batch",
@@ -13,6 +14,7 @@ _FEATURE_GENERATOR_EXPORTS = {
     "get_features_generator_config",
     "get_features_generators_metadata",
     "get_features_generator_schema",
+    "is_builtin_features_generator",
     "morgan_binary_features_generator",
     "morgan_counts_features_generator",
     "rdkit_2d_features_generator",

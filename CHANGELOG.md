@@ -1,5 +1,109 @@
 # Changelog
 
+## 1.7.1+kuroki.3 — 2026-09-09
+
+This production-readiness maintenance release follows a final repository-wide
+audit of checkpoint evaluation and transfer, generated features, LightGBM,
+atom/bond uncertainty, external splits, Web storage, and packaging.
+
+### Highlights
+
+- Made `chemprop_train --test` a true no-optimization checkpoint evaluation.
+  It restores the exact saved architecture and target/input scalers, validates
+  every ensemble member's scaler contract and data semantics, avoids dependence
+  on training-split labels, and preserves supplied checkpoints byte-for-byte.
+  It also rejects frozen-transfer options which would make evaluated and saved
+  models disagree.
+- Reworked warm starts and frozen transfer. Complete compatible encoders are
+  copied into the requested current architecture, non-encoder state is reused
+  only when shape-compatible, and frozen values and gradient flags are applied
+  only after complete validation. Multi-encoder, reaction/solvent,
+  `features_only`, shared atom/bond FFN aliases, and PReLU edge cases now fail
+  safely or map deterministically.
+- Unified scalar, native-batch, runtime, and `scripts/save_features.py`
+  molecular-feature semantics. Inputs are canonical and atom-map-independent;
+  offline reactions use reactants; hydrogen-only rows use typed zero vectors;
+  generators and duplicate calculations are reused across bounded batches and
+  worker processes. Morgan, count-Morgan, RDKit, and AtomPair fingerprints now
+  use affinity-bounded RDKit native batches at runtime while offline generation
+  retains its faster default SMILES-parsing process pool.
+- Reduced peak memory during runtime feature generation by releasing unused
+  reaction products, generator temporaries, unique-molecule maps, and each
+  source row as soon as its final vector is materialized. Empty offline inputs
+  now fail before creating artifacts when a custom generator has no discoverable
+  width, while fixed-width generators produce a valid empty archive.
+- Replaced the overly broad per-module built-in feature hash with metadata
+  schema 2 and a targeted semantic revision per generator. Dependency versions,
+  configuration, selected-column order, width, dtype, and source provenance
+  remain independently checked; custom/plugin generators retain conservative
+  full-module hashing.
+- Completed provenance and dependencies for Pharm2D and pretrained Molfeat,
+  corrected normalized Descriptastorus parity for explicit-H RDKit molecules,
+  and made selected PaDEL schemas available before the first Java calculation.
+- Added LightGBM guardrails for untrained MPN representations, reaction
+  generators, ignored atom/bond inputs, bundle-owned scalers, incompatible
+  ensembles, and unsupported uncertainty options. Versioned bundles retain the
+  exact deterministic representation, per-task boosters, and scalers; loading
+  now cross-checks target/feature scaler presence and widths, Booster objectives
+  and widths, task counts, and redundant encoder metadata before prediction.
+- Corrected constrained atom/bond prediction and uncertainty calibration.
+  Prediction and calibration constraint files are now distinct and validated
+  for task order, rows, numeric finiteness, scaling, device, and dtype.
+- Made atom/bond uncertainty and ensemble aggregation safe for variable atom
+  and bond counts under NumPy 2, added stable online aggregation, and serialized
+  variable-length CSV values as JSON arrays. Classification uncertainty now
+  validates every member's class-count shape and values and rejects mixed
+  legacy/new ensembles instead of crashing or biasing Bayesian priors.
+- Hardened predetermined, index-based, and external cross-validation splits
+  against invalid, duplicate, out-of-range, overlapping, and silently omitted
+  indices. Fold index zero is handled correctly.
+- Anchored pickle-based dataset-cache reads and atomic writes to validated
+  descriptor-relative POSIX paths, rejecting symbolic links in every path
+  component and directory-replacement races before deserialization.
+- Corrected `last_FFN` and reaction/solvent fingerprint widths, restored
+  one-molecule MPN fingerprint extraction from shared multi-molecule encoders,
+  and explicitly rejected unsupported atom/bond fingerprint export.
+- Hardened Web state cleanup against containment escape, symlink traversal,
+  and directory-replacement races. Mutable Web state now defaults outside the
+  source tree, and database/data/checkpoint reset uses the same safe deletion
+  primitive.
+- Updated CI and reproducible build declarations to Setuptools 84.x and Wheel
+  0.48.x, added missing optional feature dependencies, made Web assets explicit
+  package data, and made the source distribution include its documented
+  environment, CLI wrappers, scripts, local documentation, and logo without a
+  misleading partial test subset. Focused regression coverage checks all
+  changes above; CI now exercises both FFN and LightGBM command-line round trips
+  and inspects the corresponding release artifacts.
+
+### Compatibility notes
+
+- Recompute scores previously produced by `chemprop_train --test` for
+  regression or scaled inputs. Earlier behavior could fit scalers to evaluation
+  data or silently run a checkpoint whose required scaler was absent.
+- Feature metadata schema 1 and 2 intentionally have a one-time boundary.
+  Checkpoints which generate features at prediction time must be retrained, and
+  interrupted schema 1 `save_features` jobs require `--restart` once. A
+  completed schema 1 `.npz` plus its original manifest remains usable as
+  materialized external features when the exact files are retained.
+- Regenerate/retrain features affected by canonicalization, atom-map removal,
+  reaction-reactant handling, or hydrogen-only policy changes. `map4` and
+  `map4_v1_1` remain different definitions and cannot be interchanged.
+- Legacy LightGBM models built from an untrained random MPN, a reaction
+  molecular generator, or ignored atom/bond descriptors are rejected and need
+  retraining with deterministic, explicit molecule-level features.
+- Frozen-transfer runs which previously froze random or partially copied
+  values should be retrained. Newly ambiguous or incomplete mappings are
+  rejected instead of approximated.
+- Constrained atom/bond calibration requires both `--constraints_path` for
+  prediction rows and `--calibration_constraints_path` for calibration rows.
+  Downstream CSV readers should parse atom/bond vectors as JSON.
+- Web state formerly kept below the checkout is not moved automatically. Use
+  the private default `~/.chemprop-web`, `CHEMPROP_WEB_ROOT`, or an explicit
+  service-owned `--root_folder` with mode `0700`.
+- Updating the checkout does not update an existing conda environment. Recreate
+  it, or update it from `environment.yml` and verify dependencies before
+  building this release.
+
 ## 1.7.1+kuroki.2 — 2026-09-08
 
 This maintenance release follows a second end-to-end correctness, security,

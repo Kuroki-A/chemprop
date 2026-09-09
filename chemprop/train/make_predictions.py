@@ -1,5 +1,6 @@
 from collections import OrderedDict
 import csv
+import json
 import os
 from typing import List, Optional, Union, Tuple
 
@@ -117,6 +118,13 @@ def _validate_prediction_values(
                 raise ValueError(f'{label} output must contain numeric values.') from error
             if np.isinf(numeric_value) or (np.isnan(numeric_value) and not allow_nan):
                 raise ValueError(f'{label} output contains non-finite values.')
+
+
+def _prediction_csv_cell(value, is_atom_bond_targets: bool):
+    """Serializes variable-length atom/bond vectors as machine-readable JSON."""
+    if not is_atom_bond_targets or isinstance(value, str):
+        return value
+    return json.dumps(np.asarray(value).tolist(), separators=(',', ':'))
 
 
 def _lgbm_compatibility_signature(train_args: TrainArgs) -> dict:
@@ -372,6 +380,15 @@ def load_data(
     """
     print("Loading data")
     if smiles is not None:
+        if train_args is not None and (
+            any(getattr(train_args, 'atom_constraints', []))
+            or any(getattr(train_args, 'bond_constraints', []))
+        ):
+            raise ValueError(
+                'In-memory SMILES prediction is not supported for a checkpoint '
+                'with atom/bond constraints because constraints are row-aligned '
+                'to --test_path. Predict from a CSV and provide --constraints_path.'
+            )
         full_data = get_data_from_smiles(
             smiles=smiles,
             skip_invalid_smiles=False,
@@ -386,6 +403,11 @@ def load_data(
             ignore_columns=[],
             skip_invalid_smiles=False,
             args=args,
+            constraints_target_columns=(
+                list(train_args.atom_targets) + list(train_args.bond_targets)
+                if train_args is not None and train_args.is_atom_bond_targets
+                else None
+            ),
             store_row=not args.drop_extra_columns,
         )
 
@@ -635,7 +657,7 @@ def predict_and_save(
 
     preds, unc = estimator.calculate_uncertainty(
         calibrator=calibrator
-    )  # preds and unc are lists of shape(data,tasks)
+    )  # dense tasks are lists; atom/bond tasks are 2-D object arrays
 
     _validate_prediction_values(
         preds,
@@ -659,7 +681,7 @@ def predict_and_save(
     if args.individual_ensemble_predictions:
         individual_preds = (
             estimator.individual_predictions()
-        )  # shape(data, tasks, ensemble) or (data, tasks, classes, ensemble)
+        )  # dense outputs include an ensemble axis; atom/bond cells are (ensemble, elements)
 
     if args.evaluation_methods is not None:
 
@@ -779,18 +801,24 @@ def predict_and_save(
                 unc_names = [name + f"_{estimator.label}" for name in task_names]
             
             for pred_name, pred in zip(task_names, d_preds):
-                datapoint.row[pred_name] = pred
+                datapoint.row[pred_name] = _prediction_csv_cell(
+                    pred, args.is_atom_bond_targets,
+                )
             
 
             for unc_name, un in zip(unc_names, d_unc):
                 if (
                     args.uncertainty_method is not None or args.calibration_method is not None
                 ):
-                    datapoint.row[unc_name] = un
+                    datapoint.row[unc_name] = _prediction_csv_cell(
+                        un, args.is_atom_bond_targets,
+                    )
             if args.individual_ensemble_predictions:
                 for pred_name, model_preds in zip(task_names, ind_preds):
                     for idx, pred in enumerate(model_preds):
-                        datapoint.row[pred_name + f"_model_{idx}"] = pred
+                        datapoint.row[pred_name + f"_model_{idx}"] = (
+                            _prediction_csv_cell(pred, args.is_atom_bond_targets)
+                        )
 
         # Save
         with open(args.preds_path, 'w', newline="") as f:
@@ -848,8 +876,15 @@ def predict_lgbm(
         )
     _require_safe_lgbm_representation(model)
 
+    if scaler is not None and scaler is not model.scalers:
+        raise ValueError(
+            "LightGBM prediction scalers must be the scaler tuple stored in "
+            "the supplied model bundle."
+        )
+    active_scalers = model.scalers if scaler is None else scaler
+
     if encoded_features is None:
-        _apply_lgbm_feature_scalers(test_data, model.scalers)
+        _apply_lgbm_feature_scalers(test_data, active_scalers)
         encoded_features = encode_lgbm_features(
             encoder=model.encoder,
             data=test_data,
@@ -857,14 +892,14 @@ def predict_lgbm(
             num_workers=args.num_workers,
         )
     predictions = predict_task_boosters(model.task_boosters, encoded_features)
-    data_scaler = model.scalers[0]
+    data_scaler = active_scalers[0]
     if data_scaler is not None:
         predictions = data_scaler.inverse_transform(predictions)
     return np.asarray(predictions, dtype=float)
 
 
 def _require_safe_lgbm_representation(model: LightGBMModelBundle) -> None:
-    """Rejects bundles fitted to an untrained random neural representation."""
+    """Rejects bundles fitted to incomplete or silently ignored inputs."""
     if not getattr(model.train_args, "features_only", False):
         raise ValueError(
             f'LightGBM bundle "{model.checkpoint_path}" was trained without '
@@ -872,6 +907,26 @@ def _require_safe_lgbm_representation(model: LightGBMModelBundle) -> None:
             "representation. Prediction is disabled because its model quality "
             "is unreliable. Retrain with this Chemprop release using, for "
             "example, --features_generator morgan --features_only."
+        )
+    train_args = model.train_args
+    if (
+        getattr(train_args, "reaction", False)
+        or getattr(train_args, "reaction_solvent", False)
+    ) and getattr(train_args, "features_generator", None):
+        raise ValueError(
+            f'LightGBM bundle "{model.checkpoint_path}" used a molecular '
+            "feature generator for reaction data. That representation omits "
+            "the product, so prediction is disabled; retrain with explicit "
+            "reaction-aware --features_path data."
+        )
+    if (
+        getattr(train_args, "atom_descriptors", None) is not None
+        or getattr(train_args, "bond_descriptors", None) is not None
+    ):
+        raise ValueError(
+            f'LightGBM bundle "{model.checkpoint_path}" was trained with atom '
+            "or bond descriptors/features that features-only encoding ignores. "
+            "Prediction is disabled; retrain with molecule-level features."
         )
 
 
@@ -1135,6 +1190,12 @@ def make_predictions(
             phase_features_path=args.calibration_phase_features_path,
             atom_descriptors_path=args.calibration_atom_descriptors_path,
             bond_descriptors_path=args.calibration_bond_descriptors_path,
+            constraints_path=getattr(args, 'calibration_constraints_path', None),
+            constraints_target_columns=(
+                list(train_args.atom_targets) + list(train_args.bond_targets)
+                if getattr(train_args, 'is_atom_bond_targets', False)
+                else None
+            ),
             max_data_size=args.max_data_size,
             loss_function=args.loss_function,
         )
@@ -1272,6 +1333,14 @@ def make_predictions_lgbm(
         raise ValueError("LightGBM prediction does not support uncertainty calibration.")
     if getattr(args, "uncertainty_method", None) is not None:
         raise ValueError("LightGBM prediction does not support uncertainty methods.")
+    if (
+        getattr(args, "evaluation_methods", None) is not None
+        or getattr(args, "evaluation_scores_path", None) is not None
+    ):
+        raise ValueError(
+            "LightGBM prediction does not support uncertainty evaluation "
+            "options --evaluation_methods or --evaluation_scores_path."
+        )
 
     if model_objects:
         (

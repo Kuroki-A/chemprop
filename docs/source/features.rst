@@ -8,7 +8,7 @@ Features
 Featurization
 -------------
 
-Classes and functions from `chemprop.features.featurization.py <https://github.com/Kuroki-A/chemprop/tree/master/chemprop/features/featurization.py>`_. Featurization specifically includes computation of the atom and bond features used in message passing.
+Classes and functions from `chemprop.features.featurization.py <https://github.com/Kuroki-A/chemprop/blob/master/chemprop/features/featurization.py>`_. Featurization specifically includes computation of the atom and bond features used in message passing.
 
 .. automodule:: chemprop.features.featurization
    :members:
@@ -16,10 +16,48 @@ Classes and functions from `chemprop.features.featurization.py <https://github.c
 Features Generators
 -------------------
 
-Classes and functions from `chemprop.features.features_generators.py <https://github.com/Kuroki-A/chemprop/tree/master/chemprop/features/features_generators.py>`_. Features generators are used for computing additional molecule-level features that are appended after message passing. Optional backends are imported lazily. :func:`generate_features_batch` preserves input order while using native batches where available, and the schema/config helpers support reproducible feature manifests and checkpoints.
+Classes and functions from `chemprop.features.features_generators.py <https://github.com/Kuroki-A/chemprop/blob/master/chemprop/features/features_generators.py>`_. Features generators are used for computing additional molecule-level features that are appended after message passing. Optional backends are imported lazily. :func:`generate_features_batch` preserves input order while using native batches where available, and the schema/config helpers support reproducible feature manifests and checkpoints.
 
 .. automodule:: chemprop.features.features_generators
    :members:
+
+Reproducibility and offline generation
+--------------------------------------
+
+Built-in molecular generators canonicalize structural inputs and remove atom
+map labels from a private copy. String and RDKit-molecule inputs therefore use
+the same representation. :code:`scripts/save_features.py` follows the same
+policy as runtime loading: reaction rows are featurized from the reactant,
+hydrogen-only rows use a correctly typed zero vector, input order is preserved,
+and native batching or bounded worker processes reuse generator instances.
+
+Runtime :code:`morgan`, :code:`morgan_count`, :code:`rdkit`, and
+:code:`atompair` generation uses RDKit native batches with at most four
+affinity-visible threads. The offline script defaults these generators to its
+bounded process pool because parallel SMILES parsing is faster there.
+:code:`--sequential` selects scalar calls; :code:`--num_workers 1` or an
+explicit :code:`--batch_size` selects the one-process native-batch path.
+Explicit MAP4 worker selection is unchanged.
+
+Feature metadata schema 2 identifies each managed built-in with a targeted
+:code:`semantic_revision` plus its configuration and value-affecting dependency
+versions. An unrelated edit elsewhere in the generator module no longer
+invalidates every checkpoint. A custom/plugin generator remains conservatively
+identified by a hash of its complete source module so helper changes are also
+detected.
+
+.. warning::
+   Schema 1 checkpoints which generate molecular features at prediction time
+   cannot prove equivalence to schema 2 and must be retrained. An interrupted
+   schema 1 :code:`save_features` job needs :code:`--restart` once. A completed
+   schema 1 :code:`.npz` and its original manifest remain usable as materialized
+   external features when the exact same files are supplied for training and
+   prediction.
+
+Install stable local backends with
+:code:`python -m pip install -e '.[features]'`. Registered pretrained Molfeat
+models require the larger, historically constrained
+:code:`features-pretrained` extra.
 
 MAP4 compatibility
 ------------------
@@ -92,7 +130,7 @@ after independently verifying its original vectors.
 Utils
 -----
 
-Classes and functions from `chemprop.features.utils.py <https://github.com/Kuroki-A/chemprop/tree/master/chemprop/features/utils.py>`_.
+Classes and functions from `chemprop.features.utils.py <https://github.com/Kuroki-A/chemprop/blob/master/chemprop/features/utils.py>`_.
 
 .. automodule:: chemprop.features.utils
    :members:

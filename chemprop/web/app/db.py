@@ -1,13 +1,13 @@
 """Defines a number of database helper functions."""
 
 import os
-import shutil
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from flask import current_app, Flask, g
 
 from chemprop.web.app import app
+from chemprop.web.utils import clear_web_storage_folder
 
 
 DB_PATH = 'chemprop.sqlite3'
@@ -43,11 +43,8 @@ def init_db():
     Initializes the database by running schema.sql.
     This will wipe existing tables and the corresponding files.
     """
-    shutil.rmtree(app.config['DATA_FOLDER'])
-    os.makedirs(app.config['DATA_FOLDER'], mode=0o700)
-
-    shutil.rmtree(app.config['CHECKPOINT_FOLDER'])
-    os.makedirs(app.config['CHECKPOINT_FOLDER'], mode=0o700)
+    clear_web_storage_folder(app, 'DATA_FOLDER')
+    clear_web_storage_folder(app, 'CHECKPOINT_FOLDER')
 
     db = get_db()
 

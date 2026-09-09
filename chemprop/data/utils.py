@@ -7,9 +7,11 @@ import ctypes
 from logging import Logger
 import pickle
 from random import Random
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Sequence, Set, Tuple, Union
 import os
 import json
+from numbers import Integral
+import warnings
 
 from rdkit import Chem
 import numpy as np
@@ -19,8 +21,13 @@ from tqdm import tqdm
 from .data import MoleculeDatapoint, MoleculeDataset, generate_features_for_smiles_batch, \
     load_selected_feature_columns, make_mols
 from .scaffold import log_scaffold_stats, scaffold_split
-from chemprop.features import get_features_generator_schema, is_mol, load_features, \
-    load_valid_atom_or_bond_features
+from chemprop.features import (
+    FEATURE_GENERATOR_METADATA_SCHEMA_VERSION,
+    get_features_generator_schema,
+    is_mol,
+    load_features,
+    load_valid_atom_or_bond_features,
+)
 from chemprop.rdkit import make_mol
 
 if TYPE_CHECKING:
@@ -89,6 +96,7 @@ _FEATURE_MANIFEST_SCHEMA_FIELDS = (
     'feature_names',
     'dimension',
     'dtype',
+    'semantic_revision',
     'implementation_sha256',
 )
 
@@ -253,6 +261,54 @@ def _feature_manifest_schema(
     if manifest is None:
         return None
     manifest_path = f'{path}.manifest.json'
+
+    schema_version = manifest.get('schema_version')
+    if (
+        schema_version is not None
+        and (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version not in {1, FEATURE_GENERATOR_METADATA_SCHEMA_VERSION}
+        )
+    ):
+        raise ValueError(
+            f'Invalid feature manifest {manifest_path}: unsupported '
+            f'schema_version {schema_version!r}.'
+        )
+    if schema_version == FEATURE_GENERATOR_METADATA_SCHEMA_VERSION:
+        has_revision = 'semantic_revision' in manifest
+        has_source_hash = 'implementation_sha256' in manifest
+        if has_revision == has_source_hash:
+            raise ValueError(
+                f'Invalid feature manifest {manifest_path}: schema_version '
+                f'{schema_version} requires exactly one of semantic_revision '
+                'or implementation_sha256.'
+            )
+        if has_revision:
+            revision = manifest['semantic_revision']
+            if (
+                isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 1
+            ):
+                raise ValueError(
+                    f'Invalid feature manifest {manifest_path}: '
+                    'semantic_revision must be a positive integer.'
+                )
+        else:
+            implementation_sha256 = manifest['implementation_sha256']
+            if (
+                not isinstance(implementation_sha256, str)
+                or len(implementation_sha256) != 64
+                or any(
+                    character not in '0123456789abcdef'
+                    for character in implementation_sha256.lower()
+                )
+            ):
+                raise ValueError(
+                    f'Invalid feature manifest {manifest_path}: '
+                    'implementation_sha256 must be a 64-character hexadecimal string.'
+                )
 
     status = manifest.get('status')
     if status is not None and status != 'complete':
@@ -770,7 +826,11 @@ def get_smiles(path: str,
             smiles = []
             for row_number, row in enumerate(reader, start=2):
                 _validate_csv_dict_row(row, path, row_number)
-                smiles.append([row[column] for column in smiles_columns])
+                row_smiles = [row[column] for column in smiles_columns]
+                if flatten:
+                    smiles.extend(row_smiles)
+                else:
+                    smiles.append(row_smiles)
         else:
             reader = csv.reader(f)
             smiles_columns = list(range(number_of_molecules))
@@ -782,10 +842,11 @@ def get_smiles(path: str,
                         f'{len(row)} fields, but {number_of_molecules} SMILES '
                         'columns were requested.'
                     )
-                smiles.append([row[column] for column in smiles_columns])
-
-    if flatten:
-        smiles = [smile for smiles_list in smiles for smile in smiles_list]
+                row_smiles = [row[column] for column in smiles_columns]
+                if flatten:
+                    smiles.extend(row_smiles)
+                else:
+                    smiles.append(row_smiles)
 
     return smiles
 
@@ -912,7 +973,8 @@ def get_data(path: str,
              logger: Logger = None,
              loss_function: str = None,
              skip_none_targets: bool = False,
-             selected_features_path: str = None) -> MoleculeDataset:
+             selected_features_path: str = None,
+             constraints_target_columns: List[str] = None) -> MoleculeDataset:
     """
     Gets SMILES and target values from a CSV file.
 
@@ -934,6 +996,9 @@ def get_data(path: str,
     :param atom_descriptors_path: The path to the file containing the custom atom descriptors.
     :param bond_descriptors_path: The path to the file containing the custom bond descriptors.
     :param constraints_path: The path to the file containing constraints applied to different atomic/bond properties.
+    :param constraints_target_columns: Ordered task columns to load from the
+                                      constraints file when the main data targets
+                                      are intentionally omitted (prediction).
     :param max_data_size: The maximum number of data points to load.
     :param logger: A logger for recording output.
     :param store_row: Whether to store the raw CSV row in each :class:`~chemprop.data.data.MoleculeDatapoint`.
@@ -1138,7 +1203,11 @@ def get_data(path: str,
     if constraints_path is not None:
         constraints_data, raw_constraints_data = get_constraints(
             path=constraints_path,
-            target_columns=target_columns,
+            target_columns=(
+                target_columns
+                if constraints_target_columns is None
+                else constraints_target_columns
+            ),
             save_raw_data=getattr(args, 'save_smiles_splits', False)
         )
         if len(constraints_data) != raw_data_row_count:
@@ -1540,6 +1609,117 @@ def get_inequality_targets(path: str, target_columns: List[str] = None) -> List[
 
     return gt_targets, lt_targets
 
+def _validate_external_indices(
+    raw_indices,
+    data_size: int,
+    label: str,
+) -> List[int]:
+    """Validates one user-supplied index collection without Python wrapping."""
+    if isinstance(raw_indices, (str, bytes, dict, set)):
+        raise ValueError(f'{label} indices must be an ordered sequence of integers.')
+    try:
+        values = list(raw_indices)
+    except TypeError as error:
+        raise ValueError(
+            f'{label} indices must be an ordered sequence of integers.'
+        ) from error
+
+    normalized = []
+    seen = set()
+    for position, value in enumerate(values):
+        if not isinstance(value, Integral) or isinstance(value, (bool, np.bool_)):
+            raise ValueError(
+                f'{label} index at position {position} must be an integer; '
+                f'got {value!r}.'
+            )
+        index = int(value)
+        if index < 0 or index >= data_size:
+            raise ValueError(
+                f'{label} index {index} is outside the valid range '
+                f'[0, {data_size}).'
+            )
+        if index in seen:
+            raise ValueError(f'{label} contains duplicate data index {index}.')
+        seen.add(index)
+        normalized.append(index)
+    return normalized
+
+
+def _validate_external_fold_ids(raw_ids, label: str) -> List[int]:
+    """Validates ordered non-negative identifiers used as pickle filenames."""
+    if isinstance(raw_ids, (str, bytes, dict, set)):
+        raise ValueError(f'{label} fold IDs must be an ordered sequence of integers.')
+    try:
+        values = list(raw_ids)
+    except TypeError as error:
+        raise ValueError(
+            f'{label} fold IDs must be an ordered sequence of integers.'
+        ) from error
+
+    normalized = []
+    seen = set()
+    for position, value in enumerate(values):
+        if not isinstance(value, Integral) or isinstance(value, (bool, np.bool_)):
+            raise ValueError(
+                f'{label} fold ID at position {position} must be an integer; '
+                f'got {value!r}.'
+            )
+        fold_id = int(value)
+        if fold_id < 0:
+            raise ValueError(f'{label} fold ID must be non-negative; got {fold_id}.')
+        if fold_id in seen:
+            raise ValueError(f'{label} contains duplicate fold ID {fold_id}.')
+        seen.add(fold_id)
+        normalized.append(fold_id)
+    return normalized
+
+
+def _validate_external_split_disjointness(
+    split_indices: Sequence[Sequence[int]],
+    labels: Sequence[str] = ('training', 'validation', 'test'),
+    allow_identical_validation_test: bool = False,
+) -> None:
+    """Rejects train/validation/test leakage in externally supplied splits."""
+    split_sets = [set(indices) for indices in split_indices]
+    for first in range(len(split_sets)):
+        for second in range(first + 1, len(split_sets)):
+            overlap = split_sets[first].intersection(split_sets[second])
+            if not overlap:
+                continue
+            validation_test = {first, second} == {1, 2}
+            if (
+                allow_identical_validation_test
+                and validation_test
+                and split_sets[first] == split_sets[second]
+            ):
+                continue
+            preview = sorted(overlap)[:10]
+            raise ValueError(
+                f'External {labels[first]} and {labels[second]} splits overlap '
+                f'at data indices {preview}.'
+            )
+
+
+def _warn_unassigned_external_indices(
+    split_indices: Sequence[Sequence[int]],
+    data_size: int,
+    logger: Logger = None,
+) -> None:
+    """Reports omitted rows while preserving legacy intentional-subset inputs."""
+    assigned = set().union(*(set(indices) for indices in split_indices))
+    omitted = data_size - len(assigned)
+    if omitted <= 0:
+        return
+    message = (
+        f'External split indices omit {omitted} of {data_size} data rows; '
+        'those rows will not be used.'
+    )
+    if logger is not None:
+        logger.warning(message)
+    else:
+        warnings.warn(message, RuntimeWarning)
+
+
 def split_data(data: MoleculeDataset,
                split_type: str = 'random',
                sizes: Tuple[float, float, float] = (0.8, 0.1, 0.1),
@@ -1579,13 +1759,43 @@ def split_data(data: MoleculeDataset,
 
     if split_type == 'crossval':
         index_set = args.crossval_index_sets[args.seed]
-        data_split = []
-        for split in range(3):
+        if not isinstance(index_set, (list, tuple, np.ndarray)) or len(index_set) != 3:
+            raise ValueError(
+                'Cross-validation index sets must contain training, validation, '
+                'and test fold-ID sequences.'
+            )
+        split_labels = ('training', 'validation', 'test')
+        data_split_indices = []
+        for split, label in enumerate(split_labels):
             split_indices = []
-            for index in index_set[split]:
-                with open(os.path.join(args.crossval_index_dir, f'{index}.pkl'), 'rb') as rf:
-                    split_indices.extend(pickle.load(rf))
-            data_split.append([data[i] for i in split_indices])
+            fold_ids = _validate_external_fold_ids(index_set[split], label)
+            for fold_id in fold_ids:
+                with open(os.path.join(args.crossval_index_dir, f'{fold_id}.pkl'), 'rb') as rf:
+                    raw_indices = pickle.load(rf)
+                split_indices.extend(_validate_external_indices(
+                    raw_indices,
+                    len(data),
+                    f'{label} fold {fold_id}',
+                ))
+            # Also catches one data row repeated across two different fold files
+            # assigned to the same split.
+            split_indices = _validate_external_indices(
+                split_indices, len(data), f'combined {label} split',
+            )
+            data_split_indices.append(split_indices)
+        _validate_external_split_disjointness(
+            data_split_indices,
+            allow_identical_validation_test=bool(
+                getattr(args, 'skip_test_evaluation', False)
+            ),
+        )
+        _warn_unassigned_external_indices(
+            data_split_indices, len(data), logger,
+        )
+        data_split = [
+            [data[index] for index in split_indices]
+            for split_indices in data_split_indices
+        ]
         train, val, test = tuple(data_split)
         return MoleculeDataset(train), MoleculeDataset(val), MoleculeDataset(test)
 
@@ -1614,17 +1824,25 @@ def split_data(data: MoleculeDataset,
     elif split_type == 'index_predetermined':
         split_indices = args.crossval_index_sets[args.seed]
 
-        if len(split_indices) != 3:
+        if not isinstance(split_indices, (list, tuple, np.ndarray)) or len(split_indices) != 3:
             raise ValueError('Split indices must have three splits: train, validation, and test')
 
-        data_split = []
-        for split in range(3):
-            data_split.append([data[i] for i in split_indices[split]])
+        labels = ('training', 'validation', 'test')
+        normalized_splits = [
+            _validate_external_indices(indices, len(data), label)
+            for indices, label in zip(split_indices, labels)
+        ]
+        _validate_external_split_disjointness(normalized_splits, labels)
+        _warn_unassigned_external_indices(normalized_splits, len(data), logger)
+        data_split = [
+            [data[index] for index in indices]
+            for indices in normalized_splits
+        ]
         train, val, test = tuple(data_split)
         return MoleculeDataset(train), MoleculeDataset(val), MoleculeDataset(test)
 
     elif split_type == 'predetermined':
-        if not val_fold_index and sizes[2] != 0:
+        if val_fold_index is None and sizes[2] != 0:
             raise ValueError('Test size must be zero since test set is created separately '
                              'and we want to put all other data in train and validation')
 
@@ -1640,9 +1858,37 @@ def split_data(data: MoleculeDataset,
             with open(folds_file, 'rb') as f:
                 all_fold_indices = pickle.load(f, encoding='latin1')  # in case we're loading indices from python2
 
-        log_scaffold_stats(data, all_fold_indices, logger=logger)
+        if not isinstance(all_fold_indices, (list, tuple, np.ndarray)) or len(all_fold_indices) == 0:
+            raise ValueError('folds_file must contain at least one ordered fold.')
+        normalized_folds = [
+            _validate_external_indices(indices, len(data), f'fold {fold_index}')
+            for fold_index, indices in enumerate(all_fold_indices)
+        ]
+        _validate_external_split_disjointness(
+            normalized_folds,
+            labels=tuple(f'fold {index}' for index in range(len(normalized_folds))),
+        )
+        for name, fold_index in (
+            ('test_fold_index', test_fold_index),
+            ('val_fold_index', val_fold_index),
+        ):
+            if fold_index is not None and (
+                not isinstance(fold_index, Integral)
+                or isinstance(fold_index, (bool, np.bool_))
+            ):
+                raise ValueError(f'{name} must be an integer or None.')
+            if fold_index is not None and not 0 <= fold_index < len(normalized_folds):
+                raise ValueError(
+                    f'{name}={fold_index} is outside the valid fold range '
+                    f'[0, {len(normalized_folds)}).'
+                )
+        if val_fold_index is not None and val_fold_index == test_fold_index:
+            raise ValueError('Validation and test fold indices must be different.')
+        _warn_unassigned_external_indices(normalized_folds, len(data), logger)
 
-        folds = [[data[i] for i in fold_indices] for fold_indices in all_fold_indices]
+        log_scaffold_stats(data, normalized_folds, logger=logger)
+
+        folds = [[data[i] for i in fold_indices] for fold_indices in normalized_folds]
 
         test = folds[test_fold_index]
         if val_fold_index is not None:

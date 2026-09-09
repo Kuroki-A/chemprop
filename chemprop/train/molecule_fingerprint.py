@@ -127,6 +127,11 @@ def molecule_fingerprint(args: FingerprintArgs,
     checkpoint_train_args = [load_args(path) for path in args.checkpoint_paths]
     validate_checkpoint_ensemble(checkpoint_train_args)
     train_args = checkpoint_train_args[0]
+    if getattr(train_args, "is_atom_bond_targets", False):
+        raise ValueError(
+            'Latent fingerprint export is not supported for atom/bond target '
+            'models because their MPN output is not a molecule-level tensor.'
+        )
 
     # Update args with training arguments
     # MPN fingerprints are truncated before being returned, but the current v1
@@ -253,9 +258,17 @@ def molecule_fingerprint(args: FingerprintArgs,
     # Set column names
     fingerprint_columns = []
     if args.fingerprint_type == 'MPN':
-        fingerprint_size_per_molecule = total_fp_size // args.number_of_molecules
-        for k in range(args.number_of_molecules):
-            for j in range(fingerprint_size_per_molecule):
+        component_sizes = (
+            [args.hidden_size, args.hidden_size_solvent]
+            if args.reaction_solvent
+            else [total_fp_size // args.number_of_molecules] * args.number_of_molecules
+        )
+        if sum(component_sizes) != total_fp_size:
+            raise ValueError(
+                'MPN fingerprint component widths do not sum to the model output width.'
+            )
+        for k, component_size in enumerate(component_sizes):
+            for j in range(component_size):
                 if len(args.checkpoint_paths) == 1:
                     fingerprint_columns.append(f'fp_{j}_mol_{k}')
                 else:
@@ -270,6 +283,13 @@ def molecule_fingerprint(args: FingerprintArgs,
             for j in range(total_fp_size):
                 for i in range(len(args.checkpoint_paths)):
                     fingerprint_columns.append(f'fp_{j}_model_{i}')
+
+    expected_column_count = total_fp_size * len(args.checkpoint_paths)
+    if len(fingerprint_columns) != expected_column_count:
+        raise ValueError(
+            f'Generated {len(fingerprint_columns)} fingerprint columns for '
+            f'{expected_column_count} values.'
+        )
 
     # Copy predictions over to full_data
     for full_index, datapoint in enumerate(full_data):

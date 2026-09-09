@@ -1,5 +1,6 @@
 from logging import Logger
 import os
+import shutil
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
@@ -18,8 +19,256 @@ from chemprop.constants import MODEL_FILE_NAME
 from chemprop.data import get_class_sizes, get_data, MoleculeDataLoader, MoleculeDataset, set_cache_graph, split_data
 from chemprop.models import MoleculeModel
 from chemprop.nn_utils import param_count, param_count_all
-from chemprop.utils import build_optimizer, build_lr_scheduler, load_checkpoint, makedirs, \
+from chemprop.utils import build_optimizer, build_lr_scheduler, load_checkpoint, \
+    load_args, load_checkpoint_for_training, load_scalers, makedirs, \
     save_checkpoint, save_smiles_splits, load_frzn_model, multitask_mean
+
+
+_TEST_EVALUATION_COMPATIBILITY_FIELDS = (
+    'model_type',
+    'dataset_type',
+    'task_names',
+    'loss_function',
+    'multiclass_num_classes',
+    'number_of_molecules',
+    'reaction',
+    'reaction_solvent',
+    'reaction_mode',
+    'explicit_h',
+    'adding_h',
+    'keeping_atom_map',
+    'features_generator',
+    'features_size',
+    'use_input_features',
+    'atom_descriptors',
+    'atom_descriptors_size',
+    'atom_features_size',
+    'bond_descriptors',
+    'bond_descriptors_size',
+    'bond_features_size',
+    'overwrite_default_atom_features',
+    'overwrite_default_bond_features',
+    'is_atom_bond_targets',
+    'atom_targets',
+    'bond_targets',
+    'atom_constraints',
+    'bond_constraints',
+    'adding_bond_types',
+    'spectra_activation',
+    'spectra_target_floor',
+    'quantile_loss_alpha',
+    'quantiles',
+)
+
+
+def _checkpoint_values_equal(expected: Any, actual: Any) -> bool:
+    """Compares scalar, sequence, mapping, and array checkpoint metadata."""
+    if isinstance(expected, np.ndarray) or isinstance(actual, np.ndarray):
+        try:
+            return np.array_equal(
+                np.asarray(expected), np.asarray(actual), equal_nan=True,
+            )
+        except TypeError:
+            return np.array_equal(np.asarray(expected), np.asarray(actual))
+    return expected == actual
+
+
+def _validate_test_checkpoint_semantics(
+    args: TrainArgs,
+) -> List[TrainArgs]:
+    """Rejects test data/model combinations which would produce bogus scores."""
+    checkpoint_args = [load_args(path) for path in args.checkpoint_paths]
+
+    # Reuse the prediction path's exhaustive model-ensemble contract.  The
+    # import is intentionally lazy to avoid a module initialization cycle.
+    from chemprop.train.make_predictions import (
+        _FFN_ENSEMBLE_COMPATIBILITY_FIELDS,
+        _validate_ensemble_train_args,
+    )
+    _validate_ensemble_train_args(
+        checkpoint_args,
+        _FFN_ENSEMBLE_COMPATIBILITY_FIELDS,
+        'FFN --test',
+    )
+
+    reference = checkpoint_args[0]
+    incompatible = [
+        field
+        for field in _TEST_EVALUATION_COMPATIBILITY_FIELDS
+        if not _checkpoint_values_equal(
+            getattr(reference, field, None), getattr(args, field, None),
+        )
+    ]
+    for metadata_field in (
+        'features_generator_metadata', 'features_source_metadata',
+    ):
+        expected = getattr(reference, metadata_field, None)
+        if expected is not None and not _checkpoint_values_equal(
+            expected, getattr(args, metadata_field, None),
+        ):
+            incompatible.append(metadata_field)
+    if getattr(reference, 'dataset_type', None) == 'spectra':
+        current_phase_mask = load_phase_mask(
+            getattr(args, 'spectra_phase_mask_path', None),
+        )
+        if not _checkpoint_values_equal(
+            getattr(reference, 'spectra_phase_mask', None), current_phase_mask,
+        ):
+            incompatible.append('spectra_phase_mask')
+    if incompatible:
+        raise ValueError(
+            '--test data/feature semantics do not match the supplied checkpoint: '
+            f'{", ".join(incompatible)}. Architecture flags such as hidden size '
+            'need not be repeated, but the dataset, ordered targets, molecular '
+            'inputs, and feature/descriptor configuration must match training.'
+        )
+    return checkpoint_args
+
+
+def _scalers_equal(first: Any, second: Any) -> bool:
+    """Returns whether two loaded checkpoint scalers are semantically equal."""
+    if first is None or second is None:
+        return first is second
+    if type(first) is not type(second):
+        return False
+    for attribute in ('means', 'stds'):
+        try:
+            first_values = np.asarray(getattr(first, attribute), dtype=float)
+            second_values = np.asarray(getattr(second, attribute), dtype=float)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if (
+            first_values.shape != second_values.shape
+            or not np.array_equal(first_values, second_values, equal_nan=True)
+        ):
+            return False
+    for attribute in ('n_atom_targets', 'n_bond_targets'):
+        if getattr(first, attribute, None) != getattr(second, attribute, None):
+            return False
+    return True
+
+
+def _validate_checkpoint_scaler_contract(
+    checkpoint_path: str,
+    checkpoint_args: TrainArgs,
+    scalers: Tuple[Any, ...],
+) -> None:
+    """Validates scaler presence against a checkpoint's saved data semantics.
+
+    ``load_args`` reconstructs old checkpoints through :class:`TrainArgs`, so
+    attributes which predate a checkpoint receive their v1 defaults (for
+    example, feature and descriptor scaling default to enabled).  A missing
+    scaler which those saved semantics require cannot be recovered from
+    evaluation labels without changing the model's inputs or output units.
+    """
+    (
+        target_scaler,
+        features_scaler,
+        atom_descriptor_scaler,
+        bond_descriptor_scaler,
+        atom_bond_target_scaler,
+    ) = scalers
+
+    uses_molecular_features = bool(
+        getattr(checkpoint_args, 'use_input_features', False)
+    )
+    scales_molecular_features = bool(
+        getattr(checkpoint_args, 'features_scaling', True)
+    )
+    atom_descriptor_channel = getattr(
+        checkpoint_args, 'atom_descriptors', None,
+    )
+    bond_descriptor_channel = getattr(
+        checkpoint_args, 'bond_descriptors', None,
+    )
+    scales_atom_descriptors = bool(
+        getattr(checkpoint_args, 'atom_descriptor_scaling', True)
+    )
+    scales_bond_descriptors = bool(
+        getattr(checkpoint_args, 'bond_descriptor_scaling', True)
+    )
+    dataset_type = getattr(checkpoint_args, 'dataset_type', None)
+    is_atom_bond_targets = bool(
+        getattr(checkpoint_args, 'is_atom_bond_targets', False)
+    )
+
+    expected_presence = (
+        dataset_type == 'regression' and not is_atom_bond_targets,
+        uses_molecular_features and scales_molecular_features,
+        atom_descriptor_channel is not None and scales_atom_descriptors,
+        bond_descriptor_channel is not None and scales_bond_descriptors,
+        dataset_type == 'regression' and is_atom_bond_targets,
+    )
+    scaler_names = (
+        'target', 'molecular feature', 'atom descriptor', 'bond descriptor',
+        'atom/bond target',
+    )
+    for scaler_name, scaler, expected in zip(
+        scaler_names, scalers, expected_presence,
+    ):
+        present = scaler is not None
+        if present == expected:
+            continue
+        state = 'missing' if expected else 'unexpectedly present'
+        raise ValueError(
+            f'--test checkpoint {checkpoint_path!r} has a {scaler_name} '
+            f'scaler which is {state} for its saved dataset, feature, and '
+            'descriptor configuration. The checkpoint cannot reproduce its '
+            'training-time preprocessing safely.'
+        )
+
+
+def _load_test_checkpoint_scalers(
+    checkpoint_paths: List[str],
+    checkpoint_args: List[TrainArgs],
+) -> Tuple[Any, ...]:
+    """Loads one compatible scaler set for label-independent ``--test`` runs."""
+    scaler_names = (
+        'target', 'molecular feature', 'atom descriptor', 'bond descriptor',
+        'atom/bond target',
+    )
+    reference = load_scalers(checkpoint_paths[0])
+    _validate_checkpoint_scaler_contract(
+        checkpoint_paths[0], checkpoint_args[0], reference,
+    )
+    for checkpoint_path, member_args in zip(
+        checkpoint_paths[1:], checkpoint_args[1:],
+    ):
+        candidate = load_scalers(checkpoint_path)
+        _validate_checkpoint_scaler_contract(
+            checkpoint_path, member_args, candidate,
+        )
+        for scaler_name, first, second in zip(
+            scaler_names, reference, candidate,
+        ):
+            if not _scalers_equal(first, second):
+                raise ValueError(
+                    '--test checkpoint scalers do not match across the ensemble: '
+                    f'{scaler_name} scaler differs in {checkpoint_path!r}.'
+                )
+    return reference
+
+
+def _apply_checkpoint_feature_scaler(
+    datasets: List[Tuple[str, MoleculeDataset]],
+    scaler: Any,
+    label: str,
+    **normalization_kwargs,
+) -> None:
+    """Applies a saved feature scaler and rejects missing required inputs."""
+    if scaler is None:
+        return
+    for dataset_name, dataset in datasets:
+        if len(dataset) == 0:
+            continue
+        applied_scaler = dataset.normalize_features(
+            scaler, **normalization_kwargs,
+        )
+        if applied_scaler is None:
+            raise ValueError(
+                f'--test checkpoint requires {label}, but the {dataset_name} '
+                'dataset did not provide them.'
+            )
 
 
 def _first_feature_schema_difference(expected: Any,
@@ -87,13 +336,20 @@ def validate_features_source_metadata(reference_data: MoleculeDataset,
 
 def _validate_training_split(args: TrainArgs,
                              train_data: MoleculeDataset,
-    val_data: MoleculeDataset) -> None:
-    """Rejects splits which would leave random, untrained prediction heads."""
+                             val_data: MoleculeDataset,
+                             require_training_labels: bool = True) -> None:
+    """Rejects unusable validation or training splits.
+
+    Evaluation-only ``--test`` runs do not optimize a model and therefore do
+    not depend on the size or labels of the otherwise unused training split.
+    """
     if len(val_data) == 0:
         raise ValueError(
             'The validation data split is empty. Chemprop FFN training '
             'requires validation data for model selection and early stopping.'
         )
+    if not require_training_labels:
+        return
     if len(train_data) == 0:
         raise ValueError(
             'The training data split is empty. Increase the data set size, '
@@ -188,6 +444,11 @@ def run_training(args: TrainArgs,
     else:
         debug = info = print
 
+    test_mode = bool(getattr(args, 'test', False))
+    checkpoint_args = (
+        _validate_test_checkpoint_semantics(args) if test_mode else None
+    )
+
     # Hyperparameter optimization must select configurations exclusively on
     # validation scores. A separate held-out file is not even loaded in this
     # mode; an in-memory split is constructed only long enough to preserve the
@@ -260,9 +521,14 @@ def run_training(args: TrainArgs,
     if skip_test_evaluation:
         test_data = MoleculeDataset([])
 
-    _validate_training_split(args, train_data, val_data)
+    _validate_training_split(
+        args,
+        train_data,
+        val_data,
+        require_training_labels=not test_mode,
+    )
 
-    if args.dataset_type == 'classification':
+    if args.dataset_type == 'classification' and not test_mode:
         class_sizes = get_class_sizes(train_data)
         debug('Training class sizes')
         for i, task_class_sizes in enumerate(class_sizes):
@@ -286,7 +552,23 @@ def run_training(args: TrainArgs,
             logger=logger,
         )
 
-    if args.features_scaling:
+    checkpoint_scalers = (
+        _load_test_checkpoint_scalers(args.checkpoint_paths, checkpoint_args)
+        if test_mode
+        else None
+    )
+    datasets_to_scale = [('training', train_data), ('validation', val_data)]
+    if not skip_test_evaluation:
+        datasets_to_scale.append(('test', test_data))
+
+    if test_mode:
+        features_scaler = checkpoint_scalers[1]
+        _apply_checkpoint_feature_scaler(
+            datasets_to_scale,
+            features_scaler,
+            'molecular features',
+        )
+    elif args.features_scaling:
         features_scaler = train_data.normalize_features(replace_nan_token=0)
         val_data.normalize_features(features_scaler)
         if not skip_test_evaluation:
@@ -294,7 +576,15 @@ def run_training(args: TrainArgs,
     else:
         features_scaler = None
 
-    if args.atom_descriptor_scaling and args.atom_descriptors is not None:
+    if test_mode:
+        atom_descriptor_scaler = checkpoint_scalers[2]
+        _apply_checkpoint_feature_scaler(
+            datasets_to_scale,
+            atom_descriptor_scaler,
+            'atom descriptors/features',
+            scale_atom_descriptors=True,
+        )
+    elif args.atom_descriptor_scaling and args.atom_descriptors is not None:
         atom_descriptor_scaler = train_data.normalize_features(replace_nan_token=0, scale_atom_descriptors=True)
         val_data.normalize_features(atom_descriptor_scaler, scale_atom_descriptors=True)
         if not skip_test_evaluation:
@@ -302,7 +592,15 @@ def run_training(args: TrainArgs,
     else:
         atom_descriptor_scaler = None
 
-    if args.bond_descriptor_scaling and args.bond_descriptors is not None:
+    if test_mode:
+        bond_descriptor_scaler = checkpoint_scalers[3]
+        _apply_checkpoint_feature_scaler(
+            datasets_to_scale,
+            bond_descriptor_scaler,
+            'bond descriptors/features',
+            scale_bond_descriptors=True,
+        )
+    elif args.bond_descriptor_scaling and args.bond_descriptors is not None:
         bond_descriptor_scaler = train_data.normalize_features(replace_nan_token=0, scale_bond_descriptors=True)
         val_data.normalize_features(bond_descriptor_scaler, scale_bond_descriptors=True)
         if not skip_test_evaluation:
@@ -329,13 +627,29 @@ def run_training(args: TrainArgs,
 
     # Initialize scaler and scale training targets by subtracting mean and dividing standard deviation (regression only)
     if args.dataset_type == 'regression':
-        debug('Fitting scaler')
-        if args.is_atom_bond_targets:
-            scaler = None
-            atom_bond_scaler = train_data.normalize_atom_bond_targets()
+        if test_mode:
+            debug('Using target scaler stored in the supplied checkpoint')
+            scaler = checkpoint_scalers[0]
+            atom_bond_scaler = checkpoint_scalers[4]
+            if args.is_atom_bond_targets:
+                if scaler is not None or atom_bond_scaler is None:
+                    raise ValueError(
+                        '--test checkpoint target scaler is incompatible with '
+                        'atom/bond regression mode.'
+                    )
+            elif scaler is None or atom_bond_scaler is not None:
+                raise ValueError(
+                    '--test checkpoint target scaler is incompatible with '
+                    'molecule-level regression mode.'
+                )
         else:
-            scaler = train_data.normalize_targets()
-            atom_bond_scaler = None
+            debug('Fitting scaler')
+            if args.is_atom_bond_targets:
+                scaler = None
+                atom_bond_scaler = train_data.normalize_atom_bond_targets()
+            else:
+                scaler = train_data.normalize_targets()
+                atom_bond_scaler = None
         args.spectra_phase_mask = None
     elif args.dataset_type == 'spectra':
         debug('Normalizing spectra and excluding spectra regions based on phase')
@@ -408,12 +722,13 @@ def run_training(args: TrainArgs,
         num_workers = args.num_workers
 
     # Create data loaders
+    training_class_balance = bool(args.class_balance and not test_mode)
     train_data_loader = MoleculeDataLoader(
         dataset=train_data,
         batch_size=args.batch_size,
         num_workers=num_workers,
-        class_balance=args.class_balance,
-        shuffle=True,
+        class_balance=training_class_balance,
+        shuffle=not test_mode,
         seed=args.seed
     )
     val_data_loader = MoleculeDataLoader(
@@ -429,7 +744,7 @@ def run_training(args: TrainArgs,
             num_workers=num_workers
         )
 
-    if args.class_balance:
+    if training_class_balance:
         debug(f'With class_balance, effective train size = {train_data_loader.iter_size:,}')
 
     # Train ensemble of models
@@ -447,7 +762,25 @@ def run_training(args: TrainArgs,
         # Load/build model
         if args.checkpoint_paths is not None:
             debug(f'Loading model {model_idx} from {args.checkpoint_paths[model_idx]}')
-            model = load_checkpoint(args.checkpoint_paths[model_idx], logger=logger)
+            if test_mode:
+                # Test-only runs must reconstruct the architecture stored in
+                # the checkpoint.  CLI architecture defaults (for example
+                # hidden_size=300) are intentionally not required to repeat
+                # the training configuration.
+                model = load_checkpoint(
+                    args.checkpoint_paths[model_idx],
+                    device=args.device,
+                    logger=logger,
+                )
+            else:
+                # Continued training is a warm start into the *current*
+                # architecture, which may have a different task/readout shape.
+                model = load_checkpoint_for_training(
+                    args.checkpoint_paths[model_idx],
+                    current_args=args,
+                    device=args.device,
+                    logger=logger,
+                )
         else:
             debug(f'Building model {model_idx}')
             model = MoleculeModel(args)
@@ -469,10 +802,23 @@ def run_training(args: TrainArgs,
             debug('Moving model to cuda')
         model = model.to(args.device)
 
-        # Ensure that model is saved in correct location for evaluation if 0 epochs
-        save_checkpoint(os.path.join(save_dir, MODEL_FILE_NAME), model, scaler,
-                        features_scaler, atom_descriptor_scaler, bond_descriptor_scaler,
-                        atom_bond_scaler, args)
+        # Ensure that a checkpoint exists in the result directory even for a
+        # zero-epoch run.  In --test mode the supplied checkpoint must be
+        # preserved byte-for-byte: serializing its model with current CLI
+        # defaults would attach incompatible architecture metadata.
+        model_checkpoint_path = os.path.join(save_dir, MODEL_FILE_NAME)
+        if test_mode:
+            source_checkpoint_path = args.checkpoint_paths[model_idx]
+            same_checkpoint = (
+                os.path.exists(model_checkpoint_path)
+                and os.path.samefile(source_checkpoint_path, model_checkpoint_path)
+            )
+            if not same_checkpoint:
+                shutil.copy2(source_checkpoint_path, model_checkpoint_path)
+        else:
+            save_checkpoint(model_checkpoint_path, model, scaler,
+                            features_scaler, atom_descriptor_scaler, bond_descriptor_scaler,
+                            atom_bond_scaler, args)
 
         # Optimizers
         optimizer = build_optimizer(model, args)
@@ -558,12 +904,15 @@ def run_training(args: TrainArgs,
         # checkpoint. Accumulating validation predictions here makes the
         # returned validation payload independent of ensemble size and gives
         # extra metrics the same semantics as test metrics.
-        info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f} on epoch {best_epoch}')
-        model = load_checkpoint(
-            os.path.join(save_dir, MODEL_FILE_NAME),
-            device=args.device,
-            logger=logger,
-        )
+        if test_mode:
+            info(f'Model {model_idx}: skipped optimization and retained the supplied checkpoint.')
+        else:
+            info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f} on epoch {best_epoch}')
+            model = load_checkpoint(
+                model_checkpoint_path,
+                device=args.device,
+                logger=logger,
+            )
         val_preds = predict(
             model=model,
             data_loader=val_data_loader,
