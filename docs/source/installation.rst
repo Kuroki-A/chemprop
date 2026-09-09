@@ -17,7 +17,8 @@ the maintenance fixes and feature generators documented here.
 Conda
 -----
 
-Both options require conda, so first install Miniconda from `<https://conda.io/miniconda.html>`_.
+The source-install workflow uses conda, so first install Miniconda from
+`<https://conda.io/miniconda.html>`_. Docker does not require conda on the host.
 
 The committed environment targets Python 3.10 and installs the official
 PyTorch 2.6.0 CUDA 12.4 wheel. A CUDA 12.5-capable NVIDIA driver is backward
@@ -34,8 +35,26 @@ Installing from source
 6. :code:`python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"`
 
 The expected GPU check is :code:`2.6.0+cu124`, :code:`12.4`, and
-:code:`True`. The editable Chemprop installation is already performed by the
-environment file.
+:code:`True`. Run it on a GPU compute node; a login node without an allocated
+GPU correctly reports :code:`False`. The editable Chemprop installation is
+already performed by the environment file. It pins Setuptools 84.x and Wheel
+0.48.x to match the isolated build requirements.
+
+Updating an existing environment
+--------------------------------
+
+A clean recreation is preferred after pulling a release. If an in-place update
+is necessary, run:
+
+.. code-block:: bash
+
+   conda env update -n chemprop310-cu124 -f environment.yml --prune
+   conda activate chemprop310-cu124
+   python -c "import setuptools, wheel; print(setuptools.__version__, wheel.__version__)"
+   python -m pip check
+
+Use a separate environment for CPU-only testing. Do not replace the cu124
+wheel inside the production GPU environment.
 
 Docker
 ------

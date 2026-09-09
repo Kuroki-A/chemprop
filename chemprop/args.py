@@ -468,7 +468,7 @@ class TrainArgs(CommonArgs):
     save_smiles_splits: bool = False
     """Save smiles for each train/val/test splits for prediction convenience later."""
     test: bool = False
-    """Whether to skip training and only test the model."""
+    """Whether to skip optimization and evaluate supplied checkpoints on the configured validation/test splits."""
     quiet: bool = False
     """Skip non-essential print statements."""
     log_frequency: int = 10
@@ -975,6 +975,12 @@ class TrainArgs(CommonArgs):
                 '--test skips optimization and therefore requires an existing '
                 '--checkpoint_path, --checkpoint_paths, or --checkpoint_dir.'
             )
+        if self.test and self.checkpoint_frzn is not None:
+            raise ValueError(
+                '--test evaluates the supplied checkpoint exactly and cannot be '
+                'combined with --checkpoint_frzn. Remove the frozen-transfer '
+                'options or run a normal training job.'
+            )
 
         # Adapt the number of molecules for reaction_solvent mode
         if self.reaction_solvent is True and self.number_of_molecules != 2:
@@ -1022,6 +1028,46 @@ class TrainArgs(CommonArgs):
         # Validate reaction/reaction_solvent mode
         if self.reaction is True and self.reaction_solvent is True:
             raise ValueError('Only reaction or reaction_solvent mode can be used, not both.')
+        if self.split_type == 'molecular_weight' and (
+            self.reaction or self.reaction_solvent
+        ):
+            raise ValueError(
+                'molecular_weight splitting is undefined for reaction inputs. '
+                'Choose an explicit reaction-aware split instead.'
+            )
+
+        if self.frzn_ffn_layers > 0 and self.checkpoint_frzn is None:
+            raise ValueError('frzn_ffn_layers requires --checkpoint_frzn.')
+        if self.freeze_first_only and self.checkpoint_frzn is None:
+            raise ValueError('freeze_first_only requires --checkpoint_frzn.')
+        if self.frzn_ffn_layers >= self.ffn_num_layers:
+            raise ValueError(
+                'frzn_ffn_layers must be smaller than ffn_num_layers so the '
+                'task output layer remains trainable.'
+            )
+        if (
+            self.activation == 'PReLU'
+            and 0 < self.frzn_ffn_layers < self.ffn_num_layers - 1
+        ):
+            raise ValueError(
+                'Partial hidden-layer freezing is undefined with PReLU because '
+                'Chemprop v1 shares one trainable slope across all hidden FFN '
+                'activations. Freeze all hidden FFN layers or use another activation.'
+            )
+        if self.checkpoint_frzn is not None and self.features_only:
+            raise ValueError(
+                'checkpoint_frzn cannot freeze an MPN when --features_only is used.'
+            )
+        if (
+            self.freeze_first_only
+            and self.mpn_shared
+            and self.number_of_molecules > 1
+            and not self.reaction_solvent
+        ):
+            raise ValueError(
+                'freeze_first_only is incompatible with --mpn_shared because '
+                'all molecule encoders reference the same parameters.'
+            )
 
         # Create temporary directory as save directory if not provided
         if self.save_dir is None:
@@ -1265,6 +1311,19 @@ class TrainArgs(CommonArgs):
                 )
             if self.is_atom_bond_targets:
                 raise NotImplementedError('LightGBM does not support atom/bond target mode.')
+            if (self.reaction or self.reaction_solvent) and self.features_generator:
+                raise NotImplementedError(
+                    'LightGBM molecular feature generators are not reaction-aware: '
+                    'they encode only the reactant and would ignore product changes. '
+                    'For reaction data, provide an explicitly reaction-aware '
+                    '--features_path together with --features_only.'
+                )
+            if self.atom_descriptors is not None or self.bond_descriptors is not None:
+                raise NotImplementedError(
+                    'LightGBM features-only encoding does not consume atom or bond '
+                    'descriptors/features. Convert them to molecule-level features '
+                    'and provide them with --features_path instead.'
+                )
             supported_primary_metrics = {
                 'classification': {'auc', 'prc-auc', 'binary_cross_entropy'},
                 'regression': {'rmse', 'mae', 'mse'},
@@ -1418,6 +1477,8 @@ class PredictArgs(CommonArgs):
     """Path to the extra atom descriptors."""
     calibration_bond_descriptors_path: str = None
     """Path to the extra bond descriptors that will be used as bond features to featurize a given molecule."""
+    calibration_constraints_path: str = None
+    """Path to atom/bond constraints aligned with the uncertainty calibration dataset."""
 
     @property
     def ensemble_size(self) -> int:
@@ -1436,16 +1497,34 @@ class PredictArgs(CommonArgs):
             self.calibration_phase_features_path,
             self.calibration_atom_descriptors_path,
             self.calibration_bond_descriptors_path,
+            self.calibration_constraints_path,
         )
         if self.calibration_path is None and any(
             path is not None for path in calibration_auxiliary_paths
         ):
             raise ValueError(
-                'Calibration feature/descriptor paths require --calibration_path.'
+                'Calibration feature/descriptor/constraint paths require '
+                '--calibration_path.'
+            )
+        if self.calibration_path is not None and (
+            (self.constraints_path is None)
+            != (self.calibration_constraints_path is None)
+        ):
+            raise ValueError(
+                '--constraints_path and --calibration_constraints_path must '
+                'either both be provided for calibration or both be omitted.'
             )
         if self.evaluation_scores_path is not None and self.evaluation_methods is None:
             raise ValueError(
                 '--evaluation_scores_path requires --evaluation_methods.'
+            )
+        if self.model_type == 'lgbm' and (
+            self.evaluation_methods is not None
+            or self.evaluation_scores_path is not None
+        ):
+            raise NotImplementedError(
+                'LightGBM prediction does not support uncertainty evaluation '
+                'options --evaluation_methods or --evaluation_scores_path.'
             )
         if (
             self.individual_ensemble_predictions
@@ -1519,7 +1598,8 @@ class PredictArgs(CommonArgs):
             ('`--features_path`', self.features_path, self.calibration_features_path),
             ('`--phase_features_path`', self.phase_features_path, self.calibration_phase_features_path),
             ('`--atom_descriptors_path`', self.atom_descriptors_path, self.calibration_atom_descriptors_path),
-            ('`--bond_descriptors_path`', self.bond_descriptors_path, self.calibration_bond_descriptors_path)
+            ('`--bond_descriptors_path`', self.bond_descriptors_path, self.calibration_bond_descriptors_path),
+            ('`--constraints_path`', self.constraints_path, self.calibration_constraints_path),
         ]:
             if (
                 base_features_path is not None

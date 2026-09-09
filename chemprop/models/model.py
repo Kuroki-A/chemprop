@@ -83,14 +83,6 @@ class MoleculeModel(nn.Module):
         """
         self.encoder = MPN(args)
 
-        if args.checkpoint_frzn is not None:
-            if args.freeze_first_only:  # Freeze only the first encoder
-                for param in list(self.encoder.encoder.children())[0].parameters():
-                    param.requires_grad = False
-            else:  # Freeze all encoders
-                for param in self.encoder.parameters():
-                    param.requires_grad = False
-
     def create_ffn(self, args: TrainArgs) -> None:
         """
         Creates the feed-forward layers for the model.
@@ -148,35 +140,10 @@ class MoleculeModel(nn.Module):
                 spectra_activation=args.spectra_activation,
             )
 
-        if args.checkpoint_frzn is not None:
-            if args.frzn_ffn_layers > 0:
-                if self.is_atom_bond_targets:
-                    if args.shared_atom_bond_ffn:
-                        for param in list(self.readout.atom_ffn_base.parameters())[
-                            0 : 2 * args.frzn_ffn_layers
-                        ]:
-                            param.requires_grad = False
-                        for param in list(self.readout.bond_ffn_base.parameters())[
-                            0 : 2 * args.frzn_ffn_layers
-                        ]:
-                            param.requires_grad = False
-                    else:
-                        for ffn in self.readout.ffn_list:
-                            if ffn.constraint:
-                                for param in list(ffn.ffn.parameters())[
-                                    0 : 2 * args.frzn_ffn_layers
-                                ]:
-                                    param.requires_grad = False
-                            else:
-                                for param in list(ffn.ffn_readout.parameters())[
-                                    0 : 2 * args.frzn_ffn_layers
-                                ]:
-                                    param.requires_grad = False
-                else:
-                    for param in list(self.readout.parameters())[
-                        0 : 2 * args.frzn_ffn_layers
-                    ]:  # Freeze weights and bias for given number of layers
-                        param.requires_grad = False
+        # Frozen checkpoint values and ``requires_grad`` flags are applied
+        # together by ``load_frzn_model``.  Freezing here would leave random
+        # parameters immobile if loading later fails or a warm-start model was
+        # constructed from different saved arguments.
 
     def _positive_uncertainty_parameter(self, values: torch.Tensor) -> torch.Tensor:
         """Maps logits to values safely separated from zero.
@@ -227,18 +194,30 @@ class MoleculeModel(nn.Module):
                 atom_features_batch,
                 bond_descriptors_batch,
                 bond_features_batch,
+                allow_shared_single_molecule=True,
             )
         elif fingerprint_type == "last_FFN":
-            return self.readout[:-1](
-                self.encoder(
-                    batch,
-                    features_batch,
-                    atom_descriptors_batch,
-                    atom_features_batch,
-                    bond_descriptors_batch,
-                    bond_features_batch,
+            if not isinstance(self.readout, nn.Sequential):
+                raise ValueError(
+                    "last_FFN fingerprints are not supported for atom/bond readouts."
                 )
+            output_linear_indices = [
+                index
+                for index, layer in enumerate(self.readout)
+                if isinstance(layer, nn.Linear)
+            ]
+            if not output_linear_indices:
+                raise ValueError("The model readout contains no output Linear layer.")
+            output_linear_index = output_linear_indices[-1]
+            encodings = self.encoder(
+                batch,
+                features_batch,
+                atom_descriptors_batch,
+                atom_features_batch,
+                bond_descriptors_batch,
+                bond_features_batch,
             )
+            return self.readout[:output_linear_index](encodings)
         else:
             raise ValueError(f"Unsupported fingerprint type {fingerprint_type}.")
 
@@ -437,14 +416,6 @@ class MoleculeModelEncoder(nn.Module):
         """
         self.encoder = MPN(args)
 
-        if args.checkpoint_frzn is not None:
-            if args.freeze_first_only:  # Freeze only the first encoder
-                for param in list(self.encoder.encoder.children())[0].parameters():
-                    param.requires_grad = False
-            else:  # Freeze all encoders
-                for param in self.encoder.parameters():
-                    param.requires_grad = False
-
     def create_ffn(self, args: TrainArgs) -> None:
         """
         Creates the feed-forward layers for the model.
@@ -502,35 +473,8 @@ class MoleculeModelEncoder(nn.Module):
                 spectra_activation=args.spectra_activation,
             )
 
-        if args.checkpoint_frzn is not None:
-            if args.frzn_ffn_layers > 0:
-                if self.is_atom_bond_targets:
-                    if args.shared_atom_bond_ffn:
-                        for param in list(self.readout.atom_ffn_base.parameters())[
-                            0 : 2 * args.frzn_ffn_layers
-                        ]:
-                            param.requires_grad = False
-                        for param in list(self.readout.bond_ffn_base.parameters())[
-                            0 : 2 * args.frzn_ffn_layers
-                        ]:
-                            param.requires_grad = False
-                    else:
-                        for ffn in self.readout.ffn_list:
-                            if ffn.constraint:
-                                for param in list(ffn.ffn.parameters())[
-                                    0 : 2 * args.frzn_ffn_layers
-                                ]:
-                                    param.requires_grad = False
-                            else:
-                                for param in list(ffn.ffn_readout.parameters())[
-                                    0 : 2 * args.frzn_ffn_layers
-                                ]:
-                                    param.requires_grad = False
-                else:
-                    for param in list(self.readout.parameters())[
-                        0 : 2 * args.frzn_ffn_layers
-                    ]:  # Freeze weights and bias for given number of layers
-                        param.requires_grad = False
+        # ``load_frzn_model`` applies frozen values and gradient flags only
+        # after it has validated the complete checkpoint mapping.
 
     def fingerprint(
         self,
@@ -571,18 +515,30 @@ class MoleculeModelEncoder(nn.Module):
                 atom_features_batch,
                 bond_descriptors_batch,
                 bond_features_batch,
+                allow_shared_single_molecule=True,
             )
         elif fingerprint_type == "last_FFN":
-            return self.readout[:-1](
-                self.encoder(
-                    batch,
-                    features_batch,
-                    atom_descriptors_batch,
-                    atom_features_batch,
-                    bond_descriptors_batch,
-                    bond_features_batch,
+            if not isinstance(self.readout, nn.Sequential):
+                raise ValueError(
+                    "last_FFN fingerprints are not supported for atom/bond readouts."
                 )
+            output_linear_indices = [
+                index
+                for index, layer in enumerate(self.readout)
+                if isinstance(layer, nn.Linear)
+            ]
+            if not output_linear_indices:
+                raise ValueError("The model readout contains no output Linear layer.")
+            output_linear_index = output_linear_indices[-1]
+            encodings = self.encoder(
+                batch,
+                features_batch,
+                atom_descriptors_batch,
+                atom_features_batch,
+                bond_descriptors_batch,
+                bond_features_batch,
             )
+            return self.readout[:output_linear_index](encodings)
         else:
             raise ValueError(f"Unsupported fingerprint type {fingerprint_type}.")
 

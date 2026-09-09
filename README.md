@@ -9,7 +9,7 @@
 Chemprop is a repository containing message passing neural networks for molecular property prediction.
 
 > [!IMPORTANT]
-> This repository is the Kuroki-maintained Chemprop v1 line (`1.7.1+kuroki.2`).
+> This repository is the Kuroki-maintained Chemprop v1 line (`1.7.1+kuroki.3`).
 > It intentionally retains the v1 command line and checkpoint interfaces while
 > carrying local correctness, LightGBM, security, dependency, and feature-generation
 > fixes. Install this fork from source; the `chemprop` package on PyPI is the
@@ -108,7 +108,9 @@ Install this maintained v1 build directly from this repository. The package name
 `chemprop` on PyPI is the upstream project and does not contain the fixes and
 feature generators documented here.
 
-Both options require conda, so first install Miniconda from [https://conda.io/miniconda.html](https://conda.io/miniconda.html).
+The source-install workflow uses conda, so first install Miniconda from
+[https://conda.io/miniconda.html](https://conda.io/miniconda.html). The Docker
+workflow below does not require conda on the host.
 
 If installing the environment with conda seems to be taking too long, you can
 also try running `conda install -c conda-forge mamba` and then replacing
@@ -129,10 +131,26 @@ wheel is published; newer PyTorch releases use newer CUDA wheel series.
  #### Check whether `torch` can recognize the GPU
 6. `python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"`
 
-The expected values are `2.6.0+cu124`, `12.4`, and `True`. The environment
-already installs this checkout in editable mode. For a CPU-only CI or
-workstation, install `torch==2.6.0` from
-`https://download.pytorch.org/whl/cpu` before `pip install -e .`.
+The expected values are `2.6.0+cu124`, `12.4`, and `True`; run this check on a
+GPU compute node, since a login node without an allocated GPU correctly reports
+`False`. The environment already installs this checkout in editable mode.
+It also pins `setuptools` 84.x and `wheel` 0.48.x so the checked-in build
+requirements can be satisfied without downloading different tooling.
+
+To update an existing environment after pulling a new release, prefer a clean
+recreation. If that is impractical, update and verify it explicitly:
+
+```bash
+conda env update -n chemprop310-cu124 -f environment.yml --prune
+conda activate chemprop310-cu124
+python -c "import setuptools, wheel; print(setuptools.__version__, wheel.__version__)"
+python -m pip check
+```
+
+For a CPU-only CI or workstation, create a separate environment and install
+`torch==2.6.0` from `https://download.pytorch.org/whl/cpu` before
+`pip install -e .`; do not replace the cu124 wheel inside the production GPU
+environment.
 
 ### Docker
 
@@ -194,17 +212,20 @@ exactly one Gunicorn worker and one thread.
 
 ### Gunicorn
 
-Gunicorn is only available for a UNIX environment, meaning it will not work on Windows. It is not installed by default with the rest of Chemprop, so first run:
+Gunicorn is only available for a UNIX environment, meaning it will not work on Windows. It is included in `environment.yml`; package-only installs can add the Web extra with:
 
 ```
-pip install gunicorn
+python -m pip install -e ".[web]"
 ```
 
-For local use, bind explicitly to loopback with
+The default mutable state root is `~/.chemprop-web` (or the value of
+`CHEMPROP_WEB_ROOT`), outside the checkout. If upgrading from an older checkout
+which stored Web state below `chemprop/web`, copy any trusted data/checkpoints
+to a private root and pass it explicitly. For local use, bind explicitly to loopback with
 `gunicorn --workers 1 --threads 1 --bind 127.0.0.1:5000 'chemprop.web.wsgi:build_app()'`.
 For an HTTPS reverse proxy, first create a private state directory, for example
-`install -d -m 700 "$HOME/.local/share/chemprop-web"`, then use
-`"chemprop.web.wsgi:build_app(allow_remote=True, root_folder='$HOME/.local/share/chemprop-web')"`
+`install -d -m 700 "$HOME/.chemprop-web"`, then use
+`"chemprop.web.wsgi:build_app(allow_remote=True, root_folder='$HOME/.chemprop-web')"`
 with the two security environment variables above and the same one-worker,
 one-thread options. Never publish the local/default-mode socket through a
 reverse proxy because the proxy itself appears as a loopback client.
@@ -214,8 +235,12 @@ reverse proxy because the proxy itself appears as a loopback client.
 
 ## Within Python
 
-For information on the use of Chemprop within a python script, refer to the [Within a python script](https://chemprop.readthedocs.io/en/latest/tutorial.html#within-a-python-script)
-section of the documentation. A [Google Colab notebook](https://colab.research.google.com/github/chemprop/chemprop/blob/master/colab_demo.ipynb) is also available with several examples. Note that this notebook is intended to be run in Google Colab rather than as a Jupyter notebook on your local machine. A similar notebook of examples is available as a [nanoHUB tool](https://nanohub.org/resources/chempropdemo/).
+For information on using Chemprop within Python, build this fork's local HTML
+documentation and see the "Within a Python script" section of its tutorial.
+The upstream Google Colab notebook predates this maintained environment and
+installs the upstream PyPI package; treat it as historical v1 API background,
+not as an installation recipe for this fork. A similar historical example is
+available as a [nanoHUB tool](https://nanohub.org/resources/chempropdemo/).
 
 
 ## Data
@@ -299,6 +324,11 @@ classification. Checkpoint warm-starting and `chemprop_hyperopt` are rejected
 explicitly for this backend; tune it with the `--lgbm_*` options instead.
 `--target_weights` is also rejected because each target is fit by an
 independent booster; row-wise `--data_weights_path` remains supported.
+Reaction inputs combined with a molecular generator and atom/bond descriptor
+inputs are rejected because the features-only representation would omit those
+chemically relevant inputs; use explicit reaction-aware molecule-level
+features instead. Uncertainty methods, calibration, and uncertainty evaluation
+are not implemented for LightGBM.
 
 ### Train/Validation/Test Splits
 
@@ -312,7 +342,20 @@ Our code supports several methods of splitting data into train, validation, and 
 
 When data contains multiple molecules per datapoint, scaffold and repeated SMILES splitting will only constrain splitting based on one of the molecules. The key molecule can be chosen with the argument `--split_key_molecule <int>`, with the default setting using an index of 0 indicating the first molecule.
 
+Externally supplied fold/index files are checked for integer type, bounds,
+duplicates, and overlap between train, validation, and test. Rows omitted by
+an external split are reported explicitly.
+
 By default, both random and scaffold split the data into 80% train, 10% validation, and 10% test. This can be changed with `--split_sizes <train_frac> <val_frac> <test_frac>`. The default setting is `--split_sizes 0.8 0.1 0.1`. If a separate validation set or test set is provided, the split defaults to 80%-20%. Splitting involves a random component and can be seeded with `--seed <seed>`. The default setting is `--seed 0`. The split size argument is not used with split types `cv` or `cv-no-test`.
+
+To re-evaluate existing FFN checkpoints without optimization, use `--test`
+together with a checkpoint source. This reconstructs the saved architecture
+and applies the checkpoint's target and input scalers; evaluation labels are
+never used to fit scalers. It still reports the configured validation and test
+splits. Architecture flags need not be repeated, but dataset type, ordered
+targets, molecule/reaction semantics, features/descriptors, and spectra
+settings must match. Ensemble scaler state must agree, and
+`--checkpoint_frzn` cannot be combined with `--test`.
 
 ### Loss functions
 
@@ -413,11 +456,34 @@ python scripts/save_features.py --data_path data.csv \
   --features_generator rdkit_2d_normalized --save_path features.npz
 ```
 
-The script uses native batches or bounded multiprocessing, persists bounded
-chunks for restart, and consolidates them through a disk-backed array rather
-than retaining the full feature matrix as Python objects. It writes a sidecar
-manifest containing the ordered input hash, generator configuration, feature
-schema, dependency versions, and resumable progress.
+Runtime `morgan`, `morgan_count`, `rdkit`, and `atompair` fingerprints use
+RDKit's native batch API with at most four affinity-visible threads. For the
+offline script, SMILES parsing is faster in the bounded process pool, so these
+four generators use that pool by default; `--sequential` forces scalar calls,
+while `--num_workers 1` or an explicit `--batch_size` selects the one-process
+native-batch path. Other generators retain their documented native-batch or
+process-pool behavior (including explicit MAP4 `--num_workers`).
+
+The script persists bounded chunks for restart and consolidates them through a
+disk-backed array rather than retaining the full feature matrix as Python
+objects. It writes a sidecar manifest containing the ordered input hash,
+generator configuration, feature schema, dependency versions, and resumable
+progress.
+
+Runtime and offline generation canonicalize structural inputs and remove atom
+map labels from a private copy, so equivalent string and RDKit-molecule inputs
+have the same molecular features. Offline reaction rows follow runtime policy
+and use the reactant; hydrogen-only rows use a correctly typed zero vector.
+
+Metadata schema 2 gives every maintained built-in generator a targeted
+`semantic_revision`; only a change to that generator's output meaning (or its
+recorded configuration/dependency version) invalidates it. Custom/plugin
+generators retain a conservative full-source-module hash. This creates a
+one-time transition: schema 1 checkpoints that generate features at prediction
+time must be retrained, and interrupted schema 1 offline jobs require
+`--restart` once. A completed schema 1 `.npz` and its original manifest remain
+usable as external materialized features when the exact same files are used at
+training and prediction.
 
 `--selected_features_path` accepts a CSV whose column names are generator
 names and whose values are the ordered feature names to retain. Fixed
@@ -591,9 +657,21 @@ Parameters from existing models can be used for parameter-initialization of a ne
  * `--checkpoint_dir <dir>` Directory where the model checkpoint(s) are saved (i.e. `--save_dir` during training of the old model). This will walk the directory, and load all `.pt` files it finds.
  * `--checkpoint_path <path>` Path to a model checkpoint file (`.pt` file).
  * `--checkpoint_paths <list of paths>` A list of paths to multiple model checkpoint (`.pt`) files.
-when training the new model. The model architecture of the new model should resemble the architecture of the old model - otherwise some or all parameters might not be loaded correctly. If any of these options are specified during training, any argument provided with `--ensemble_size` will be overwritten and the ensemble size will be specified as the number of checkpoint files that were provided, with each submodel in the ensemble using a separate checkpoint file for initialization. When using these options, new model parameters are initialized using the old checkpoint files but all parameters remain trainable (no frozen layers from these arguments).
+when training the new model. Warm-start training builds the requested current
+architecture, requires every transferred MPN encoder to match completely, and
+copies only shape-compatible non-encoder state; skipped readout entries are
+logged. If these options are specified, `--ensemble_size` is replaced by the
+number of checkpoint files, with one initialization checkpoint per submodel.
+All copied parameters remain trainable.
 
-Certain portions of the model can be loaded from a previous model and frozen so that they will not be trainable, using the various frozen layer parameters. A path to a checkpoint file for frozen parameters is provided with the argument `--checkpoint_frzn <path>`. If this path is provided, the parameters in the MPNN portion of the model will be specified from the path and frozen. Layers in the FFNN portion of the model can also be applied and frozen in addition to freezing the MPNN using `--frzn_ffn_layers <number-of-layers>`. Model architecture of the new model should match the old model in any layers that are being frozen, but non-frozen layers can be different without affecting the frozen layers (e.g., MPNN alone is frozen and new model has a larger number of FFNN layers). Parameters provided with `--checkpoint_frzn` will overwrite initialization parameters from `--checkpoint_path` (or similar) that are frozen in the new model. At present, only one checkpoint can be provided for the `--checkpoint_frzn` and those parameters will be used for any number of submodels if `--ensemble_size` is specified. If multiple molecules (with multiple MPNNs) are being trained in the new model, the default behavior is for both of the new MPNNs to be frozen and drawn from the checkpoint. Only the first MPNN will be frozen and subsequent MPNNs still allowed to train if `--freeze_first_only` is specified.
+`--checkpoint_frzn <path>` loads and freezes a fully validated compatible MPN
+mapping. `--frzn_ffn_layers <n>` additionally transfers and freezes complete
+leading FFN blocks while leaving the task output layer trainable.
+`--freeze_first_only` is available only where a distinct first encoder can be
+identified. Chemprop validates all requested values and shapes before changing
+weights or `requires_grad`; `features_only`, ambiguous shared-MPN mappings,
+and partial hidden PReLU freezing are rejected. One frozen checkpoint is
+reused for every requested ensemble member.
 
 ### Missing Target Values
 
@@ -616,8 +694,10 @@ content-addressed `.chemprop_cache` directory. Set `CHEMPROP_CACHE_DIR` to an
 alternate directory if needed. These files use Python pickle internally and
 must be treated as trusted local artifacts: the cache directory must be owned
 by the current user, must have mode `0700`, and must not be shared with
-untrusted users. The loader rejects symbolic links and insecure ownership or
-permissions before deserialization.
+untrusted users. The loader rejects symbolic links in every cache path
+component and insecure ownership or permissions before deserialization. On
+POSIX, descriptor-relative no-follow access also keeps validation, loading,
+and atomic replacement bound to the same directory across concurrent renames.
 
 By default, the molecule objects created from each SMILES string are cached for all dataset sizes, and the graph objects created from each molecule object are cached for datasets up to 10000 molecules. If memory permits, you may use the keyword `--cache_cutoff inf` to set this cutoff from 10000 to infinity to always keep the generated graphs in cache (or to another integer value for custom behavior). This may speed up training (depending on the dataset size, molecule size, number of epochs and GPU support), since the graphs do not need to be recreated each epoch, but increases memory usage considerably. Below the cutoff, graphs are created sequentially in the first epoch. Above the cutoff, graphs are created in parallel (on `--num_workers <int>` workers) for each epoch. If training on a GPU, training without caching and creating graphs on the fly in parallel is often preferable. On CPU, training with caching if often preferable for medium-sized datasets and a very low number of CPUs. If a very large dataset causes memory issues, you might turn off caching even of the molecule objects via the commands `--no_cache_mol` to reduce memory usage further.
 
@@ -657,6 +737,14 @@ The uncertainty of predictions made in Chemprop can be estimated by several diff
 ### Uncertainty Calibration
 
 Uncertainty predictions may be calibrated to improve their performance on new predictions. Calibration methods are selected using `--calibration_method <method>`, options provided below. An additional dataset to use in calibration is provided through `--calibration_path <path>`, along with necessary features like `--calibration_features_path <path>`. As with the data used in training, calibration data for multitask models are allowed to have gaps and missing targets in the data.
+
+For a constrained atom/bond checkpoint, prediction constraints and calibration
+constraints are distinct row-aligned inputs. Supply both
+`--constraints_path <prediction_constraints.csv>` and
+`--calibration_constraints_path <calibration_constraints.csv>`; omitting one
+or reusing a file with the wrong row order is rejected. Variable-length
+atom/bond predictions and uncertainties written to CSV are JSON arrays and
+should be read with a JSON parser.
 
 **Regression** 
 

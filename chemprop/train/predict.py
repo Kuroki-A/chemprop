@@ -59,35 +59,72 @@ def _predict(
         if model.is_atom_bond_targets:
             natoms, nbonds = batch.number_of_atoms, batch.number_of_bonds
             natoms, nbonds = np.array(natoms).flatten(), np.array(nbonds).flatten()
-            constraints_batch = np.transpose(constraints_batch).tolist()
-            device = next(model.parameters()).device
+            num_atom_bond_tasks = len(model.atom_targets) + len(model.bond_targets)
+            constraint_rows = [list(row) for row in constraints_batch]
+            constraint_widths = {len(row) for row in constraint_rows}
+            if constraint_widths == {0} or not constraint_rows:
+                constraints_batch = [
+                    [None] * len(batch) for _ in range(num_atom_bond_tasks)
+                ]
+            elif constraint_widths != {num_atom_bond_tasks}:
+                raise ValueError(
+                    'Prediction constraints must contain exactly one value per '
+                    f'atom/bond task ({num_atom_bond_tasks}); received row widths '
+                    f'{sorted(constraint_widths)}.'
+                )
+            else:
+                constraints_batch = [
+                    list(task_values) for task_values in zip(*constraint_rows)
+                ]
+            model_parameter = next(model.parameters())
+            device = model_parameter.device
 
-            # If the path to constraints is not given, the constraints matrix needs to be reformatted.
-            if constraints_batch == []:
-                for _ in batch._data:
-                    natom_targets = len(model.atom_targets)
-                    nbond_targets = len(model.bond_targets)
-                    ntargets = natom_targets + nbond_targets
-                    constraints_batch.append([None] * ntargets)
+            def constraint_tensor(values, counts, scaler_index, task_name, task_kind):
+                """Validates, standardizes, and tensors one required constraint."""
+                if atom_bond_scaler is None:
+                    raise ValueError(
+                        f'Prediction for constrained {task_kind} task '
+                        f'{task_name!r} requires an atom/bond target scaler.'
+                    )
+                try:
+                    numeric = np.asarray(values, dtype=float)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f'Prediction constraints for required {task_kind} task '
+                        f'{task_name!r} must contain one numeric finite value '
+                        'per input row.'
+                    ) from error
+                if numeric.shape != (len(batch),) or not np.all(np.isfinite(numeric)):
+                    raise ValueError(
+                        f'Prediction constraints for required {task_kind} task '
+                        f'{task_name!r} must contain one numeric finite value '
+                        'per input row.'
+                    )
+                mean = atom_bond_scaler.means[scaler_index][0]
+                std = atom_bond_scaler.stds[scaler_index][0]
+                standardized = (numeric - counts * mean) / std
+                return torch.as_tensor(
+                    standardized, dtype=model_parameter.dtype, device=device,
+                )
 
             ind = 0
             for i in range(len(model.atom_targets)):
                 if not model.atom_constraints[i]:
                     constraints_batch[ind] = None
                 else:
-                    mean, std = atom_bond_scaler.means[ind][0], atom_bond_scaler.stds[ind][0]
-                    for j, natom in enumerate(natoms):
-                        constraints_batch[ind][j] = (constraints_batch[ind][j] - natom * mean) / std
-                    constraints_batch[ind] = torch.tensor(constraints_batch[ind]).to(device)
+                    constraints_batch[ind] = constraint_tensor(
+                        constraints_batch[ind], natoms, ind,
+                        model.atom_targets[i], 'atom',
+                    )
                 ind += 1
             for i in range(len(model.bond_targets)):
                 if not model.bond_constraints[i]:
                     constraints_batch[ind] = None
                 else:
-                    mean, std = atom_bond_scaler.means[ind][0], atom_bond_scaler.stds[ind][0]
-                    for j, nbond in enumerate(nbonds):
-                        constraints_batch[ind][j] = (constraints_batch[ind][j] - nbond * mean) / std
-                    constraints_batch[ind] = torch.tensor(constraints_batch[ind]).to(device)
+                    constraints_batch[ind] = constraint_tensor(
+                        constraints_batch[ind], nbonds, ind,
+                        model.bond_targets[i], 'bond',
+                    )
                 ind += 1
             bond_types_batch = []
             for i in range(len(model.atom_targets)):

@@ -1,10 +1,12 @@
 from collections import defaultdict
 import csv
+import errno
 import hashlib
 import inspect
 import json
 from logging import Logger
 import os
+import secrets
 import stat
 import sys
 import tempfile
@@ -100,10 +102,16 @@ def _dependency_versions() -> Dict[str, str]:
         'padelpy',
         'map4',
         'mhfp',
+        'pmapper',
+        'dgl',
         'dgllife',
         'datamol',
         'molfeat',
+        'graphormer-pretrained',
+        'tokenizers',
         'transformers',
+        'sentencepiece',
+        'selfies',
     ]:
         if metadata is None:
             versions[distribution] = None
@@ -171,6 +179,10 @@ def _dataset_cache_manifest(args: TrainArgs) -> Dict:
         'overwrite_default_bond_features',
         'loss_function',
         'is_atom_bond_targets',
+        'atom_targets',
+        'bond_targets',
+        'molecule_targets',
+        'save_smiles_splits',
         'reaction',
         'reaction_mode',
         'reaction_solvent',
@@ -214,24 +226,133 @@ def _dataset_cache_path(args: TrainArgs, manifest: Dict) -> str:
     return os.path.join(cache_dir, f'dataset-{cache_key}.pt')
 
 
-def _validate_private_cache_directory(cache_dir: str, create: bool) -> None:
-    """Requires a non-symlink, user-private directory for pickle caches."""
-    cache_dir = os.path.abspath(cache_dir)
-    if os.path.lexists(cache_dir) and os.path.islink(cache_dir):
-        raise ValueError(f'Dataset cache directory {cache_dir} must not be a symbolic link.')
-    if create:
-        os.makedirs(cache_dir, mode=0o700, exist_ok=True)
-    directory_stat = os.lstat(cache_dir)
+def _validate_private_cache_directory_stat(
+    cache_dir: str, directory_stat: os.stat_result,
+) -> None:
+    """Validates the already-open cache directory used for pickle data."""
     if not stat.S_ISDIR(directory_stat.st_mode):
         raise ValueError(f'Dataset cache path {cache_dir} is not a directory.')
     if os.name == 'posix':
         if directory_stat.st_uid != os.geteuid():
             raise ValueError(f'Dataset cache directory {cache_dir} is not owned by the current user.')
-        if stat.S_IMODE(directory_stat.st_mode) & 0o077:
+        if stat.S_IMODE(directory_stat.st_mode) != 0o700:
             raise ValueError(
                 f'Dataset cache directory {cache_dir} must be private (mode 0700); '
                 'dataset caches contain trusted Python pickle data.'
             )
+
+
+def _supports_secure_cache_dir_fd() -> bool:
+    """Whether this OS supports descriptor-relative, no-follow cache access."""
+    return (
+        os.name == 'posix'
+        and hasattr(os, 'O_DIRECTORY')
+        and hasattr(os, 'O_NOFOLLOW')
+        and os.open in getattr(os, 'supports_dir_fd', ())
+        and os.mkdir in getattr(os, 'supports_dir_fd', ())
+        and os.unlink in getattr(os, 'supports_dir_fd', ())
+        and os.rename in getattr(os, 'supports_dir_fd', ())
+    )
+
+
+def _cache_directory_component_error(cache_dir: str) -> ValueError:
+    """Returns a stable public error for a symlink/non-directory component."""
+    return ValueError(
+        f'Dataset cache directory {cache_dir} must contain only real '
+        'directories and no symbolic-link components.'
+    )
+
+
+def _open_private_cache_directory_fd(cache_dir: str, create: bool) -> int:
+    """Opens a private cache directory without following any path symlink.
+
+    Every component is resolved relative to an already-open parent descriptor.
+    The returned descriptor therefore remains anchored to the validated
+    directory even if another process renames a path component afterwards.
+    """
+    cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, 'O_CLOEXEC'):
+        flags |= os.O_CLOEXEC
+
+    directory_fd = os.open(os.path.sep, flags)
+    components = [part for part in cache_dir.split(os.path.sep) if part]
+    try:
+        for index, component in enumerate(components):
+            component_created = False
+            try:
+                child_fd = os.open(component, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                    component_created = True
+                except FileExistsError:
+                    # A concurrent creator won the race. Opening with
+                    # O_NOFOLLOW below still validates what it installed.
+                    pass
+                try:
+                    child_fd = os.open(component, flags, dir_fd=directory_fd)
+                except OSError as error:
+                    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        raise _cache_directory_component_error(
+                            cache_dir,
+                        ) from error
+                    raise
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise _cache_directory_component_error(
+                        cache_dir,
+                    ) from error
+                raise
+
+            os.close(directory_fd)
+            directory_fd = child_fd
+            if component_created and index == len(components) - 1:
+                # mkdir's requested mode is filtered through umask. Restore
+                # the exact documented mode only for the directory we created.
+                os.fchmod(directory_fd, 0o700)
+
+        _validate_private_cache_directory_stat(
+            cache_dir, os.fstat(directory_fd),
+        )
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _validate_no_symlink_components(cache_dir: str) -> None:
+    """Best-effort component validation for platforms without dir_fd APIs."""
+    cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
+    drive, tail = os.path.splitdrive(cache_dir)
+    current = drive + os.path.sep
+    for component in (part for part in tail.split(os.path.sep) if part):
+        current = os.path.join(current, component)
+        if os.path.lexists(current) and os.path.islink(current):
+            raise ValueError(
+                f'Dataset cache directory {cache_dir} must not contain '
+                'symbolic-link components.'
+            )
+
+
+def _validate_private_cache_directory(cache_dir: str, create: bool) -> None:
+    """Requires a non-symlink, user-private directory for pickle caches."""
+    cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
+    if _supports_secure_cache_dir_fd():
+        directory_fd = _open_private_cache_directory_fd(cache_dir, create=create)
+        os.close(directory_fd)
+        return
+
+    # Non-POSIX compatibility path. There is no portable equivalent to the
+    # descriptor-relative POSIX walk, so validate before and after creation.
+    _validate_no_symlink_components(cache_dir)
+    if create:
+        os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+    _validate_no_symlink_components(cache_dir)
+    directory_stat = os.lstat(cache_dir)
+    _validate_private_cache_directory_stat(cache_dir, directory_stat)
 
 
 def _validate_cache_file_stat(path: str, file_stat: os.stat_result) -> None:
@@ -249,15 +370,35 @@ def _validate_cache_file_stat(path: str, file_stat: os.stat_result) -> None:
 
 def _load_dataset_cache(path: str, manifest: Dict):
     """Loads a trusted private cache only when its manifest exactly matches."""
-    cache_dir = os.path.dirname(os.path.abspath(path))
-    _validate_private_cache_directory(cache_dir, create=False)
-    if os.path.islink(path):
-        raise ValueError(f'Dataset cache {path} must not be a symbolic link.')
-
+    path = os.path.abspath(os.path.expanduser(path))
+    cache_dir = os.path.dirname(path)
+    filename = os.path.basename(path)
     flags = os.O_RDONLY
-    if hasattr(os, 'O_NOFOLLOW'):
+    if hasattr(os, 'O_CLOEXEC'):
+        flags |= os.O_CLOEXEC
+
+    directory_fd = None
+    if _supports_secure_cache_dir_fd():
+        directory_fd = _open_private_cache_directory_fd(cache_dir, create=False)
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
+        try:
+            descriptor = os.open(filename, flags, dir_fd=directory_fd)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise ValueError(
+                    f'Dataset cache {path} must not be a symbolic link.'
+                ) from error
+            raise
+        finally:
+            os.close(directory_fd)
+    else:
+        _validate_private_cache_directory(cache_dir, create=False)
+        if os.path.islink(path):
+            raise ValueError(f'Dataset cache {path} must not be a symbolic link.')
+        if hasattr(os, 'O_NOFOLLOW'):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+
     with os.fdopen(descriptor, 'rb') as cache_file:
         _validate_cache_file_stat(path, os.fstat(cache_file.fileno()))
         if Version(str(torch.__version__)) >= Version("2.6"):
@@ -273,7 +414,44 @@ def _load_dataset_cache(path: str, manifest: Dict):
 
 def _save_dataset_cache(path: str, manifest: Dict, data: MoleculeDataset) -> None:
     """Atomically saves a dataset cache so readers never observe partial files."""
+    path = os.path.abspath(os.path.expanduser(path))
     cache_dir = os.path.dirname(path)
+    filename = os.path.basename(path)
+
+    if _supports_secure_cache_dir_fd():
+        directory_fd = _open_private_cache_directory_fd(cache_dir, create=True)
+        temporary_name = f'.dataset-{secrets.token_hex(16)}.tmp'
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        if hasattr(os, 'O_CLOEXEC'):
+            flags |= os.O_CLOEXEC
+        try:
+            file_descriptor = os.open(
+                temporary_name, flags, 0o600, dir_fd=directory_fd,
+            )
+            with os.fdopen(file_descriptor, 'wb') as cache_file:
+                torch.save({'manifest': manifest, 'data': data}, cache_file)
+                cache_file.flush()
+                os.fsync(cache_file.fileno())
+            os.rename(
+                temporary_name,
+                filename,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                # Some POSIX filesystems do not support directory fsync. The
+                # replace is still atomic for concurrent readers.
+                pass
+        finally:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            os.close(directory_fd)
+        return
+
     _validate_private_cache_directory(cache_dir, create=True)
     file_descriptor, temporary_path = tempfile.mkstemp(
         dir=cache_dir, prefix='.dataset-', suffix='.tmp'

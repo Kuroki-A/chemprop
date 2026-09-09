@@ -1,6 +1,7 @@
 import csv
 from collections import OrderedDict
 import importlib
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -254,3 +255,89 @@ def test_empty_conformal_regression_has_one_uncertainty_per_task(tmp_path):
 
     assert predictions == [["Invalid SMILES", "Invalid SMILES"]]
     assert uncertainties == [["Invalid SMILES", "Invalid SMILES"]]
+
+
+@pytest.mark.parametrize(
+    ('atom_constraints', 'bond_constraints'),
+    [([True], []), ([], [True])],
+)
+def test_in_memory_smiles_reject_checkpoints_with_row_aligned_constraints(
+    atom_constraints, bond_constraints,
+):
+    args = SimpleNamespace()
+    train_args = SimpleNamespace(
+        atom_constraints=atom_constraints,
+        bond_constraints=bond_constraints,
+    )
+
+    with pytest.raises(ValueError, match='In-memory SMILES.*constraints'):
+        make_predictions_module.load_data(
+            args,
+            smiles=[['CC']],
+            train_args=train_args,
+        )
+
+
+def test_calibration_constraints_are_loaded_with_checkpoint_task_columns(monkeypatch):
+    class ExpectedStop(Exception):
+        pass
+
+    captured = {}
+
+    def capture_calibration_data(**kwargs):
+        captured.update(kwargs)
+        raise ExpectedStop
+
+    args = SimpleNamespace(
+        checkpoint_paths=['model.pt'],
+        uncertainty_method='mve',
+        calibration_method='zscaling',
+        calibration_path='calibration.csv',
+        calibration_features_path=None,
+        calibration_phase_features_path=None,
+        calibration_atom_descriptors_path=None,
+        calibration_bond_descriptors_path=None,
+        calibration_constraints_path='calibration_constraints.csv',
+        smiles_columns=['smiles'],
+        features_generator=None,
+        max_data_size=None,
+        dataset_type='regression',
+        loss_function='mve',
+        evaluation_methods=None,
+    )
+    train_args = SimpleNamespace(
+        is_atom_bond_targets=True,
+        atom_targets=['atom_a'],
+        bond_targets=['bond_b'],
+    )
+    model_objects = (args, train_args, [], [], 2, ['atom_a', 'bond_b'])
+
+    monkeypatch.setattr(make_predictions_module, 'set_features', lambda *_args: None)
+    monkeypatch.setattr(
+        make_predictions_module,
+        'load_data',
+        lambda *_args, **_kwargs: (None, None, None, {}),
+    )
+    monkeypatch.setattr(make_predictions_module, 'get_data', capture_calibration_data)
+
+    with pytest.raises(ExpectedStop):
+        make_predictions(args, model_objects=model_objects)
+
+    assert captured['constraints_path'] == 'calibration_constraints.csv'
+    assert captured['constraints_target_columns'] == ['atom_a', 'bond_b']
+
+
+@pytest.mark.parametrize(
+    'value',
+    [
+        np.array([1.25, 2.5]),
+        np.array([[1.0, 2.0], [3.0, 4.0]]),
+        [5.0, 6.0, 7.0],
+    ],
+)
+def test_atom_bond_prediction_csv_cells_round_trip_as_json(value):
+    encoded = make_predictions_module._prediction_csv_cell(
+        value, is_atom_bond_targets=True,
+    )
+
+    assert json.loads(encoded) == np.asarray(value).tolist()

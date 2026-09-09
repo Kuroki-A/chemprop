@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from chemprop.data import get_data
 from chemprop.features import load_features
 from scripts import save_features as save_features_script
 
@@ -99,6 +100,45 @@ def test_streaming_empty_input_preserves_historical_archive_shape(
     result = load_features(args.save_path)
     assert result.shape == (0,)
     assert result.dtype == np.float32
+    dataset = get_data(
+        path=args.data_path,
+        smiles_columns=['smiles'],
+        features_path=[args.save_path],
+    )
+    assert len(dataset) == 0
+    assert dataset._features_source_metadata['total_dimension'] == 1
+
+
+def test_streaming_empty_input_rejects_generator_with_unknown_width(
+    tmp_path, monkeypatch,
+):
+    args = _args(tmp_path, row_count=0)
+    monkeypatch.setattr(
+        save_features_script,
+        'get_features_generator_schema',
+        lambda *_args, **_kwargs: {
+            'schema_version': 2,
+            'generator': 'streaming_test',
+            'semantic_revision': 1,
+            'generator_config': {},
+            'versions': {},
+            'dimension': None,
+            'dtype': None,
+            'feature_names': [],
+        },
+    )
+    monkeypatch.setattr(
+        save_features_script,
+        'get_features_generator',
+        lambda _name: lambda value: np.asarray([int(value)], dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match='empty input.*dimension.*not known'):
+        save_features_script.generate_and_save_features(args)
+
+    assert not (tmp_path / 'features.npz').exists()
+    assert not (tmp_path / 'features.npz.manifest.json').exists()
+    assert not (tmp_path / 'features.npz_temp').exists()
 
 
 def test_explicit_worker_count_can_override_a_pseudo_batch_generator():
@@ -116,6 +156,62 @@ def test_explicit_worker_count_can_override_a_pseudo_batch_generator():
     assert not save_features_script._prefer_requested_process_pool(args, generator)
 
 
+@pytest.mark.parametrize(
+    ('sequential', 'num_workers', 'batch_size', 'expected'),
+    [
+        (False, None, None, False),
+        (False, 4, None, False),
+        (True, None, None, False),
+        (False, 1, None, True),
+        (False, None, 64, True),
+        (False, 4, 64, True),
+    ],
+)
+def test_rdkit_fingerprint_offline_batch_selection(
+    sequential, num_workers, batch_size, expected,
+):
+    def generator(value):
+        return np.asarray([value])
+
+    generator.batch_transform = lambda values: values
+    generator.save_features_process_pool_by_default = True
+    args = SimpleNamespace(
+        sequential=sequential,
+        num_workers=num_workers,
+        batch_size=batch_size,
+    )
+
+    assert save_features_script._use_native_batch(args, generator) is expected
+
+
+def test_map4_requested_process_pool_selection_is_unchanged():
+    def generator(value):
+        return np.asarray([value])
+
+    generator.batch_transform = lambda values: values
+    generator.prefer_process_pool_when_requested = True
+    args = SimpleNamespace(sequential=False, num_workers=None, batch_size=None)
+
+    assert save_features_script._use_native_batch(args, generator)
+    args.num_workers = 4
+    assert not save_features_script._use_native_batch(args, generator)
+    args.sequential = True
+    assert save_features_script._use_native_batch(args, generator)
+
+
+def test_offline_scalar_policy_bypasses_native_batch(monkeypatch):
+    generator = save_features_script.get_features_generator('morgan')
+
+    def unexpected_batch(*_args, **_kwargs):
+        pytest.fail('the scalar offline path must not invoke batch_transform')
+
+    monkeypatch.setattr(generator, 'batch_transform', unexpected_batch)
+    actual = save_features_script._generate_features_with_dataset_policy(
+        ['CCO'], 'morgan', generator, use_native_batch=False,
+    )[0]
+    np.testing.assert_array_equal(actual, generator('CCO'))
+
+
 def test_resume_without_identity_manifest_is_rejected(tmp_path, monkeypatch):
     args = _args(tmp_path, row_count=2, save_frequency=1)
     _install_generator(monkeypatch)
@@ -131,12 +227,12 @@ def test_resume_without_identity_manifest_is_rejected(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ('sequential', 'num_workers'),
-    [(True, None), (False, 2)],
-    ids=['sequential', 'process-pool'],
+    ('sequential', 'num_workers', 'batch_size'),
+    [(True, None, None), (False, 2, None), (False, 1, None), (False, 2, 1)],
+    ids=['sequential', 'process-pool', 'native-workers-one', 'native-batch-size'],
 )
 def test_save_features_applies_selected_fixed_fingerprint_columns(
-    tmp_path, sequential, num_workers,
+    tmp_path, sequential, num_workers, batch_size,
 ):
     data_path = tmp_path / 'selected.csv'
     data_path.write_text('smiles\nCCO\nCC\n')
@@ -153,7 +249,7 @@ def test_save_features_applies_selected_fixed_fingerprint_columns(
         sequential=sequential,
         num_workers=num_workers,
         chunksize=1,
-        batch_size=None,
+        batch_size=batch_size,
     )
 
     save_features_script.generate_and_save_features(args)

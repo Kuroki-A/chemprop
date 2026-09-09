@@ -54,6 +54,26 @@ def _seed_lgbm_pipeline(seed: int) -> None:
 
 def build_frozen_lgbm_encoder(args: TrainArgs) -> MoleculeModelEncoder:
     """Builds the single deterministic MPN encoder used by a fold."""
+    if not getattr(args, "features_only", False):
+        raise ValueError(
+            "LightGBM requires a deterministic --features_only representation."
+        )
+    if (
+        getattr(args, "reaction", False)
+        or getattr(args, "reaction_solvent", False)
+    ) and getattr(args, "features_generator", None):
+        raise NotImplementedError(
+            "LightGBM molecular feature generators encode only the reactant. "
+            "Use an explicitly reaction-aware --features_path for reaction data."
+        )
+    if (
+        getattr(args, "atom_descriptors", None) is not None
+        or getattr(args, "bond_descriptors", None) is not None
+    ):
+        raise NotImplementedError(
+            "LightGBM features-only encoding does not consume atom or bond "
+            "descriptors/features; provide molecule-level --features_path data."
+        )
     _seed_lgbm_pipeline(args.pytorch_seed)
     encoder = MoleculeModelEncoder(args).to(args.device)
     encoder.eval()

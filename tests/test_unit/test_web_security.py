@@ -16,6 +16,7 @@ import pytest
 
 from chemprop.web.app import app as web_app, db, views
 from chemprop.web import run as web_run
+from chemprop.web import utils as web_utils
 from chemprop.web.wsgi import build_app
 
 
@@ -327,6 +328,83 @@ def test_remote_mode_requires_private_user_owned_storage():
 
         with pytest.raises(ValueError, match='must be private'):
             build_app(root_folder=root_dir, init_db=False, allow_remote=True)
+
+
+def test_remote_mode_rejects_replaceable_storage_ancestor():
+    with TemporaryDirectory() as parent_dir, _remote_config():
+        # Model a service-owned private root placed below a non-sticky shared
+        # directory.  Another local account could otherwise rename the root
+        # after validation and redirect startup cleanup through a symlink.
+        os.chmod(parent_dir, 0o755)
+        shared_dir = os.path.join(parent_dir, 'shared')
+        os.mkdir(shared_dir)
+        os.chmod(shared_dir, 0o777)
+        root_dir = os.path.join(shared_dir, 'service-state')
+        os.mkdir(root_dir, mode=0o700)
+
+        with pytest.raises(ValueError, match='could replace a validated path'):
+            build_app(root_folder=root_dir, init_db=False, allow_remote=True)
+
+
+def test_temp_cleanup_does_not_follow_internal_symlinks():
+    with TemporaryDirectory() as root_dir, TemporaryDirectory() as victim_dir:
+        app = build_app(root_folder=root_dir, init_db=False)
+        marker = os.path.join(victim_dir, 'must-remain.txt')
+        with open(marker, 'w', encoding='utf-8') as marker_file:
+            marker_file.write('safe')
+        os.symlink(victim_dir, os.path.join(app.config['TEMP_FOLDER'], 'escape'))
+
+        web_utils.clear_temp_folder(app)
+
+        assert os.path.isfile(marker)
+        assert os.listdir(app.config['TEMP_FOLDER']) == []
+
+
+def test_database_reset_does_not_follow_storage_symlinks():
+    with TemporaryDirectory() as root_dir, TemporaryDirectory() as victim_dir:
+        app = build_app(root_folder=root_dir, init_db=True)
+        marker = os.path.join(victim_dir, 'must-remain.txt')
+        with open(marker, 'w', encoding='utf-8') as marker_file:
+            marker_file.write('safe')
+        os.symlink(victim_dir, os.path.join(app.config['DATA_FOLDER'], 'escape'))
+        os.symlink(
+            victim_dir, os.path.join(app.config['CHECKPOINT_FOLDER'], 'escape'),
+        )
+
+        with app.app_context():
+            db.init_db()
+
+        assert os.path.isfile(marker)
+        assert os.listdir(app.config['DATA_FOLDER']) == []
+        assert os.listdir(app.config['CHECKPOINT_FOLDER']) == []
+
+
+def test_temp_cleanup_fails_safe_if_root_is_swapped_after_validation(monkeypatch):
+    with TemporaryDirectory() as parent_dir:
+        root_dir = os.path.join(parent_dir, 'state')
+        app = build_app(root_folder=root_dir, init_db=False)
+        victim_dir = os.path.join(parent_dir, 'victim')
+        victim_temp = os.path.join(victim_dir, 'app', 'temp')
+        os.makedirs(victim_temp)
+        marker = os.path.join(victim_temp, 'must-remain.txt')
+        with open(marker, 'w', encoding='utf-8') as marker_file:
+            marker_file.write('safe')
+        os.chmod(parent_dir, 0o777)
+
+        original_validate = web_utils.validate_web_storage_layout
+
+        def validate_then_swap(current_app):
+            original_validate(current_app)
+            os.rename(root_dir, f'{root_dir}.original')
+            os.rename(victim_dir, root_dir)
+
+        monkeypatch.setattr(
+            web_utils, 'validate_web_storage_layout', validate_then_swap,
+        )
+        with pytest.raises(ValueError, match='could replace a validated path'):
+            web_utils.clear_temp_folder(app)
+
+        assert os.path.isfile(os.path.join(root_dir, 'app', 'temp', 'must-remain.txt'))
 
 
 def test_security_headers_and_current_cdn_assets():

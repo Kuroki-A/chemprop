@@ -1,6 +1,7 @@
 """Computes and saves molecular features for a dataset."""
 
 import hashlib
+from itertools import islice
 import json
 from multiprocessing import get_context
 import os
@@ -21,12 +22,14 @@ from tap import Tap  # pip install typed-argument-parser (https://github.com/swa
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from chemprop.data import get_smiles, load_selected_feature_columns
+from chemprop.data.data import generate_features_for_smiles_batch
 from chemprop.features import get_available_features_generators, get_features_generator, load_features, save_features
 from chemprop.features.features_generators import get_features_generator_schema
 from chemprop.utils import makedirs
 
 
 _FEATURES_WORKER = None
+_FEATURES_WORKER_NAME = None
 _FEATURES_WORKER_SELECTED_COLUMNS = None
 
 
@@ -35,19 +38,84 @@ def _initialize_features_worker(
     selected_feature_columns: Sequence[str] = None,
 ) -> None:
     """Initializes one generator per worker process."""
-    global _FEATURES_WORKER, _FEATURES_WORKER_SELECTED_COLUMNS
+    global _FEATURES_WORKER, _FEATURES_WORKER_NAME, _FEATURES_WORKER_SELECTED_COLUMNS
     _FEATURES_WORKER = get_features_generator(features_generator_name)
+    _FEATURES_WORKER_NAME = features_generator_name
     _FEATURES_WORKER_SELECTED_COLUMNS = selected_feature_columns
+
+
+def _generate_features_with_dataset_policy(
+    smiles_values: Sequence[str],
+    features_generator_name: str,
+    features_generator,
+    selected_feature_columns: Sequence[str] = None,
+    use_native_batch: bool = True,
+) -> List[np.ndarray]:
+    """Applies Chemprop's reaction and hydrogen-only policy to saved features."""
+    if features_generator_name not in get_available_features_generators():
+        batch_transform = (
+            getattr(features_generator, 'batch_transform', None)
+            if use_native_batch
+            else None
+        )
+        if batch_transform is not None:
+            if selected_feature_columns is None:
+                return [np.asarray(row) for row in batch_transform(smiles_values)]
+            return [
+                np.asarray(row)
+                for row in batch_transform(
+                    smiles_values,
+                    selected_feature_columns=selected_feature_columns,
+                )
+            ]
+        return [
+            np.asarray(
+                features_generator(value)
+                if selected_feature_columns is None
+                else features_generator(
+                    value, selected_feature_columns=selected_feature_columns,
+                )
+            )
+            for value in smiles_values
+        ]
+
+    effective_generator = features_generator
+    if not use_native_batch:
+        # ``generate_features_for_smiles_batch`` normally discovers the
+        # callable's native transform. A plain adapter intentionally keeps the
+        # offline sequential/process-pool paths scalar while retaining their
+        # shared reaction and hydrogen-only policy.
+        def scalar_generator(mol, selected_feature_columns=None):
+            return features_generator(
+                mol, selected_feature_columns=selected_feature_columns,
+            )
+        effective_generator = scalar_generator
+
+    selected = (
+        {}
+        if selected_feature_columns is None
+        else {features_generator_name: selected_feature_columns}
+    )
+    return generate_features_for_smiles_batch(
+        [[smiles] for smiles in smiles_values],
+        [features_generator_name],
+        selected_feature_columns=selected,
+        generator_overrides={features_generator_name: effective_generator},
+        auto_detect_reactions=True,
+    )
 
 
 def _generate_features_worker(smiles: str):
     """Generates one row through the process-local registry function."""
-    if _FEATURES_WORKER is None:
+    if _FEATURES_WORKER is None or _FEATURES_WORKER_NAME is None:
         raise RuntimeError("Feature worker was not initialized.")
-    return _FEATURES_WORKER(
-        smiles,
-        selected_feature_columns=_FEATURES_WORKER_SELECTED_COLUMNS,
-    )
+    return _generate_features_with_dataset_policy(
+        [smiles],
+        _FEATURES_WORKER_NAME,
+        _FEATURES_WORKER,
+        _FEATURES_WORKER_SELECTED_COLUMNS,
+        use_native_batch=False,
+    )[0]
 
 
 class Args(Tap):
@@ -59,9 +127,9 @@ class Args(Tap):
     save_frequency: int = 10000  # Frequency with which to save the features
     restart: bool = False  # Whether to not load partially complete featurization and instead start from scratch
     sequential: bool = False  # Whether to run sequentially rather than in parallel
-    num_workers: int = None  # Worker processes. Explicit values >1 enable MAP4 multiprocessing.
+    num_workers: int = None  # Worker processes; 1 selects native RDKit fingerprint batches.
     chunksize: int = 100  # Number of molecules dispatched to a CPU worker at once
-    batch_size: int = None  # Molecules per call for generators exposing a native batch API
+    batch_size: int = None  # Native batch size; also selects the native RDKit path.
 
     def configure(self) -> None:
         self.add_argument('--features_generator', choices=get_available_features_generators())
@@ -243,13 +311,18 @@ def _atomic_consolidate_chunks(
             os.remove(npy_path)
 
 
-def _iter_batches(values: Sequence[str], size: int) -> Iterator[Sequence[str]]:
-    for start in range(0, len(values), size):
-        yield values[start:start + size]
+def _iter_batches(values: Iterable[str], size: int) -> Iterator[List[str]]:
+    """Yields bounded lists from either a sequence or a streaming iterator."""
+    iterator = iter(values)
+    while True:
+        batch = list(islice(iterator, size))
+        if not batch:
+            return
+        yield batch
 
 
 def _iter_batched_features(
-    smiles: Sequence[str], batch_transform: Callable[[Sequence[str]], Sequence], batch_size: int,
+    smiles: Iterable[str], batch_transform: Callable[[Sequence[str]], Sequence], batch_size: int,
 ) -> Iterator:
     """Yields native-batch results while bounding temporary memory usage."""
     for batch in _iter_batches(smiles, batch_size):
@@ -280,6 +353,20 @@ def _prefer_requested_process_pool(args: Args, features_generator: Callable) -> 
             features_generator, 'prefer_process_pool_when_requested', False,
         )
     )
+
+
+def _use_native_batch(args: Args, features_generator: Callable) -> bool:
+    """Chooses the offline native-batch path without slowing SMILES parsing."""
+    if getattr(features_generator, 'batch_transform', None) is None:
+        return False
+    if getattr(features_generator, 'save_features_process_pool_by_default', False):
+        # For inexpensive RDKit fingerprints, parsing SMILES across the bounded
+        # process pool is faster by default. Users can explicitly choose the
+        # lower-process native path with --num_workers 1 or --batch_size.
+        if args.sequential:
+            return False
+        return args.batch_size is not None or args.num_workers == 1
+    return not _prefer_requested_process_pool(args, features_generator)
 
 
 def _atomic_write_json(path: str, payload: dict) -> None:
@@ -332,11 +419,23 @@ def _input_identity(data_path: str, smiles: Sequence[str]) -> dict:
 def _validate_resume_manifest(path: str, expected_schema: dict, expected_input: dict) -> dict:
     with open(path, encoding='utf-8') as file:
         manifest = json.load(file)
+    recorded_schema_version = manifest.get('schema_version')
+    expected_schema_version = expected_schema.get('schema_version')
+    if recorded_schema_version != expected_schema_version:
+        raise ValueError(
+            'Cannot resume feature generation because feature metadata '
+            f'schema_version changed from {recorded_schema_version!r} to '
+            f'{expected_schema_version!r}. Schema 1 used a legacy whole-module '
+            'implementation hash and is intentionally incompatible with the '
+            'per-generator identity format. Use --restart once to discard the '
+            'existing temporary features.'
+        )
     comparisons = {
-        'schema_version': (
-            manifest.get('schema_version'), expected_schema.get('schema_version'),
-        ),
         'generator': (manifest.get('generator'), expected_schema.get('generator')),
+        'semantic_revision': (
+            manifest.get('semantic_revision'),
+            expected_schema.get('semantic_revision'),
+        ),
         'implementation_sha256': (
             manifest.get('implementation_sha256'),
             expected_schema.get('implementation_sha256'),
@@ -456,6 +555,14 @@ def generate_and_save_features(args: Args):
         args.features_generator,
         selected_feature_columns=selected_feature_columns,
     )
+    if not all_smiles and expected_schema.get('dimension') is None:
+        raise ValueError(
+            f'Cannot generate features for an empty input because the output '
+            f'dimension of {args.features_generator!r} is not known until at '
+            'least one molecule is processed. Add a valid molecule, select an '
+            'explicit feature-column schema where supported, or use a generator '
+            'with a statically known dimension.'
+        )
     resume_manifest = None
     feature_vector = None
     dimension = expected_schema.get('dimension')
@@ -544,16 +651,20 @@ def generate_and_save_features(args: Args):
     )
 
     # Build features map function
-    smiles = all_smiles[completed:]  # restrict to molecules whose features are not persisted
+    # ``all_smiles[completed:]`` duplicates one Python reference per remaining
+    # row.  Keep a lazy tail instead; this matters for multi-million-row
+    # feature jobs and works for native batches, scalar maps and process pools.
+    remaining_count = len(all_smiles) - completed
+    smiles = islice(all_smiles, completed, None)
 
     def consume(features_iterator: Iterable) -> None:
         nonlocal current_manifest, completed, dimension, dtype, feature_vector, temp_num
         temp_features = []
-        for i, feats in enumerate(tqdm(features_iterator, total=len(smiles))):
+        for i, feats in enumerate(tqdm(features_iterator, total=remaining_count)):
             temp_features.append(feats)
 
             # Save temporary features every save_frequency.
-            if (i + 1) % args.save_frequency == 0 or i == len(smiles) - 1:
+            if (i + 1) % args.save_frequency == 0 or i == remaining_count - 1:
                 chunk_vector, chunk_dimension, chunk_dtype = _validate_feature_chunk(
                     temp_features, dimension=dimension, dtype=dtype,
                 )
@@ -576,36 +687,29 @@ def generate_and_save_features(args: Args):
                     selected_feature_columns=selected_feature_columns,
                 )
 
-    batch_transform = getattr(features_generator, 'batch_transform', None)
-    use_requested_process_pool = _prefer_requested_process_pool(
-        args, features_generator,
-    )
     batch_supports_selection = (
         selected_feature_columns is None
         or getattr(features_generator, 'batch_supports_selected_columns', False)
     )
-    if (
-        batch_transform is not None
-        and batch_supports_selection
-        and not use_requested_process_pool
-    ):
+    if batch_supports_selection and _use_native_batch(args, features_generator):
         effective_batch_size = args.batch_size or getattr(features_generator, 'preferred_batch_size', 256)
-        if selected_feature_columns is None:
-            selected_batch_transform = batch_transform
-        else:
-            selected_batch_transform = lambda batch: batch_transform(
-                batch, selected_feature_columns=selected_feature_columns,
-            )
+        selected_batch_transform = lambda batch: _generate_features_with_dataset_policy(
+            batch,
+            args.features_generator,
+            features_generator,
+            selected_feature_columns,
+        )
         consume(_iter_batched_features(
             smiles, selected_batch_transform, effective_batch_size,
         ))
     elif args.sequential:
-        if selected_feature_columns is None:
-            selected_generator = features_generator
-        else:
-            selected_generator = lambda value: features_generator(
-                value, selected_feature_columns=selected_feature_columns,
-            )
+        selected_generator = lambda value: _generate_features_with_dataset_policy(
+            [value],
+            args.features_generator,
+            features_generator,
+            selected_feature_columns,
+            use_native_batch=False,
+        )[0]
         consume(map(selected_generator, smiles))
     else:
         worker_count = args.num_workers or _default_num_workers()

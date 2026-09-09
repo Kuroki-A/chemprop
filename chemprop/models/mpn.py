@@ -326,7 +326,8 @@ class MPN(nn.Module):
                 atom_descriptors_batch: List[np.ndarray] = None,
                 atom_features_batch: List[np.ndarray] = None,
                 bond_descriptors_batch: List[np.ndarray] = None,
-                bond_features_batch: List[np.ndarray] = None) -> torch.Tensor:
+                bond_features_batch: List[np.ndarray] = None,
+                allow_shared_single_molecule: bool = False) -> torch.Tensor:
         """
         Encodes a batch of molecules.
 
@@ -339,10 +340,25 @@ class MPN(nn.Module):
         :param atom_features_batch: A list of numpy arrays containing additional atom features.
         :param bond_descriptors_batch: A list of numpy arrays containing additional bond descriptors.
         :param bond_features_batch: A list of numpy arrays containing additional bond features.
+        :param allow_shared_single_molecule: Whether an MPN fingerprint call may use
+                                            one encoder from a shared multi-molecule MPN.
+                                            Normal training and prediction calls must
+                                            leave this disabled.
         :return: A PyTorch tensor of shape :code:`(num_molecules, hidden_size)` containing the encoding of each molecule.
         """
         if not isinstance(batch, (list, tuple)) or len(batch) == 0:
             raise ValueError('MPN input batch must be a non-empty list or tuple.')
+
+        encoder_modules = getattr(self, 'encoder', None)
+        has_shared_multi_molecule_encoder = (
+            allow_shared_single_molecule
+            and not self.reaction_solvent
+            and self.number_of_molecules > 1
+            and isinstance(encoder_modules, nn.ModuleList)
+            and len(encoder_modules) == self.number_of_molecules
+            and all(encoder is encoder_modules[0] for encoder in encoder_modules[1:])
+        )
+        shared_single_molecule = False
 
         if not isinstance(batch[0], BatchMolGraph):
             if not all(isinstance(mols, (list, tuple)) for mols in batch):
@@ -350,10 +366,16 @@ class MPN(nn.Module):
                     'Each MPN datapoint must contain a list or tuple of molecules.'
                 )
             molecule_counts = {len(mols) for mols in batch}
-            if molecule_counts != {self.number_of_molecules}:
+            shared_single_molecule = (
+                has_shared_multi_molecule_encoder and molecule_counts == {1}
+            )
+            expected_molecule_count = (
+                1 if shared_single_molecule else self.number_of_molecules
+            )
+            if molecule_counts != {expected_molecule_count}:
                 raise ValueError(
                     'Every MPN datapoint must contain exactly '
-                    f'{self.number_of_molecules} molecule(s); got counts '
+                    f'{expected_molecule_count} molecule(s); got counts '
                     f'{sorted(molecule_counts)}.'
                 )
             # Group first molecules, second molecules, etc for mol2graph
@@ -393,6 +415,16 @@ class MPN(nn.Module):
                 batch = [mol2graph(b) for b in batch]
         elif not all(isinstance(graph, BatchMolGraph) for graph in batch):
             raise ValueError('MPN graph batches must contain only BatchMolGraph objects.')
+        else:
+            shared_single_molecule = (
+                has_shared_multi_molecule_encoder and len(batch) == 1
+            )
+
+        encoders = (
+            (encoder_modules[0],)
+            if shared_single_molecule
+            else encoder_modules
+        )
 
         if self.use_input_features:
             if features_batch is None:
@@ -420,20 +452,20 @@ class MPN(nn.Module):
                 raise NotImplementedError('Atom descriptors are currently only supported with one molecule '
                                           'per input (i.e., number_of_molecules = 1).')
 
-            if len(self.encoder) != len(batch):
+            if len(encoders) != len(batch):
                 raise ValueError(
-                    f'Expected {len(self.encoder)} molecular graph batches but '
+                    f'Expected {len(encoders)} molecular graph batches but '
                     f'received {len(batch)}.'
                 )
-            encodings = [enc(ba, atom_descriptors_batch, bond_descriptors_batch) for enc, ba in zip(self.encoder, batch)]
+            encodings = [enc(ba, atom_descriptors_batch, bond_descriptors_batch) for enc, ba in zip(encoders, batch)]
         else:
             if not self.reaction_solvent:
-                if len(self.encoder) != len(batch):
+                if len(encoders) != len(batch):
                     raise ValueError(
-                        f'Expected {len(self.encoder)} molecular graph batches but '
+                        f'Expected {len(encoders)} molecular graph batches but '
                         f'received {len(batch)}.'
                     )
-                encodings = [enc(ba) for enc, ba in zip(self.encoder, batch)]
+                encodings = [enc(ba) for enc, ba in zip(encoders, batch)]
             else:
                 encodings = []
                 for ba in batch:

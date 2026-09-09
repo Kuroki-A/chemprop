@@ -15,7 +15,7 @@ from sklearn.metrics import average_precision_score
 pytest.importorskip("lightgbm")
 
 from chemprop.args import PredictArgs, TrainArgs
-from chemprop.data import MoleculeDatapoint, MoleculeDataset
+from chemprop.data import MoleculeDatapoint, MoleculeDataset, StandardScaler
 from chemprop.train.make_predictions import (
     _validate_ensemble_train_args,
     load_data,
@@ -31,6 +31,7 @@ from chemprop.train.run_training_lgbm import (
     encode_lgbm_features,
     evaluate_lgbm_predictions,
     predict_task_boosters,
+    run_training_lgbm,
     train_task_boosters,
 )
 from chemprop.train.metrics import prc_auc
@@ -197,6 +198,13 @@ def test_lgbm_regression_bundle_fresh_process_round_trip_and_empty_input(
     val_data = _molecule_dataset(SMILES[16:20], targets[16:20])
     test_data = _molecule_dataset(SMILES[20:], targets[20:])
 
+    raw_val_targets = np.asarray(val_data.targets(), dtype=float)
+    features_scaler = train_data.normalize_features(replace_nan_token=0)
+    val_data.normalize_features(features_scaler)
+    test_data.normalize_features(features_scaler)
+    scaler = train_data.normalize_targets()
+    val_data.set_targets(scaler.transform(raw_val_targets).tolist())
+
     encoder = build_frozen_lgbm_encoder(args)
     train_features = encode_lgbm_features(encoder, train_data, 8, 0)
     val_features = encode_lgbm_features(encoder, val_data, 8, 0)
@@ -215,12 +223,21 @@ def test_lgbm_regression_bundle_fresh_process_round_trip_and_empty_input(
             val_targets,
             seed=17 + model_index,
         )
-        member_predictions.append(predict_task_boosters(boosters, test_features))
+        member_predictions.append(
+            np.asarray(
+                scaler.inverse_transform(
+                    predict_task_boosters(boosters, test_features)
+                ),
+                dtype=float,
+            )
+        )
         checkpoint_path = tmp_path / f"model_{model_index}.pkl"
         saved_path = save_checkpoint_lgbm(
             str(checkpoint_path),
             encoder,
             boosters,
+            scaler=scaler,
+            features_scaler=features_scaler,
             args=args,
             model_index=model_index,
             seed=17 + model_index,
@@ -234,7 +251,12 @@ def test_lgbm_regression_bundle_fresh_process_round_trip_and_empty_input(
     reloaded_features = encode_lgbm_features(reloaded.encoder, test_data, 8, 0)
     np.testing.assert_array_equal(reloaded_features, test_features)
     np.testing.assert_allclose(
-        predict_task_boosters(reloaded.task_boosters, reloaded_features),
+        np.asarray(
+            reloaded.scalers[0].inverse_transform(
+                predict_task_boosters(reloaded.task_boosters, reloaded_features)
+            ),
+            dtype=float,
+        ),
         member_predictions[0],
         rtol=0,
         atol=0,
@@ -248,6 +270,114 @@ def test_lgbm_regression_bundle_fresh_process_round_trip_and_empty_input(
         pickle.dump(corrupted_bundle, checkpoint_file)
     with pytest.raises(LightGBMCheckpointError, match="metadata"):
         load_checkpoint_lgbm(str(corrupted_path))
+
+    original_bundle_bytes = Path(checkpoint_paths[0]).read_bytes()
+    corruptions = [
+        (
+            "boolean_version",
+            lambda value: value.__setitem__("version", True),
+            "Unsupported LightGBM bundle version",
+        ),
+        (
+            "missing_target_scaler",
+            lambda value: value["scalers"].__setitem__("data", None),
+            "target data scaler.*missing",
+        ),
+        (
+            "missing_feature_scaler",
+            lambda value: value["scalers"].__setitem__("features", None),
+            "molecular feature scaler.*missing",
+        ),
+        (
+            "feature_scaler_width",
+            lambda value: value["scalers"]["features"].__setitem__(
+                "means", value["scalers"]["features"]["means"][:-1]
+            ),
+            "molecular feature scaler.*parameter widths",
+        ),
+        (
+            "feature_scaler_zero_std",
+            lambda value: value["scalers"]["features"]["stds"].__setitem__(0, 0),
+            "molecular feature scaler.*positive",
+        ),
+        (
+            "unexpected_atom_scaler",
+            lambda value: value["scalers"].__setitem__(
+                "atom_descriptor", {"means": np.zeros(1), "stds": np.ones(1)}
+            ),
+            "unexpected atom descriptor scaler",
+        ),
+        (
+            "booster_count",
+            lambda value: value.__setitem__("task_boosters", []),
+            "one LightGBM Booster per task",
+        ),
+        (
+            "booster_objective",
+            lambda value: value["task_boosters"][0].params.__setitem__(
+                "objective", "binary"
+            ),
+            "objective.*expected 'regression'",
+        ),
+        (
+            "encoded_width",
+            lambda value: setattr(
+                value["args"], "features_size", value["args"].features_size + 1
+            ),
+            "Booster feature width.*expected encoded width",
+        ),
+        (
+            "metadata_width",
+            lambda value: value["metadata"].__setitem__(
+                "encoded_feature_width", value["metadata"]["encoded_feature_width"] + 1
+            ),
+            "metadata encoded feature width",
+        ),
+        (
+            "metadata_missing_seed",
+            lambda value: value["metadata"].pop("seed"),
+            "invalid or incomplete metadata",
+        ),
+        (
+            "metadata_bad_index",
+            lambda value: value["metadata"].__setitem__("model_index", True),
+            "invalid model index or seed",
+        ),
+        (
+            "encoder_state",
+            lambda value: value.__setitem__(
+                "encoder_state_dict", {"unexpected": np.asarray([1.0])}
+            ),
+            "invalid MPN state",
+        ),
+    ]
+    for corruption_name, corrupt, message in corruptions:
+        bundle = pickle.loads(original_bundle_bytes)
+        corrupt(bundle)
+        corruption_path = tmp_path / f"corrupted_{corruption_name}.pkl"
+        with corruption_path.open("wb") as checkpoint_file:
+            pickle.dump(bundle, checkpoint_file)
+        with pytest.raises(LightGBMCheckpointError, match=message):
+            load_checkpoint_lgbm(str(corruption_path))
+
+    # ``encoded_feature_width`` was added as redundant metadata without
+    # changing version 1, so already-created version-1 bundles remain usable;
+    # their args, scaler widths, and Booster widths still cross-validate it.
+    earlier_v1_bundle = pickle.loads(original_bundle_bytes)
+    earlier_v1_bundle["metadata"].pop("encoded_feature_width")
+    earlier_v1_path = tmp_path / "earlier_v1_bundle.pkl"
+    with earlier_v1_path.open("wb") as checkpoint_file:
+        pickle.dump(earlier_v1_bundle, checkpoint_file)
+    assert load_checkpoint_lgbm(str(earlier_v1_path)).task_names == task_names
+
+    with pytest.raises(ValueError, match="target data scaler.*missing"):
+        save_checkpoint_lgbm(
+            str(tmp_path / "missing_regression_scaler.pkl"),
+            encoder,
+            boosters,
+            features_scaler=features_scaler,
+            args=args,
+        )
 
     test_path = tmp_path / "test.csv"
     with test_path.open("w", newline="") as file:
@@ -413,6 +543,119 @@ def test_lgbm_classification_multitask_missing_targets_and_seed_reproducibility(
         )
 
 
+def test_lgbm_classification_bundle_scaler_contract(tmp_path: Path):
+    args = _training_args(tmp_path, "classification", ["active"])
+    args.features_size = 3
+    args.features_generator = None
+    args.features_path = [str(tmp_path / "external_features.npz")]
+    args.lgbm_num_boost_round = 4
+    args.lgbm_early_stopping_rounds = 0
+
+    train_features = np.arange(36, dtype=float).reshape(12, 3)
+    val_features = np.arange(18, dtype=float).reshape(6, 3)
+    features_scaler = StandardScaler(replace_nan_token=0).fit(train_features)
+    scaled_train_features = features_scaler.transform(train_features)
+    scaled_val_features = features_scaler.transform(val_features)
+    train_targets = (np.arange(12) % 2).reshape(-1, 1)
+    val_targets = (np.arange(6) % 2).reshape(-1, 1)
+    boosters = train_task_boosters(
+        args,
+        scaled_train_features,
+        train_targets,
+        scaled_val_features,
+        val_targets,
+        seed=3,
+    )
+    encoder = build_frozen_lgbm_encoder(args)
+    checkpoint_path = tmp_path / "classification.pkl"
+    save_checkpoint_lgbm(
+        str(checkpoint_path),
+        encoder,
+        boosters,
+        features_scaler=features_scaler,
+        args=args,
+    )
+    loaded = load_checkpoint_lgbm(str(checkpoint_path))
+    assert loaded.scalers[0] is None
+    assert loaded.scalers[1] is not None
+
+    invalid_target_scaler = StandardScaler().fit(train_targets)
+    with pytest.raises(ValueError, match="target data scaler.*disable"):
+        save_checkpoint_lgbm(
+            str(tmp_path / "classification_with_target_scaler.pkl"),
+            encoder,
+            boosters,
+            scaler=invalid_target_scaler,
+            features_scaler=features_scaler,
+            args=args,
+        )
+    with pytest.raises(ValueError, match="molecular feature scaler.*missing"):
+        save_checkpoint_lgbm(
+            str(tmp_path / "classification_without_feature_scaler.pkl"),
+            encoder,
+            boosters,
+            args=args,
+        )
+
+    # Unscaled inputs are also a valid, distinct contract (for example with
+    # rdkit_2d_normalized); in that case a feature scaler must be absent.
+    args.features_scaling = False
+    unscaled_boosters = train_task_boosters(
+        args,
+        train_features,
+        train_targets,
+        val_features,
+        val_targets,
+        seed=4,
+    )
+    unscaled_encoder = build_frozen_lgbm_encoder(args)
+    unscaled_path = tmp_path / "classification_unscaled.pkl"
+    save_checkpoint_lgbm(
+        str(unscaled_path),
+        unscaled_encoder,
+        unscaled_boosters,
+        args=args,
+    )
+    assert load_checkpoint_lgbm(str(unscaled_path)).scalers[1] is None
+    with pytest.raises(ValueError, match="molecular feature scaler.*disable"):
+        save_checkpoint_lgbm(
+            str(tmp_path / "unscaled_with_feature_scaler.pkl"),
+            unscaled_encoder,
+            unscaled_boosters,
+            features_scaler=features_scaler,
+            args=args,
+        )
+
+
+def test_lgbm_training_writes_a_self_consistent_regression_bundle(tmp_path: Path):
+    args = _training_args(tmp_path, "regression", ["target"])
+    args.save_dir = str(tmp_path / "training")
+    args.split_sizes = [0.7, 0.15, 0.15]
+    args.lgbm_num_boost_round = 4
+    args.lgbm_early_stopping_rounds = 0
+    data = _molecule_dataset(
+        SMILES,
+        [[np.sin(index / 3)] for index in range(len(SMILES))],
+    )
+
+    validation_scores, test_scores = run_training_lgbm(
+        args=args,
+        data=data,
+        fold_num=0,
+    )
+
+    assert set(validation_scores) == {"rmse"}
+    assert set(test_scores) == {"rmse"}
+    bundle = load_checkpoint_lgbm(
+        str(Path(args.save_dir) / "model_0" / "model.pkl")
+    )
+    assert bundle.scalers[0] is not None
+    assert bundle.scalers[0].means.shape == (1,)
+    assert bundle.scalers[1] is not None
+    assert bundle.scalers[1].means.shape == (args.features_size,)
+    assert bundle.task_boosters[0].num_feature() == args.features_size
+
+
 @pytest.mark.parametrize("metric", ["auc", "prc-auc"])
 def test_lgbm_rank_metric_does_not_early_stop_on_single_class_validation(metric):
     rng = np.random.default_rng(12)
@@ -576,6 +819,11 @@ def test_lgbm_multiple_metrics_preserve_task_positions_and_reject_legacy(tmp_pat
         pickle.dump({"legacy": "raw Booster had no encoder state"}, file)
     with pytest.raises(LightGBMCheckpointError, match="legacy raw-Booster"):
         load_checkpoint_lgbm(str(legacy_path))
+
+    corrupt_pickle_path = tmp_path / "corrupt.pkl"
+    corrupt_pickle_path.write_bytes(b"\x80\xff")
+    with pytest.raises(LightGBMCheckpointError, match="Could not read"):
+        load_checkpoint_lgbm(str(corrupt_pickle_path))
 
 
 def test_ensemble_rejects_same_width_but_different_feature_schema():

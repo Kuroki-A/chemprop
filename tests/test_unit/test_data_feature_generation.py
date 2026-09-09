@@ -2,6 +2,7 @@
 
 import inspect
 import json
+import weakref
 
 import numpy as np
 import pandas as pd
@@ -18,10 +19,13 @@ from chemprop.data import (
 )
 from chemprop.data.data import (
     SMILES_TO_GRAPH,
+    cache_mol,
     generate_features_for_smiles_batch,
     make_mols,
+    set_cache_mol,
 )
 from chemprop.data.utils import (
+    _feature_manifest_schema,
     _ordered_smiles_sha256,
     get_data as get_data_function,
 )
@@ -191,6 +195,28 @@ def test_datapoint_replaces_nan_in_every_feature_input():
     assert datapoint.atom_descriptors[0, 0] == 0
     assert datapoint.bond_features[0, 0] == 0
     assert datapoint.bond_descriptors[0, 0] == 0
+
+
+def test_precomputed_generated_features_are_not_copied_when_already_valid():
+    features = np.array([1.0, 2.0], dtype=np.float32)
+
+    datapoint = MoleculeDatapoint(
+        ['CC'],
+        features=features,
+        features_generator=['_test_selected_features'],
+        features_generator_precomputed=True,
+    )
+
+    assert datapoint.features is features
+
+
+def test_direct_feature_input_retains_historical_copy_semantics():
+    features = np.array([1.0, 2.0], dtype=np.float32)
+
+    datapoint = MoleculeDatapoint(['CC'], features=features)
+
+    assert datapoint.features is not features
+    np.testing.assert_array_equal(datapoint.features, features)
 
 
 def test_datapoint_rejects_non_numeric_feature_inputs():
@@ -389,6 +415,179 @@ def test_batch_duplicate_keys_are_computed_once_for_all_generators(monkeypatch):
     assert mol_to_smiles_calls == 3
 
 
+def test_builtin_batch_deduplicates_noncanonical_and_atom_mapped_smiles(monkeypatch):
+    empty_cache()
+    reset_featurization_parameters()
+    set_keeping_atom_map(True)
+    generator = feature_generators_module.get_features_generator('morgan')
+    original_batch_transform = generator.batch_transform
+    generated_batch_sizes = []
+
+    def counted_batch_transform(mols, **kwargs):
+        generated_batch_sizes.append(len(mols))
+        return original_batch_transform(mols, **kwargs)
+
+    monkeypatch.setattr(generator, 'batch_transform', counted_batch_transform)
+    try:
+        result = generate_features_for_smiles_batch(
+            [
+                ['CO'],
+                ['OC'],
+                ['[CH3:1][OH:2]'],
+                ['[OH:9][CH3:8]'],
+            ],
+            ['morgan'],
+        )
+
+        # All four strings describe methanol. Managed generators ignore atom
+        # ordering and atom-map identifiers, so only one vector is computed.
+        assert generated_batch_sizes == [1]
+        for row in result[1:]:
+            np.testing.assert_array_equal(row, result[0])
+    finally:
+        reset_featurization_parameters()
+        empty_cache()
+
+
+def test_custom_generator_retains_atom_order_preserving_deduplication():
+    generated_batch_sizes = []
+
+    def generator(mol, selected_feature_columns=None):
+        return np.array([mol.GetAtomWithIdx(0).GetAtomicNum()], dtype=np.int16)
+
+    def batch_transform(mols):
+        generated_batch_sizes.append(len(mols))
+        return [generator(mol) for mol in mols]
+
+    generator.batch_transform = batch_transform
+
+    result = generate_features_for_smiles_batch(
+        [['CO'], ['OC']],
+        ['_test_atom_order_generator'],
+        generator_overrides={'_test_atom_order_generator': generator},
+    )
+
+    assert generated_batch_sizes == [2]
+    assert [row.tolist() for row in result] == [[6], [8]]
+
+
+def test_batch_finalization_releases_source_rows_incrementally(monkeypatch):
+    """Final output allocation must not retain a second full feature matrix."""
+    source_references = []
+
+    def generator(_mol, selected_feature_columns=None):
+        pytest.fail('The native batch transform should be used.')
+
+    def batch_transform(mols):
+        rows = [
+            np.full(4096, index, dtype=np.float32)
+            for index in range(len(mols))
+        ]
+        source_references.extend(weakref.ref(row) for row in rows)
+        return rows
+
+    generator.batch_transform = batch_transform
+    generator.preferred_batch_size = 256
+
+    original_concatenate = np.concatenate
+    live_source_counts = []
+
+    def recording_concatenate(parts, *args, **kwargs):
+        live_source_counts.append(sum(ref() is not None for ref in source_references))
+        return original_concatenate(parts, *args, **kwargs)
+
+    monkeypatch.setattr('chemprop.data.data.np.concatenate', recording_concatenate)
+
+    result = generate_features_for_smiles_batch(
+        [['C'], ['CC'], ['CCC'], ['CO']],
+        ['_test_memory_generator'],
+        generator_overrides={'_test_memory_generator': generator},
+    )
+
+    assert live_source_counts == [4, 3, 2, 1]
+    assert all(ref() is None for ref in source_references)
+    assert [row.shape for row in result] == [(4096,)] * 4
+
+
+def test_batch_parsing_releases_unused_reaction_products_before_generation(monkeypatch):
+    empty_cache()
+    previous_cache_mol = cache_mol()
+    set_cache_mol(False)
+    product_references = []
+    original_make_mols = make_mols
+
+    def tracked_make_mols(*args, **kwargs):
+        mols = original_make_mols(*args, **kwargs)
+        product_references.extend(
+            weakref.ref(mol[1])
+            for mol in mols
+            if isinstance(mol, tuple) and mol[1] is not None
+        )
+        return mols
+
+    def generator(mol, selected_feature_columns=None):
+        return np.array([mol.GetNumHeavyAtoms()], dtype=np.int16)
+
+    def batch_transform(mols):
+        assert all(ref() is None for ref in product_references)
+        return [generator(mol) for mol in mols]
+
+    generator.batch_transform = batch_transform
+    monkeypatch.setattr('chemprop.data.data.make_mols', tracked_make_mols)
+    try:
+        result = generate_features_for_smiles_batch(
+            [['C>>CC'], ['C>>CCC'], ['C>>CO'], ['C>>CN']],
+            ['_test_reaction_memory_generator'],
+            generator_overrides={'_test_reaction_memory_generator': generator},
+            auto_detect_reactions=True,
+        )
+    finally:
+        set_cache_mol(previous_cache_mol)
+        empty_cache()
+
+    assert [row.tolist() for row in result] == [[1], [1], [1], [1]]
+
+
+def test_runtime_batching_chunks_unique_molecules_and_scatters_duplicates():
+    batch_sizes = []
+
+    def generator(_mol, selected_feature_columns=None):
+        pytest.fail('The native batch transform should be used.')
+
+    def batch_transform(mols):
+        batch_sizes.append(len(mols))
+        return [
+            np.array([mol.GetNumHeavyAtoms()], dtype=np.int16)
+            for mol in mols
+        ]
+
+    generator.batch_transform = batch_transform
+    generator.preferred_batch_size = 2
+    smiles = [
+        ['C', 'CC'],
+        ['CCC', 'C'],
+        ['CO', 'CN'],
+        ['CC', 'CO'],
+    ]
+
+    result = generate_features_for_smiles_batch(
+        smiles,
+        ['_test_chunked_generator'],
+        generator_overrides={'_test_chunked_generator': generator},
+    )
+
+    # Five unique atom-order-preserving molecules are generated in bounded
+    # native batches, then duplicates are restored in their original columns.
+    assert batch_sizes == [2, 2, 1]
+    assert [row.tolist() for row in result] == [
+        [1, 2],
+        [3, 1],
+        [2, 2],
+        [2, 2],
+    ]
+    assert all(row.dtype == np.int16 for row in result)
+
+
 def test_get_data_batches_duplicates_and_preserves_external_feature_alignment(tmp_path):
     global CALLS
     empty_cache()
@@ -501,14 +700,14 @@ def test_feature_source_metadata_uses_semantic_save_features_manifest(tmp_path):
         feature_path = tmp_path / f'{generator_name}.npz'
         np.savez_compressed(feature_path, features=values)
         manifest = {
-            'schema_version': 1,
+            'schema_version': 2,
             'generator': generator_name,
             'generator_config': {'example': generator_name},
             'versions': {'rdkit': 'test'},
             'feature_names': ['first', 'second'],
             'dimension': 2,
             'dtype': 'float32',
-            'implementation_sha256': generator_name * 8,
+            'semantic_revision': 1,
             # Operational and row-dependent fields must not become model
             # compatibility constraints.
             'input': {'data_sha256': generator_name},
@@ -533,7 +732,7 @@ def test_feature_source_metadata_uses_semantic_save_features_manifest(tmp_path):
             field: manifest[field]
             for field in (
                 'schema_version', 'generator', 'generator_config', 'versions',
-                'feature_names', 'dimension', 'dtype', 'implementation_sha256',
+                'feature_names', 'dimension', 'dtype', 'semantic_revision',
             )
         }
         assert 'input' not in source['feature_manifest']
@@ -542,6 +741,39 @@ def test_feature_source_metadata_uses_semantic_save_features_manifest(tmp_path):
     assert schemas[0]['dimension'] == schemas[1]['dimension'] == 2
     assert schemas[0]['dtype'] == schemas[1]['dtype'] == 'float32'
     assert schemas[0] != schemas[1]
+
+
+@pytest.mark.parametrize(
+    ('identity', 'error'),
+    [
+        ({}, 'exactly one'),
+        (
+            {'semantic_revision': 1, 'implementation_sha256': '0' * 64},
+            'exactly one',
+        ),
+        ({'semantic_revision': 0}, 'positive integer'),
+        ({'implementation_sha256': 'z' * 64}, 'hexadecimal string'),
+    ],
+)
+def test_v2_feature_manifest_requires_one_valid_generator_identity(
+    tmp_path, identity, error,
+):
+    feature_path = tmp_path / 'features.npz'
+    manifest = {
+        'schema_version': 2,
+        'generator': 'test',
+        'generator_config': {},
+        'versions': {},
+        'feature_names': ['value'],
+        'dimension': 1,
+        'dtype': 'float64',
+        **identity,
+    }
+
+    with pytest.raises(ValueError, match=error):
+        _feature_manifest_schema(
+            str(feature_path), np.asarray([[1.0]]), manifest=manifest,
+        )
 
 
 def test_empty_save_features_archive_recovers_width_from_complete_manifest(tmp_path):

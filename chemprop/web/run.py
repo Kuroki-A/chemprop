@@ -22,7 +22,7 @@ class WebArgs(Tap):
     debug: bool = False  # Whether to run in debug mode
     demo: bool = False  # Display only demo features
     initdb: bool = False  # Initialize Database
-    root_folder: str = None  # Root folder where web data and checkpoints will be saved (defaults to chemprop/web/app)
+    root_folder: str = None  # Root folder for Web state (defaults to ~/.chemprop-web or CHEMPROP_WEB_ROOT)
     allow_remote: bool = False  # Allow non-loopback clients (requires deployment-layer authentication)
     allow_checkpoint_uploads: bool = False  # Trust and load uploaded pickle-based PyTorch checkpoints
 
@@ -43,9 +43,9 @@ def run_web(args: WebArgs) -> None:
         root_folder=args.root_folder,
         create_folders=True
     )
-    clear_temp_folder(app=app)
     if args.allow_remote:
         validate_web_storage_config(app)
+    clear_temp_folder(app=app)
 
     db.init_app(app)
 

@@ -647,13 +647,28 @@ def predict():
 
     if not preds:
         return render_predict(errors=['No SMILES strings given'])
-    invalid_smiles_count = sum(pred is None for pred in preds)
+    def is_invalid_prediction(prediction) -> bool:
+        if prediction is None:
+            return True
+        if isinstance(prediction, (list, tuple, np.ndarray)):
+            values = np.asarray(prediction, dtype=object).reshape(-1).tolist()
+            return bool(values) and all(
+                isinstance(value, str) and value == 'Invalid SMILES'
+                for value in values
+            )
+        return False
+
+    invalid_rows = [is_invalid_prediction(pred) for pred in preds]
+    invalid_smiles_count = sum(invalid_rows)
     if invalid_smiles_count == len(preds):
         return render_predict(errors=['All SMILES are invalid'])
 
     # Replace invalid smiles with message
     invalid_smiles_warning = 'Invalid SMILES String'
-    preds = [pred if pred is not None else [invalid_smiles_warning] * num_tasks for pred in preds]
+    preds = [
+        pred if not invalid else [invalid_smiles_warning] * num_tasks
+        for pred, invalid in zip(preds, invalid_rows)
+    ]
 
     return render_predict(predicted=True,
                           smiles=smiles,

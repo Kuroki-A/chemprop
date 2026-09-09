@@ -39,6 +39,11 @@ uploads.
 The configured state directory contains the checkpoint-selection database and
 pickle-based model files. Remote mode therefore requires that it is owned by
 the service account and private (mode ``0700``).
+The default state root is :code:`~/.chemprop-web`, or
+:code:`CHEMPROP_WEB_ROOT` when that environment variable is set. Mutable state
+is no longer written below the source checkout. When upgrading an old checkout,
+copy only trusted data/checkpoints to the new private root or pass the old
+location explicitly with :code:`--root_folder` after securing it.
 
 Training progress and prediction downloads use legacy process-local state.
 Run exactly one Gunicorn worker and one thread; this interface is not a
@@ -59,7 +64,7 @@ extras can add it with:
 
 .. code-block::
 
-   pip install gunicorn
+   python -m pip install -e ".[web]"
 
 For local-only use, bind explicitly to loopback:
 
@@ -72,10 +77,10 @@ For an HTTPS reverse proxy, opt into authenticated remote mode explicitly:
 
 .. code-block::
 
-   install -d -m 700 "$HOME/.local/share/chemprop-web"
+   install -d -m 700 "$HOME/.chemprop-web"
    CHEMPROP_WEB_PASSWORD='...' CHEMPROP_WEB_SECRET_KEY='...' \
      gunicorn --workers 1 --threads 1 --bind 127.0.0.1:5000 \
-     "chemprop.web.wsgi:build_app(allow_remote=True, root_folder='$HOME/.local/share/chemprop-web')"
+     "chemprop.web.wsgi:build_app(allow_remote=True, root_folder='$HOME/.chemprop-web')"
 
 Generate independent random values rather than reusing another service's
 password. For example, :code:`python -c "import secrets; print(secrets.token_hex(32))"`

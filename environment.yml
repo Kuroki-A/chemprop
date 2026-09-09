@@ -17,8 +17,8 @@ channels:
 dependencies:
   - python=3.10
   - pip>=25,<27
-  - setuptools>=78,<82
-  - wheel>=0.45,<0.46
+  - setuptools>=84,<85
+  - wheel>=0.48,<0.49
   # PaDEL-Descriptor is a Java application; keep its runtime in the environment.
   - openjdk=17
   - pip:
@@ -59,6 +59,8 @@ dependencies:
       - padelpy==0.1.17
       - map4==1.1.3
       - mhfp==1.9.6
+      - pmapper==1.1.3
+      - selfies==2.2.0
       - h5py==3.16.0
 
       # Test, documentation, and notebook tooling.

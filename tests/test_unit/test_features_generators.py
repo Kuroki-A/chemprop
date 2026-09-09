@@ -83,6 +83,103 @@ class TestRDKitFeatureGenerators(unittest.TestCase):
             generators.erg_float_features_generator(self.mol),
         ))
 
+    def test_native_rdkit_fingerprint_batches_match_scalar(self):
+        molecules = [
+            ASPIRIN,
+            "CCO",
+            Chem.AddHs(Chem.MolFromSmiles("C")),
+            Chem.MolFromSmiles("[CH3:7][OH:9]"),
+        ]
+        cases = {
+            "morgan": "bit",
+            "morgan_count": "count",
+            "rdkit": "bit",
+            "atompair": "bit",
+        }
+        for name, prefix in cases.items():
+            with self.subTest(generator=name):
+                generator = generators.get_features_generator(name)
+                scalar = np.stack([generator(molecule) for molecule in molecules])
+                batch = np.stack(generators.generate_features_batch(
+                    name, molecules, batch_size=2,
+                ))
+                np.testing.assert_array_equal(batch, scalar)
+                self.assertEqual(batch.dtype, scalar.dtype)
+
+                selected = [f"{prefix}_17", f"{prefix}_3", f"{prefix}_17"]
+                scalar_selected = np.stack([
+                    generator(
+                        molecule, selected_feature_columns=selected,
+                    )
+                    for molecule in molecules
+                ])
+                batch_selected = np.stack(generators.generate_features_batch(
+                    name, molecules, selected, batch_size=3,
+                ))
+                np.testing.assert_array_equal(batch_selected, scalar_selected)
+                self.assertEqual(batch_selected.dtype, scalar_selected.dtype)
+
+                empty = generator.batch_transform(
+                    [], selected_feature_columns=selected,
+                )
+                self.assertEqual(empty.shape, (0, len(selected)))
+                self.assertEqual(empty.dtype, scalar.dtype)
+
+    def test_native_rdkit_fingerprint_batches_preserve_dataset_policy(self):
+        from chemprop.data.data import generate_features_for_smiles_batch
+
+        smiles_rows = [
+            ["[CH3:1][OH:2]>>[CH3:1][Cl:2]"],
+            ["[H][H]"],
+            ["OCC"],
+        ]
+        cases = {
+            "morgan": "bit",
+            "morgan_count": "count",
+            "rdkit": "bit",
+            "atompair": "bit",
+        }
+        for name, prefix in cases.items():
+            with self.subTest(generator=name):
+                generator = generators.get_features_generator(name)
+                selected = [f"{prefix}_17", f"{prefix}_3", f"{prefix}_17"]
+
+                def scalar_generator(molecule, selected_feature_columns=None):
+                    return generator(
+                        molecule,
+                        selected_feature_columns=selected_feature_columns,
+                    )
+
+                expected = generate_features_for_smiles_batch(
+                    smiles_rows,
+                    [name],
+                    selected_feature_columns={name: selected},
+                    generator_overrides={name: scalar_generator},
+                    auto_detect_reactions=True,
+                )
+                actual = generate_features_for_smiles_batch(
+                    smiles_rows,
+                    [name],
+                    selected_feature_columns={name: selected},
+                    auto_detect_reactions=True,
+                )
+                for expected_row, actual_row in zip(expected, actual):
+                    np.testing.assert_array_equal(actual_row, expected_row)
+                np.testing.assert_array_equal(actual[1], np.zeros(len(selected)))
+
+    def test_rdkit_batch_thread_count_is_affinity_aware_and_bounded(self):
+        with mock.patch.object(
+            generators.os, "sched_getaffinity", return_value=set(range(64)),
+        ):
+            self.assertEqual(generators._rdkit_fingerprint_batch_num_threads(256), 4)
+            self.assertEqual(generators._rdkit_fingerprint_batch_num_threads(3), 3)
+            self.assertEqual(generators._rdkit_fingerprint_batch_num_threads(1), 1)
+
+        with mock.patch.object(
+            generators.os, "sched_getaffinity", side_effect=OSError,
+        ), mock.patch.object(generators.os, "cpu_count", return_value=2):
+            self.assertEqual(generators._rdkit_fingerprint_batch_num_threads(256), 2)
+
     def test_fixed_fingerprints_honor_selected_columns(self):
         cases = {
             "morgan": ("bit", [17, 3, 17]),
@@ -151,9 +248,67 @@ class TestRDKitFeatureGenerators(unittest.TestCase):
             )
             self.assertEqual(len(first["generators"][0]["implementation_sha256"]), 64)
             self.assertEqual(len(second["generators"][0]["implementation_sha256"]), 64)
+            self.assertNotIn("semantic_revision", first["generators"][0])
+            self.assertNotIn("semantic_revision", second["generators"][0])
         finally:
             registry.pop("_callable_instance", None)
             registry.pop("_builtin_callable", None)
+
+    def test_builtin_metadata_uses_only_targeted_semantic_revisions(self):
+        with mock.patch.object(
+            generators,
+            "_features_generator_implementation_sha256",
+            side_effect=AssertionError("built-ins must not use source hashing"),
+        ):
+            first_morgan = generators.get_features_generators_metadata(["morgan"])
+            first_maccs = generators.get_features_generators_metadata(["maccs"])
+
+        self.assertEqual(
+            first_morgan["schema_version"],
+            generators.FEATURE_GENERATOR_METADATA_SCHEMA_VERSION,
+        )
+        self.assertEqual(first_morgan["generators"][0]["semantic_revision"], 1)
+        self.assertNotIn(
+            "implementation_sha256", first_morgan["generators"][0],
+        )
+
+        with mock.patch.dict(
+            generators._BUILTIN_FEATURES_GENERATOR_SEMANTIC_REVISIONS,
+            {"morgan": 2},
+        ):
+            changed_morgan = generators.get_features_generators_metadata(["morgan"])
+            unchanged_maccs = generators.get_features_generators_metadata(["maccs"])
+
+        self.assertNotEqual(first_morgan, changed_morgan)
+        self.assertEqual(first_maccs, unchanged_maccs)
+
+    def test_custom_replacement_of_builtin_name_uses_source_hash(self):
+        registry = generators.FEATURES_GENERATOR_REGISTRY
+        original = registry["morgan"]
+        self.assertTrue(generators.is_builtin_features_generator("morgan"))
+        self.assertTrue(
+            generators.is_builtin_features_generator("morgan", original)
+        )
+        self.assertFalse(generators.is_builtin_features_generator("not_registered"))
+
+        def plugin_replacement(mol, selected_feature_columns=None):
+            return np.asarray([1.0])
+
+        try:
+            generators.register_features_generator("morgan")(plugin_replacement)
+            self.assertFalse(generators.is_builtin_features_generator("morgan"))
+            self.assertFalse(
+                generators.is_builtin_features_generator(
+                    "morgan", plugin_replacement,
+                )
+            )
+            entry = generators.get_features_generators_metadata(
+                ["morgan"], total_dimension=1,
+            )["generators"][0]
+            self.assertEqual(len(entry["implementation_sha256"]), 64)
+            self.assertNotIn("semantic_revision", entry)
+        finally:
+            registry["morgan"] = original
 
     @unittest.skipUnless(importlib.util.find_spec("descriptastorus"), "descriptastorus is optional")
     def test_descriptor_shapes_and_selected_order(self):
@@ -202,6 +357,18 @@ class TestRDKitFeatureGenerators(unittest.TestCase):
             "rdkit_2d_normalized", smiles, descriptor_columns,
         ))
         np.testing.assert_array_equal(normalized_batch, normalized_scalar)
+
+    @unittest.skipUnless(importlib.util.find_spec("descriptastorus"), "descriptastorus is optional")
+    def test_normalized_descriptor_batch_matches_scalar_for_explicit_hydrogens(self):
+        explicit_h_mol = Chem.AddHs(Chem.MolFromSmiles("C"))
+        for name in (
+            "rdkit_2d_normalized",
+            "rdkit_2d_normalized_wo_fr",
+        ):
+            with self.subTest(generator=name):
+                scalar = generators.get_features_generator(name)(explicit_h_mol)
+                batch = generators.generate_features_batch(name, [explicit_h_mol])[0]
+                np.testing.assert_array_equal(batch, scalar)
 
     def test_every_registered_function_is_pickleable(self):
         for name, generator in generators.FEATURES_GENERATOR_REGISTRY.items():
@@ -620,6 +787,12 @@ class TestSaveFeaturesManifest(unittest.TestCase):
             self.assertEqual(manifest["storage"], "npz")
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(manifest["num_molecules_completed"], 2)
+            self.assertEqual(
+                manifest["schema_version"],
+                generators.FEATURE_GENERATOR_METADATA_SCHEMA_VERSION,
+            )
+            self.assertEqual(manifest["semantic_revision"], 1)
+            self.assertNotIn("implementation_sha256", manifest)
             self.assertEqual(len(manifest["feature_names"]), 2048)
             self.assertEqual(len(manifest["input"]["data_sha256"]), 64)
             self.assertEqual(len(manifest["input"]["ordered_smiles_sha256"]), 64)
@@ -658,7 +831,7 @@ class TestSaveFeaturesManifest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "data_sha256.*ordered_smiles_sha256"):
                 save_features_script.generate_and_save_features(args)
 
-    def test_resume_rejects_changed_generator_implementation(self):
+    def test_resume_rejects_changed_generator_semantic_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             data_path = os.path.join(directory, "molecules.csv")
             manifest_path = os.path.join(directory, "features.npz.manifest.json")
@@ -667,12 +840,35 @@ class TestSaveFeaturesManifest(unittest.TestCase):
             identity = save_features_script._input_identity(data_path, ["CCO"])
             expected = generators.get_features_generator_schema("morgan")
             manifest = dict(expected)
-            manifest["implementation_sha256"] = "0" * 64
+            manifest["semantic_revision"] += 1
             manifest["input"] = identity
             with open(manifest_path, "w", encoding="utf-8") as file:
                 json.dump(manifest, file)
 
-            with self.assertRaisesRegex(ValueError, "implementation_sha256"):
+            with self.assertRaisesRegex(ValueError, "semantic_revision"):
+                save_features_script._validate_resume_manifest(
+                    manifest_path, expected, identity,
+                )
+
+    def test_resume_explicitly_rejects_legacy_identity_schema_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_path = os.path.join(directory, "molecules.csv")
+            manifest_path = os.path.join(directory, "features.npz.manifest.json")
+            with open(data_path, "w", encoding="utf-8") as file:
+                file.write("smiles\nCCO\n")
+            identity = save_features_script._input_identity(data_path, ["CCO"])
+            expected = generators.get_features_generator_schema("morgan")
+            legacy_manifest = dict(expected)
+            legacy_manifest["schema_version"] = 1
+            legacy_manifest.pop("semantic_revision")
+            legacy_manifest["implementation_sha256"] = "0" * 64
+            legacy_manifest["input"] = identity
+            with open(manifest_path, "w", encoding="utf-8") as file:
+                json.dump(legacy_manifest, file)
+
+            with self.assertRaisesRegex(
+                ValueError, "legacy whole-module.*Use --restart once",
+            ):
                 save_features_script._validate_resume_manifest(
                     manifest_path, expected, identity,
                 )

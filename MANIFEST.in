@@ -1,7 +1,32 @@
 include LICENSE.txt
 include README.md
 include CHANGELOG.md
+include CITATIONS.bib
+include CONTRIBUTING.md
+include environment.yml
+include Dockerfile
+include .dockerignore
+include .readthedocs.yaml
+include fingerprint.py
+include hyperparameter_optimization.py
+include interpret.py
+include predict.py
+include sklearn_predict.py
+include sklearn_train.py
+include train.py
+include web.py
 include chemprop/py.typed
 include chemprop/web/app/schema.sql
 recursive-include chemprop/web/app/templates *.html
 recursive-include chemprop/web/app/static *
+recursive-include scripts *.py
+include docs/Makefile
+include docs/make.bat
+include docs/requirements.txt
+recursive-include docs/source *.py *.rst *.png
+recursive-include logo *.txt *.png *.svg
+
+# Unit and integration tests are run from the repository in CI. Avoid the
+# setuptools default which otherwise adds only tests/test_integration.py to
+# the source distribution and leaves a misleading, non-runnable test subset.
+prune tests

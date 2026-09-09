@@ -62,6 +62,11 @@ Our code supports several methods of splitting data into train, validation, and 
 
 **Separate val/test:** If you have separate data files you would like to use as the validation or test set, you can specify them with :code:`--separate_val_path <val_path>` and/or :code:`--separate_test_path <test_path>`.
 
+Externally supplied index and fold files are validated for integer type,
+range, duplicates, and train/validation/test overlap. Rows omitted by an
+external split are reported explicitly rather than silently included in
+another split.
+
 Note: By default, both random and scaffold split the data into 80% train, 10% validation, and 10% test. This can be changed with :code:`--split_sizes <train_frac> <val_frac> <test_frac>`. For example, the default setting is :code:`--split_sizes 0.8 0.1 0.1`. Both also involve a random component and can be seeded with :code:`--seed <seed>`. The default setting is :code:`--seed 0`.
 
 Cross validation
@@ -73,6 +78,18 @@ Ensembling
 ^^^^^^^^^^
 
 To train an ensemble, specify the number of models in the ensemble with :code:`--ensemble_size <n>`. The default is :code:`--ensemble_size 1`.
+
+Checkpoint-only evaluation
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+:code:`chemprop_train --test` skips optimization and re-evaluates supplied
+checkpoints on the configured validation and test splits. It reconstructs each
+saved architecture and uses the target/input scalers stored in the checkpoint;
+evaluation labels are never used to fit scalers. Architecture flags such as
+hidden size need not be repeated, but dataset type, ordered targets, molecule
+and reaction semantics, generated/external features, descriptors, and spectra
+settings must match. Ensemble members must also have compatible scaler state.
+:code:`--test` cannot be combined with :code:`--checkpoint_frzn`.
 
 LightGBM Heads
 ^^^^^^^^^^^^^^
@@ -107,6 +124,11 @@ classification. Checkpoint warm-starting and :code:`chemprop_hyperopt` are
 rejected explicitly; use the :code:`--lgbm_*` options for tuning.
 :code:`--target_weights` is rejected because each target is trained by an
 independent booster; row-wise :code:`--data_weights_path` remains supported.
+Reaction SMILES with a molecular generator and atom/bond descriptor inputs are
+also rejected because the features-only LightGBM representation would ignore
+chemically relevant inputs. Supply explicit reaction-aware molecule-level
+features instead. LightGBM does not implement uncertainty calibration,
+uncertainty methods, or uncertainty evaluation options.
 
 Hyperparameter Optimization
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -246,11 +268,11 @@ Similar to the molecule-level features, the atom-level descriptors and features 
 Bond-Level Features
 """""""""""""""""""
 
-Bond-level features can be provided in the same format as the atom-level features, using the option :code:`--bond_features_path /path/to/features`. The order of the features for each molecule must match the bond ordering in the RDKit molecule object.
+Bond-level features can be provided in the same format as the atom-level features, using the option :code:`--bond_descriptors_path /path/to/features`. The order of the features for each molecule must match the bond ordering in the RDKit molecule object.
 
 The bond-level features are concatenated with the bond feature vectors before the D-MPNN, such that they are used during message-passing. Alternatively, the user can overwrite the default bond features with the custom features using the option :code:`--overwrite_default_bond_features`.
 
-Similar to molecule-, and atom-level features, the bond-level features are scaled by default. This can be disabled with the option :code:`--no_bond_features_scaling`.
+Similar to molecule-, and atom-level features, the bond-level features are scaled by default. This can be disabled with the option :code:`--no_bond_descriptor_scaling`.
 
 Reaction
 ^^^^^^^^
@@ -266,7 +288,14 @@ An existing model, for example from training on a larger, lower quality dataset,
  * :code:`--checkpoint_dir <dir>` Directory where the model checkpoint(s) are saved (i.e. :code:`--save_dir` during training of the old model). This will walk the directory, and load all :code:`.pt` files it finds.
  * :code:`--checkpoint_path <path>` Path to a model checkpoint file (:code:`.pt` file).
 
-when training the new model. The model architecture of the new model should resemble the architecture of the old model - otherwise some or all parameters might not be loaded correctly. Please note that the old model is only used to initialize the parameters of the new model, but all parameters remain trainable (no frozen layers). Depending on the quality of the old model, the new model might only need a few epochs to train.
+when training the new model. Warm starts build the requested current
+architecture, require a complete compatible MPN encoder, and copy only
+shape-compatible non-encoder state; skipped readout entries are logged. All
+copied parameters remain trainable. Use :code:`--checkpoint_frzn` when the
+loaded encoder (and optionally leading FFN layers) must be frozen. Frozen
+transfer validates the complete mapping before modifying the model and rejects
+ambiguous combinations such as :code:`features_only`, incompatible shared
+encoders, and unsupported partial PReLU FFN freezing.
 
 Missing target values
 ^^^^^^^^^^^^^^^^^^^^^
@@ -277,6 +306,16 @@ In contrast, when using :code:`sklearn_train.py` (a utility script provided with
 
 Caching
 ^^^^^^^
+
+:code:`--use_cache` stores the fully loaded dataset in a content-addressed
+:code:`.chemprop_cache` directory. :code:`CHEMPROP_CACHE_DIR` selects another
+location. This cache is pickle-based trusted local data; its directory must be
+owned by the current user, private (mode ``0700``), and free of symbolic-link
+components. On POSIX, descriptor-relative no-follow access keeps validation,
+loading, and atomic replacement bound to the same directory even if a path is
+renamed concurrently. The cache key includes source content, feature
+configuration, and the relevant implementation identity, so stale entries are
+ignored.
 
 By default, the molecule objects created from each SMILES string are cached for all dataset sizes, and the graph objects created from each molecule object are cached for datasets up to 10000 molecules. If memory permits, you may use the keyword :code:`--cache_cutoff inf` to set this cutoff from 10000 to infinity to always keep the generated graphs in cache (or to another integer value for custom behavior). This may speed up training (depending on the dataset size, molecule size, number of epochs and GPU support), since the graphs do not need to be recreated each epoch, but increases memory usage considerably. Below the cutoff, graphs are created sequentially in the first epoch. Above the cutoff, graphs are created in parallel (on :code:`--num_workers <int>` workers) for each epoch. If training on a GPU, training without caching and creating graphs on the fly in parallel is often preferable. On CPU, training with caching if often preferable for medium-sized datasets and a very low number of CPUs. If a very large dataset causes memory issues, you might turn off caching even of the molecule objects via the commands :code:`--no_cache_mol` to reduce memory usage further.
    
@@ -306,6 +345,18 @@ or
    chemprop_predict --test_path data/tox21.csv --checkpoint_path tox21_checkpoints/fold_0/model_0/model.pt --preds_path tox21_preds.csv
 
 If installed from source, :code:`chemprop_predict` can be replaced with :code:`python predict.py`.
+
+Constrained atom/bond calibration
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For constrained atom/bond checkpoints, the prediction and uncertainty
+calibration datasets need separate, row-aligned constraint files. Supply both
+:code:`--constraints_path prediction_constraints.csv` and
+:code:`--calibration_constraints_path calibration_constraints.csv` whenever
+:code:`--calibration_path` is used. A missing counterpart, wrong task width,
+row-count mismatch, nonnumeric value, or nonfinite value is rejected. Atom/bond
+vectors written to prediction CSV files are JSON arrays; parse them with a JSON
+parser rather than Python-literal evaluation.
 
 Interpreting
 ^^^^^^^^^^^^
