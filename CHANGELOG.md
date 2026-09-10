@@ -15,6 +15,11 @@
 
 ### Changed
 
+- Removed the unavailable PyPI `map4==1.1.3` dependency. The `map4_v1_1`
+  generator now reproduces that release internally with the same length-based
+  shingle ordering and seed, while preserving existing checkpoint metadata.
+  GitHub Actions command blocks now fail immediately instead of allowing an
+  earlier dependency or strict-lint failure to be hidden by a later command.
 - Separate validation/test loading no longer inherits `--data_weights_path`.
   Documented that the complete weights file is normalized before filtering and
   splitting and that the retained training weights are not renormalized. A

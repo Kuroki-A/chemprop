@@ -69,9 +69,10 @@ Two deliberately distinct MAP4 generators are available:
   expected by Molfeat 0.11, including lexicographic atom-environment ordering.
   This is the recommended choice for compatibility with the original MAP4
   definition and Molfeat.
-* :code:`map4_v1_1` canonicalizes the molecule and uses the native
-  :code:`map4` 1.1.3 implementation and shingle ordering. It is provided for
-  explicit experiments and models trained with that exact named generator.
+* :code:`map4_v1_1` canonicalizes the molecule and reproduces the former native
+  :code:`map4` 1.1.3 implementation, length-based shingle ordering, and seed.
+  It is provided for explicit experiments and models trained with that exact
+  named generator.
 
 The two vectors are not bit-compatible. A model trained with one generator
 must be predicted with that same generator, and an offline feature archive
@@ -83,11 +84,11 @@ v1.0 command-line :code:`--clean-mols` behavior, Chemprop does not silently
 select only the largest fragment. The retained-fragment policy is recorded in
 feature and checkpoint metadata.
 
-The environment intentionally installs :code:`map4==1.1.3`, not the obsolete
-v1.0 package and its :code:`tmap` dependency. Chemprop implements only the
-needed folded v1.0 path directly with RDKit and MHFP, and exposes a compatibility
-class so Molfeat 0.11 can still import its fingerprint modules. The native
-package remains available to :code:`map4_v1_1`.
+The external :code:`map4` 1.1.3 distribution is no longer published on PyPI.
+Chemprop therefore implements both needed folded definitions directly with
+RDKit and MHFP. The v1.1 path was checked bit-for-bit against the former 1.1.3
+package, requires no external :code:`map4` installation, and retains 1.1.3 in
+checkpoint metadata as the compatible algorithm revision.
 
 For example, to use the native 1.1.3 behavior for training and prediction:
 

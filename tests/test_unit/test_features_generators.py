@@ -380,9 +380,8 @@ class TestMap4FeatureGenerators(unittest.TestCase):
     """Locks down the intentionally different MAP4 v1.0 and v1.1 formats."""
 
     _legacy_dependencies_available = importlib.util.find_spec("mhfp") is not None
-    _native_dependencies_available = (
-        _legacy_dependencies_available and importlib.util.find_spec("map4") is not None
-    )
+    _native_dependencies_available = _legacy_dependencies_available
+    _external_native_available = importlib.util.find_spec("map4") is not None
 
     @classmethod
     def _available_names(cls):
@@ -427,6 +426,10 @@ class TestMap4FeatureGenerators(unittest.TestCase):
         self.assertEqual(native.shape, (2048,))
         self.assertEqual(native.dtype, np.dtype("float64"))
         self.assertTrue(np.isfinite(native).all())
+        np.testing.assert_array_equal(
+            np.flatnonzero(native),
+            [326, 333, 425, 501, 1625, 1922],
+        )
 
     @unittest.skipUnless(
         _legacy_dependencies_available, "The legacy MAP4 dependency is optional",
@@ -466,7 +469,16 @@ class TestMap4FeatureGenerators(unittest.TestCase):
     @unittest.skipUnless(
         _native_dependencies_available, "The native MAP4 dependencies are optional",
     )
-    def test_formats_are_distinct_and_v1_1_matches_native_map4(self):
+    def test_formats_are_distinct(self):
+        source = Chem.MolFromSmiles(ASPIRIN)
+        legacy = generators.get_features_generator("map4")(source)
+        native = generators.get_features_generator("map4_v1_1")(source)
+        self.assertFalse(np.array_equal(legacy, native))
+
+    @unittest.skipUnless(
+        _external_native_available, "The former external map4 package is unavailable",
+    )
+    def test_bundled_v1_1_matches_former_external_map4(self):
         from map4 import MAP4
 
         source = Chem.MolFromSmiles(ASPIRIN)
@@ -482,10 +494,7 @@ class TestMap4FeatureGenerators(unittest.TestCase):
             ).calculate(canonical_mol),
             dtype=float,
         )
-
-        legacy = generators.get_features_generator("map4")(source)
         native = generators.get_features_generator("map4_v1_1")(source)
-        self.assertFalse(np.array_equal(legacy, native))
         np.testing.assert_array_equal(native, expected_native)
 
     @unittest.skipUnless(
@@ -520,8 +529,8 @@ class TestMap4FeatureGenerators(unittest.TestCase):
                 )
 
     @unittest.skipUnless(
-        _native_dependencies_available and importlib.util.find_spec("molfeat") is not None,
-        "MAP4 and Molfeat feature dependencies are optional",
+        _external_native_available and importlib.util.find_spec("molfeat") is not None,
+        "The former external MAP4 package and Molfeat are optional",
     )
     def test_fresh_process_dependency_boundary_and_pretrained_import_patch(self):
         code = """
@@ -538,6 +547,28 @@ except ImportError:
     pass
 import map4
 assert hasattr(map4, 'MAP4Calculator')
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=os.getcwd(),
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    @unittest.skipUnless(
+        _native_dependencies_available, "The MHFP dependency is optional",
+    )
+    def test_bundled_v1_1_does_not_import_external_map4(self):
+        code = """
+import sys
+from chemprop.features.features_generators import map4_v1_1_features_generator
+map4_v1_1_features_generator('CCO')
+assert 'map4' not in sys.modules
 """
         result = subprocess.run(
             [sys.executable, "-c", code],
@@ -724,9 +755,9 @@ class TestBatchCacheAndSchema(unittest.TestCase):
             self.assertEqual(scalar.shape, (2048,))
             np.testing.assert_array_equal(scalar, batch[0])
 
-        if importlib.util.find_spec("map4") is None:
-            with self.assertRaisesRegex(ImportError, "map4>=1.1"):
-                generators.map4_v1_1_features_generator("CCO")
+        if importlib.util.find_spec("mhfp") is not None:
+            native = generators.map4_v1_1_features_generator("CCO")
+            self.assertEqual(native.shape, (2048,))
 
         selected = ["Desc:0", "Desc:17"]
         selected_scalar = generators.pharmacophore_2d_features_generator(

@@ -540,12 +540,13 @@ molecule and reproduces the folded 2,048-bit [MAP4 v1.0
 algorithm](https://github.com/reymond-group/map4/tree/v1.0) expected by Molfeat
 0.11, including lexicographic atom-environment ordering. This implementation
 uses RDKit and MHFP directly; the obsolete MAP4 v1.0 package and its `tmap`
-dependency are not installed. The environment deliberately retains
-`map4==1.1.3`, and a compatibility adapter supplies the old class name needed
-when Molfeat imports its fingerprint modules.
+dependency are not installed.
 
-`map4_v1_1` also canonicalizes each molecule, but calls the native `map4`
-1.1.3 implementation with its length-based shingle ordering. The two
+`map4_v1_1` also canonicalizes each molecule and reproduces the former native
+`map4` 1.1.3 implementation with its length-based shingle ordering and seed.
+The 1.1.3 distribution is no longer published on PyPI, so Chemprop provides
+this small compatible implementation using the same RDKit and MHFP primitives;
+no external `map4` installation is required. The two
 generators are **not bit compatible**; neither one should be substituted for
 the other after a model has been trained or an offline feature file has been
 generated. Both Chemprop generators retain every disconnected input fragment;
