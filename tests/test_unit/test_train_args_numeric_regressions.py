@@ -171,6 +171,7 @@ def _parse_hyperopt_args(*extra_args):
         (['--num_iters', '0'], 'num_iters'),
         (['--num_iters', '2', '--startup_random_iters', '-1'], 'startup_random_iters'),
         (['--num_iters', '2', '--startup_random_iters', '3'], 'startup_random_iters'),
+        (['--epochs', '0'], 'epochs.*greater than 0'),
     ],
 )
 def test_hyperopt_args_reject_invalid_iteration_settings(flags, message):

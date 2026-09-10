@@ -7,7 +7,7 @@ import ctypes
 from logging import Logger
 import pickle
 from random import Random
-from typing import TYPE_CHECKING, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, TYPE_CHECKING, List, Optional, Sequence, Set, Tuple, Union
 import os
 import json
 from numbers import Integral
@@ -955,6 +955,17 @@ def get_invalid_smiles_from_list(smiles: List[List[str]], reaction: bool = False
     return invalid_smiles
 
 
+def _target_contains_observed_value(target: Any) -> bool:
+    """Returns whether a scalar or nested atom/bond target has an observation."""
+    if target is None:
+        return False
+    if isinstance(target, np.ndarray):
+        return any(_target_contains_observed_value(value) for value in target.flat)
+    if isinstance(target, (list, tuple)):
+        return any(_target_contains_observed_value(value) for value in target)
+    return True
+
+
 def get_data(path: str,
              smiles_columns: Union[str, List[str]] = None,
              target_columns: List[str] = None,
@@ -974,7 +985,9 @@ def get_data(path: str,
              loss_function: str = None,
              skip_none_targets: bool = False,
              selected_features_path: str = None,
-             constraints_target_columns: List[str] = None) -> MoleculeDataset:
+             constraints_target_columns: List[str] = None,
+             use_args_data_weights: bool = True,
+             expand_quantile_targets: bool = True) -> MoleculeDataset:
     """
     Gets SMILES and target values from a CSV file.
 
@@ -987,6 +1000,17 @@ def get_data(path: str,
     :param skip_invalid_smiles: Whether to skip and filter out invalid smiles using :func:`filter_invalid_smiles`.
     :param args: Arguments, either :class:`~chemprop.args.TrainArgs` or :class:`~chemprop.args.PredictArgs`.
     :param data_weights_path: A path to a file containing weights for each molecule in the loss function.
+    :param use_args_data_weights: Whether a missing explicit
+                                  :code:`data_weights_path` falls back to
+                                  :code:`args.data_weights_path`. Disable this
+                                  when loading separate validation/test files;
+                                  row weights belong only to the primary
+                                  training file.
+    :param expand_quantile_targets: Whether targets for
+                                    :code:`quantile_interval` models are duplicated
+                                    into lower/upper training targets. Disable this
+                                    when loading observed targets for prediction-time
+                                    calibration or uncertainty evaluation.
     :param features_path: A list of paths to files containing features. If provided, it is used
                           in place of :code:`args.features_path`.
     :param features_generator: A list of features generators to use. If provided, it is used
@@ -1026,12 +1050,12 @@ def get_data(path: str,
         bond_descriptors_path = bond_descriptors_path if bond_descriptors_path is not None \
             else args.bond_descriptors_path
         constraints_path = constraints_path if constraints_path is not None else args.constraints_path
-        data_weights_path = data_weights_path if data_weights_path is not None \
-            else getattr(args, 'data_weights_path', None)
+        if data_weights_path is None and use_args_data_weights:
+            data_weights_path = getattr(args, 'data_weights_path', None)
         max_data_size = max_data_size if max_data_size is not None else args.max_data_size
         loss_function = loss_function if loss_function is not None else args.loss_function
 
-    if target_columns is not None:
+    if target_columns is not None and expand_quantile_targets:
         target_columns = _expand_quantile_task_names(target_columns, loss_function)
 
     if isinstance(smiles_columns, str) or smiles_columns is None:
@@ -1196,7 +1220,7 @@ def get_data(path: str,
             smiles_columns=smiles_columns,
             target_columns=target_columns,
             ignore_columns=ignore_columns,
-            loss_function=loss_function,
+            loss_function=(loss_function if expand_quantile_targets else None),
         )
 
     # Load constraints
@@ -1290,8 +1314,12 @@ def get_data(path: str,
                 else:
                     targets.append(float(value))
 
-            # Check whether all targets are None and skip if so
-            if skip_none_targets and all(x is None for x in targets):
+            # Skip rows with no observed molecule, atom, or bond target. Atom
+            # and bond targets are arrays, so checking only the outer object
+            # would incorrectly retain arrays whose every element is None.
+            if skip_none_targets and not any(
+                _target_contains_observed_value(target) for target in targets
+            ):
                 continue
 
             all_smiles.append(smiles)

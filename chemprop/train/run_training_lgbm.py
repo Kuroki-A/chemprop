@@ -508,6 +508,7 @@ def _load_split_data(
         test_data = get_data(
             path=args.separate_test_path,
             args=args,
+            use_args_data_weights=False,
             target_columns=args.task_names,
             features_path=args.separate_test_features_path,
             atom_descriptors_path=args.separate_test_atom_descriptors_path,
@@ -523,6 +524,7 @@ def _load_split_data(
         val_data = get_data(
             path=args.separate_val_path,
             args=args,
+            use_args_data_weights=False,
             target_columns=args.task_names,
             features_path=args.separate_val_features_path,
             atom_descriptors_path=args.separate_val_atom_descriptors_path,
@@ -795,7 +797,13 @@ def run_training_lgbm(
         )
         if metric == args.metric:
             _validate_primary_validation_score(metric, valid_mean)
-        info(f"Ensemble validation {metric} = {valid_mean:.6f}")
+        if np.isfinite(valid_mean):
+            info(f"Ensemble validation {metric} = {valid_mean:.6f}")
+        else:
+            info(
+                f"Ensemble validation {metric}: not evaluated "
+                "(the aggregate metric is undefined for the validation labels)."
+            )
         if not skip_test_evaluation:
             test_mean = multitask_mean(
                 test_scores[metric],

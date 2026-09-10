@@ -165,6 +165,58 @@ def _prediction_feature_args(features_generator, features_path):
     )
 
 
+@pytest.mark.parametrize('missing_to_defaults', [False, True])
+def test_prediction_args_do_not_copy_training_row_weight_path(
+    missing_to_defaults,
+):
+    train_args = _prediction_feature_args(None, None)
+    train_args.data_weights_path = 'training_weights.csv'
+    train_args.dataset_type = 'regression'
+    predict_args = _prediction_feature_args(None, None)
+
+    update_prediction_args(
+        predict_args,
+        train_args,
+        missing_to_defaults=missing_to_defaults,
+    )
+
+    assert not hasattr(predict_args, 'data_weights_path')
+
+
+def test_fingerprint_input_does_not_inherit_checkpoint_training_row_weights(
+    tmp_path,
+):
+    class ExpectedStop(Exception):
+        pass
+
+    captured = {}
+
+    def capture_fingerprint_data(**kwargs):
+        captured.update(kwargs)
+        raise ExpectedStop
+
+    args = _fingerprint_args(tmp_path, 'fingerprints.csv')
+    args.test_path = str(tmp_path / 'prediction.csv')
+    args.data_weights_path = 'training_weights.csv'
+    train_args = _fingerprint_train_args()
+
+    with mock.patch.object(
+        fingerprint_module, 'load_args', return_value=train_args,
+    ), mock.patch.object(
+        fingerprint_module, 'validate_checkpoint_ensemble', return_value=None,
+    ), mock.patch.object(
+        fingerprint_module, 'update_prediction_args', return_value=None,
+    ), mock.patch.object(
+        fingerprint_module, 'restore_checkpoint_featurization', return_value=None,
+    ), mock.patch.object(
+        fingerprint_module, 'get_data', side_effect=capture_fingerprint_data,
+    ), pytest.raises(ExpectedStop):
+        molecule_fingerprint(args)
+
+    assert captured['args'] is args
+    assert captured['use_args_data_weights'] is False
+
+
 def test_legacy_prediction_args_reject_reordered_feature_generators():
     train_args = _prediction_feature_args(
         ['morgan', 'rdkit_2d'], ['training_features.npz'],

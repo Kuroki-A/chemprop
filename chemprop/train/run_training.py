@@ -1,5 +1,7 @@
+from contextlib import contextmanager
 from logging import Logger
 import os
+import random
 import shutil
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
@@ -17,6 +19,7 @@ from chemprop.spectra_utils import normalize_spectra, load_phase_mask
 from chemprop.args import TrainArgs
 from chemprop.constants import MODEL_FILE_NAME
 from chemprop.data import get_class_sizes, get_data, MoleculeDataLoader, MoleculeDataset, set_cache_graph, split_data
+from chemprop.data.utils import _target_contains_observed_value
 from chemprop.models import MoleculeModel
 from chemprop.nn_utils import param_count, param_count_all
 from chemprop.utils import build_optimizer, build_lr_scheduler, load_checkpoint, \
@@ -337,19 +340,27 @@ def validate_features_source_metadata(reference_data: MoleculeDataset,
 def _validate_training_split(args: TrainArgs,
                              train_data: MoleculeDataset,
                              val_data: MoleculeDataset,
-                             require_training_labels: bool = True) -> None:
+                             require_training_labels: bool = True,
+                             require_validation: bool = True) -> None:
     """Rejects unusable validation or training splits.
 
     Evaluation-only ``--test`` runs do not optimize a model and therefore do
     not depend on the size or labels of the otherwise unused training split.
     """
-    if len(val_data) == 0:
+    if require_validation and len(val_data) == 0:
         raise ValueError(
             'The validation data split is empty. Chemprop FFN training '
             'requires validation data for model selection and early stopping.'
         )
     if not require_training_labels:
         return
+    if require_validation and not _dataset_has_observed_targets(val_data):
+        raise ValueError(
+            'The validation data contain no observed labels. Normal Chemprop '
+            'FFN training requires at least one observed validation label for '
+            'checkpoint selection; use --train_on_full_data for '
+            'validation-free fixed-epoch training.'
+        )
     if len(train_data) == 0:
         raise ValueError(
             'The training data split is empty. Increase the data set size, '
@@ -381,26 +392,209 @@ def _validate_training_split(args: TrainArgs,
             'would remain randomly initialized.'
         )
 
-    if args.class_balance:
-        if args.num_tasks != 1:
+
+def _resolve_balanced_class_weights(
+    args: TrainArgs,
+    train_data: MoleculeDataset,
+) -> Optional[Dict[str, Any]]:
+    """Resolves FFN BCE class weights from post-split training labels only.
+
+    Missing labels do not contribute to either class count. The returned
+    weights have a mean of one over the observed training rows. Nothing is
+    written to datapoints, which keeps validation/test data unweighted and
+    prevents state from leaking between cross-validation folds.
+    """
+    if getattr(args, 'class_weight', None) is None:
+        return None
+    if getattr(args, 'class_weight', None) != 'balanced':
+        raise ValueError(
+            f'Unsupported FFN class weight mode {args.class_weight!r}; '
+            'only "balanced" is available.'
+        )
+    if getattr(args, 'model_type', 'FFN') != 'FFN':
+        raise ValueError('--class_weight balanced supports only the FFN backend.')
+    if getattr(args, 'dataset_type', None) != 'classification':
+        raise ValueError(
+            '--class_weight balanced requires binary classification data.'
+        )
+    if getattr(args, 'is_atom_bond_targets', False):
+        raise ValueError(
+            '--class_weight balanced supports molecule-level targets only.'
+        )
+    if getattr(args, 'loss_function', None) != 'binary_cross_entropy':
+        raise ValueError(
+            '--class_weight balanced requires binary_cross_entropy loss.'
+        )
+    if getattr(args, 'class_balance', False):
+        raise ValueError(
+            '--class_weight balanced cannot be combined with --class_balance.'
+        )
+    if getattr(args, 'data_weights_path', None) is not None:
+        raise ValueError(
+            '--class_weight balanced cannot be combined with --data_weights_path.'
+        )
+    if getattr(args, 'num_tasks', None) != 1:
+        raise ValueError(
+            '--class_weight balanced is supported only for single-task binary '
+            'classification; the training data contain '
+            f'{getattr(args, "num_tasks", None)} tasks.'
+        )
+
+    counts = [0, 0]
+    for datapoint in train_data:
+        targets = getattr(datapoint, 'targets', None)
+        if targets is None or len(targets) != 1:
             raise ValueError(
-                '--class_balance is supported only for single-task binary '
-                'classification data.'
+                '--class_weight balanced requires exactly one target column '
+                'for every training row.'
             )
-        observed_classes = {
-            datapoint.targets[0]
-            for datapoint in train_data
-            if datapoint.targets[0] is not None
-        }
-        if observed_classes != {0, 1}:
+        target = targets[0]
+        if target is None:
+            continue
+        target_array = np.asarray(target)
+        if target_array.ndim != 0 or target_array.item() not in (0, 1):
             raise ValueError(
-                '--class_balance requires both binary classes in the training '
-                f'split; observed classes were {sorted(observed_classes)}.'
+                '--class_weight balanced requires observed training targets '
+                'to be binary values 0 or 1.'
             )
+        counts[int(target_array.item())] += 1
+
+    observed_count = sum(counts)
+    if counts[0] == 0 or counts[1] == 0:
+        raise ValueError(
+            '--class_weight balanced requires both binary classes in the '
+            f'training split; observed class counts were 0: {counts[0]}, '
+            f'1: {counts[1]} (observed rows: {observed_count}).'
+        )
+
+    weights = [
+        observed_count / (2.0 * counts[0]),
+        observed_count / (2.0 * counts[1]),
+    ]
+    metadata = {
+        'mode': 'balanced',
+        'source': 'post-split training data only',
+        'observed_rows': observed_count,
+        'class_counts': {'0': counts[0], '1': counts[1]},
+        'class_weights': {'0': weights[0], '1': weights[1]},
+    }
+    # Public resolved fields are intentionally stored in checkpoint args. They
+    # are descriptive at prediction time and never trigger recomputation.
+    args.resolved_class_counts = counts
+    args.resolved_class_weights = weights
+    args.class_weight_observed_count = observed_count
+    args.class_weight_metadata = metadata
+    return metadata
+
+
+def _dataset_has_observed_targets(data: MoleculeDataset) -> bool:
+    """Returns whether a dataset contains at least one non-missing target."""
+    return any(
+        _target_contains_observed_value(getattr(datapoint, 'targets', None))
+        for datapoint in data
+    )
+
+
+def _validate_training_data_weights(
+    args: TrainArgs,
+    train_data: MoleculeDataset,
+) -> None:
+    """Rejects training tasks whose observed labels all have zero row weight."""
+    if getattr(args, 'data_weights_path', None) is None:
+        return
+
+    weights = np.asarray(train_data.data_weights(), dtype=float)
+    if (
+        weights.shape != (len(train_data),)
+        or not np.all(np.isfinite(weights))
+        or np.any(weights < 0)
+    ):
+        raise ValueError(
+            '--data_weights_path produced invalid retained training weights; '
+            'weights must be finite, non-negative, and aligned one per row.'
+        )
+
+    has_positive_observation = [False] * args.num_tasks
+    for target_row, weight in zip(train_data.targets(), weights):
+        if len(target_row) != args.num_tasks:
+            raise ValueError(
+                '--data_weights_path cannot be validated because the retained '
+                'training target schema does not match the configured tasks.'
+            )
+        if weight <= 0:
+            continue
+        for task_index, target in enumerate(target_row):
+            if isinstance(target, np.ndarray):
+                observed = any(value is not None for value in target.flat)
+            elif isinstance(target, (list, tuple)):
+                observed = any(value is not None for value in target)
+            else:
+                observed = target is not None
+            has_positive_observation[task_index] |= observed
+
+    zero_weight_tasks = [
+        task_index
+        for task_index, has_weight in enumerate(has_positive_observation)
+        if not has_weight
+    ]
+    if zero_weight_tasks:
+        task_names = list(args.task_names or [])
+        labels = [
+            task_names[index] if index < len(task_names) else f'index {index}'
+            for index in zero_weight_tasks
+        ]
+        raise ValueError(
+            '--data_weights_path leaves zero total positive weight for all '
+            'observed training labels in task(s): '
+            f'{", ".join(labels)}. At least one observed training row per '
+            'task must retain a positive weight after filtering and splitting.'
+        )
+
+
+@contextmanager
+def _preserve_training_rng_state(enabled: bool):
+    """Prevents evaluation-only work from changing later ensemble members."""
+    if not enabled:
+        yield
+        return
+
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cuda_states = (
+        torch.cuda.get_rng_state_all()
+        if torch.cuda.is_available() and torch.cuda.is_initialized()
+        else None
+    )
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _full_data_metric_mean(
+    scores: List[float],
+    metric: str,
+    ignore_nan_metrics: bool,
+) -> Optional[float]:
+    """Returns a valid full-data test aggregate, or ``None`` if undefined."""
+    values = np.asarray(scores, dtype=float)
+    if not np.any(np.isfinite(values)):
+        return None
+    mean_score = multitask_mean(
+        scores=values,
+        metric=metric,
+        ignore_nan_metrics=ignore_nan_metrics,
+    )
+    return float(mean_score) if np.isfinite(mean_score) else None
 
 
 def _validate_primary_validation_score(metric: str, score: float) -> None:
-    """Prevents an unusable validation split from selecting random weights."""
+    """Prevents an unusable validation split from selecting model weights."""
     if not np.isfinite(score):
         raise ValueError(
             f'The primary validation metric {metric!r} is not finite, so '
@@ -408,6 +602,75 @@ def _validate_primary_validation_score(metric: str, score: float) -> None:
             'validation split has labels and enough class/sample diversity '
             'for this metric; for multitask data, --ignore_nan_metrics may '
             'be used only when at least one task still has a finite score.'
+        )
+
+
+def _validate_full_data_runtime_args(args: TrainArgs) -> None:
+    """Defensively validates full-data mode for direct Python API callers."""
+    if not getattr(args, 'train_on_full_data', False):
+        return
+    if getattr(args, 'model_type', 'FFN') != 'FFN':
+        raise ValueError('--train_on_full_data supports only the FFN backend.')
+    if getattr(args, 'test', False):
+        raise ValueError('--train_on_full_data cannot be combined with --test.')
+    if getattr(args, 'epochs', 0) <= 0:
+        raise ValueError('--train_on_full_data requires --epochs to be greater than 0.')
+    if getattr(args, 'separate_val_path', None) is not None:
+        raise ValueError(
+            '--train_on_full_data cannot be combined with --separate_val_path.'
+        )
+    validation_input_fields = (
+        'separate_val_features_path',
+        'separate_val_phase_features_path',
+        'separate_val_atom_descriptors_path',
+        'separate_val_bond_descriptors_path',
+        'separate_val_constraints_path',
+    )
+    if any(getattr(args, field, None) is not None for field in validation_input_fields):
+        raise ValueError(
+            '--train_on_full_data cannot use separate-validation inputs.'
+        )
+    if getattr(args, 'split_type', 'random') != 'random':
+        raise ValueError(
+            '--train_on_full_data cannot use a non-default split type.'
+        )
+    if getattr(args, 'split_key_molecule', 0) != 0:
+        raise ValueError(
+            '--train_on_full_data cannot use a non-default split key.'
+        )
+    split_sizes = getattr(args, 'split_sizes', [1., 0., 0.])
+    try:
+        valid_full_split_marker = bool(
+            np.array_equal(np.asarray(split_sizes, dtype=float), [1., 0., 0.])
+        )
+    except (TypeError, ValueError):
+        valid_full_split_marker = False
+    if not valid_full_split_marker:
+        raise ValueError(
+            '--train_on_full_data requires the resolved no-split marker '
+            '[1, 0, 0]; validation-generating split sizes are not allowed.'
+        )
+    if getattr(args, 'num_folds', 1) != 1:
+        raise ValueError('--train_on_full_data cannot use cross-validation.')
+    split_artifact_fields = (
+        'folds_file', 'val_fold_index', 'test_fold_index',
+        'crossval_index_dir', 'crossval_index_file',
+    )
+    if any(getattr(args, field, None) is not None for field in split_artifact_fields):
+        raise ValueError(
+            '--train_on_full_data cannot use fold or split-index artifacts.'
+        )
+    if getattr(args, 'resume_experiment', False):
+        raise ValueError('--train_on_full_data cannot resume CV score artifacts.')
+    if getattr(args, 'skip_test_evaluation', False):
+        raise ValueError(
+            '--train_on_full_data cannot be used for validation-only/HPO runs.'
+        )
+    if getattr(args, 'max_data_size', None) is not None:
+        raise ValueError('--train_on_full_data cannot use --max_data_size.')
+    if getattr(args, 'data_type', 'test') != 'test':
+        raise ValueError(
+            '--train_on_full_data has no validation score; --data_type must be test.'
         )
 
 
@@ -445,9 +708,13 @@ def run_training(args: TrainArgs,
         debug = info = print
 
     test_mode = bool(getattr(args, 'test', False))
+    full_data_mode = bool(getattr(args, 'train_on_full_data', False))
+    _validate_full_data_runtime_args(args)
     checkpoint_args = (
         _validate_test_checkpoint_semantics(args) if test_mode else None
     )
+    if full_data_mode and test_mode:
+        raise ValueError('--train_on_full_data cannot be combined with --test.')
 
     # Hyperparameter optimization must select configurations exclusively on
     # validation scores. A separate held-out file is not even loaded in this
@@ -458,8 +725,13 @@ def run_training(args: TrainArgs,
     # Set pytorch seed for random initial weights
     torch.manual_seed(args.pytorch_seed)
 
-    # Split data
-    debug(f'Splitting data with seed {args.seed}')
+    # Split data, or deliberately retain the complete eligible dataset for the
+    # fixed-epoch final fit.
+    if full_data_mode:
+        info('Full-data fixed-epoch mode enabled.')
+        debug('Validation is disabled; no validation split will be generated.')
+    else:
+        debug(f'Splitting data with seed {args.seed}')
     test_data = MoleculeDataset([])
     if args.separate_test_path and not skip_test_evaluation:
         test_data = get_data(path=args.separate_test_path,
@@ -472,6 +744,7 @@ def run_training(args: TrainArgs,
                              constraints_path=args.separate_test_constraints_path,
                              smiles_columns=args.smiles_columns,
                              loss_function=args.loss_function,
+                             use_args_data_weights=False,
                              logger=logger)
         validate_features_source_metadata(data, test_data, 'separate test data')
     if args.separate_val_path:
@@ -485,10 +758,14 @@ def run_training(args: TrainArgs,
                             constraints_path=args.separate_val_constraints_path,
                             smiles_columns=args.smiles_columns,
                             loss_function=args.loss_function,
+                            use_args_data_weights=False,
                             logger=logger)
         validate_features_source_metadata(data, val_data, 'separate validation data')
 
-    if args.separate_val_path and args.separate_test_path:
+    if full_data_mode:
+        train_data = data
+        val_data = MoleculeDataset([])
+    elif args.separate_val_path and args.separate_test_path:
         train_data = data
     elif args.separate_val_path:
         train_data, _, test_data = split_data(data=data,
@@ -526,7 +803,10 @@ def run_training(args: TrainArgs,
         train_data,
         val_data,
         require_training_labels=not test_mode,
+        require_validation=not full_data_mode,
     )
+    if not test_mode:
+        _validate_training_data_weights(args, train_data)
 
     if args.dataset_type == 'classification' and not test_mode:
         class_sizes = get_class_sizes(train_data)
@@ -537,6 +817,15 @@ def run_training(args: TrainArgs,
         train_class_sizes = get_class_sizes(train_data, proportion=False)
         args.train_class_sizes = train_class_sizes
 
+    if getattr(args, 'class_weight', None) is not None and not test_mode:
+        class_weight_metadata = _resolve_balanced_class_weights(args, train_data)
+        info(
+            'Resolved --class_weight balanced from training data only: '
+            f'observed rows = {class_weight_metadata["observed_rows"]:,}, '
+            f'class counts = {class_weight_metadata["class_counts"]}, '
+            f'class weights = {class_weight_metadata["class_weights"]}.'
+        )
+
     if args.save_smiles_splits and not skip_test_evaluation:
         save_smiles_splits(
             data_path=args.data_path,
@@ -545,7 +834,7 @@ def run_training(args: TrainArgs,
             features_path=args.features_path,
             constraints_path=args.constraints_path,
             train_data=train_data,
-            val_data=val_data,
+            val_data=None if full_data_mode else val_data,
             test_data=test_data,
             smiles_columns=args.smiles_columns,
             loss_function=args.loss_function,
@@ -557,7 +846,9 @@ def run_training(args: TrainArgs,
         if test_mode
         else None
     )
-    datasets_to_scale = [('training', train_data), ('validation', val_data)]
+    datasets_to_scale = [('training', train_data)]
+    if not full_data_mode:
+        datasets_to_scale.append(('validation', val_data))
     if not skip_test_evaluation:
         datasets_to_scale.append(('test', test_data))
 
@@ -570,7 +861,8 @@ def run_training(args: TrainArgs,
         )
     elif args.features_scaling:
         features_scaler = train_data.normalize_features(replace_nan_token=0)
-        val_data.normalize_features(features_scaler)
+        if not full_data_mode:
+            val_data.normalize_features(features_scaler)
         if not skip_test_evaluation:
             test_data.normalize_features(features_scaler)
     else:
@@ -586,7 +878,8 @@ def run_training(args: TrainArgs,
         )
     elif args.atom_descriptor_scaling and args.atom_descriptors is not None:
         atom_descriptor_scaler = train_data.normalize_features(replace_nan_token=0, scale_atom_descriptors=True)
-        val_data.normalize_features(atom_descriptor_scaler, scale_atom_descriptors=True)
+        if not full_data_mode:
+            val_data.normalize_features(atom_descriptor_scaler, scale_atom_descriptors=True)
         if not skip_test_evaluation:
             test_data.normalize_features(atom_descriptor_scaler, scale_atom_descriptors=True)
     else:
@@ -602,15 +895,33 @@ def run_training(args: TrainArgs,
         )
     elif args.bond_descriptor_scaling and args.bond_descriptors is not None:
         bond_descriptor_scaler = train_data.normalize_features(replace_nan_token=0, scale_bond_descriptors=True)
-        val_data.normalize_features(bond_descriptor_scaler, scale_bond_descriptors=True)
+        if not full_data_mode:
+            val_data.normalize_features(bond_descriptor_scaler, scale_bond_descriptors=True)
         if not skip_test_evaluation:
             test_data.normalize_features(bond_descriptor_scaler, scale_bond_descriptors=True)
     else:
         bond_descriptor_scaler = None
 
     args.train_data_size = len(train_data)
+    if full_data_mode:
+        args.full_data_requested_epochs = int(args.epochs)
+        args.full_data_completed_epochs = 0
+        args.full_data_seed = int(args.seed)
+        args.full_data_pytorch_seed = int(args.pytorch_seed)
+        args.full_data_validation_disabled = True
+        args.full_data_checkpoint_policy = 'last_epoch'
 
-    if skip_test_evaluation:
+    if full_data_mode:
+        debug(
+            f'Total eligible size = {len(data):,} | train size = '
+            f'{len(train_data):,} | validation = disabled | test size = '
+            f'{len(test_data):,}'
+        )
+        info(
+            f'Full-data training rows = {len(train_data):,}; requested epochs '
+            f'= {args.epochs:,}; validation disabled; early stopping disabled.'
+        )
+    elif skip_test_evaluation:
         debug(f'Total size = {len(data):,} | '
               f'train size = {len(train_data):,} | val size = {len(val_data):,}')
     else:
@@ -618,11 +929,21 @@ def run_training(args: TrainArgs,
               f'train size = {len(train_data):,} | val size = {len(val_data):,} | test size = {len(test_data):,}')
 
     empty_test_set = len(test_data) == 0
-    evaluate_test = not skip_test_evaluation and not empty_test_set
+    test_has_observed_targets = _dataset_has_observed_targets(test_data)
+    predict_test = not skip_test_evaluation and not empty_test_set
+    evaluate_test = (
+        predict_test
+        and (not full_data_mode or test_has_observed_targets)
+    )
     if not skip_test_evaluation and empty_test_set:
-        debug('The test data split is empty. This may be either because splitting with no test set was selected, \
-            such as with `cv-no-test`, or because test data provided with `--separate_test_path` was empty or contained only invalid molecules. \
-            Performance on the test set will not be evaluated and metric scores will return `nan` for each task.')
+        if full_data_mode:
+            info('Test metrics: not evaluated (no test data were provided).')
+        else:
+            debug('The test data split is empty. This may be either because splitting with no test set was selected, \
+                such as with `cv-no-test`, or because test data provided with `--separate_test_path` was empty or contained only invalid molecules. \
+                Performance on the test set will not be evaluated and metric scores will return `nan` for each task.')
+    elif full_data_mode and not test_has_observed_targets:
+        info('Test metrics: not evaluated (the test data contain no observed labels).')
 
 
     # Initialize scaler and scale training targets by subtracting mean and dividing standard deviation (regression only)
@@ -654,7 +975,9 @@ def run_training(args: TrainArgs,
     elif args.dataset_type == 'spectra':
         debug('Normalizing spectra and excluding spectra regions based on phase')
         args.spectra_phase_mask = load_phase_mask(args.spectra_phase_mask_path)
-        datasets_to_normalize = [train_data, val_data]
+        datasets_to_normalize = [train_data]
+        if not full_data_mode:
+            datasets_to_normalize.append(val_data)
         if evaluate_test:
             datasets_to_normalize.append(test_data)
         for dataset in datasets_to_normalize:
@@ -675,32 +998,36 @@ def run_training(args: TrainArgs,
 
     # Get loss function
     loss_func = get_loss_func(args)
+    task_names = args.task_names
 
     # Accumulate predictions from each member's best checkpoint. Validation
     # scores must describe the final ensemble on the task axis, just like test
     # scores from every other training backend; per-member early-stopping
     # scores are not interchangeable with per-task scores.
-    val_smiles, val_targets = val_data.smiles(), val_data.targets()
-    if args.dataset_type == 'multiclass':
-        sum_val_preds = np.zeros(
-            (len(val_smiles), args.num_tasks, args.multiclass_num_classes)
-        )
-    elif args.is_atom_bond_targets:
-        sum_val_preds = np.array(
-            [
-                np.zeros((np.concatenate(task_targets).shape[0], 1))
-                for task_targets in zip(*val_data.targets())
-            ],
-            dtype=object,
-        )
-    else:
-        sum_val_preds = np.zeros((len(val_smiles), args.num_tasks))
+    val_targets = None
+    sum_val_preds = None
+    if not full_data_mode:
+        val_smiles, val_targets = val_data.smiles(), val_data.targets()
+        if args.dataset_type == 'multiclass':
+            sum_val_preds = np.zeros(
+                (len(val_smiles), args.num_tasks, args.multiclass_num_classes)
+            )
+        elif args.is_atom_bond_targets:
+            sum_val_preds = np.array(
+                [
+                    np.zeros((np.concatenate(task_targets).shape[0], 1))
+                    for task_targets in zip(*val_data.targets())
+                ],
+                dtype=object,
+            )
+        else:
+            sum_val_preds = np.zeros((len(val_smiles), args.num_tasks))
 
     # Set up held-out set evaluation only when explicitly enabled. Avoid even
     # materializing held-out targets during hyperparameter trials.
     test_targets = None
     sum_test_preds = None
-    if evaluate_test:
+    if predict_test:
         test_smiles, test_targets = test_data.smiles(), test_data.targets()
         if args.dataset_type == 'multiclass':
             sum_test_preds = np.zeros((len(test_smiles), args.num_tasks, args.multiclass_num_classes))
@@ -731,13 +1058,15 @@ def run_training(args: TrainArgs,
         shuffle=not test_mode,
         seed=args.seed
     )
-    val_data_loader = MoleculeDataLoader(
-        dataset=val_data,
-        batch_size=args.batch_size,
-        num_workers=num_workers
-    )
+    val_data_loader = None
+    if not full_data_mode:
+        val_data_loader = MoleculeDataLoader(
+            dataset=val_data,
+            batch_size=args.batch_size,
+            num_workers=num_workers
+        )
     test_data_loader = None
-    if evaluate_test:
+    if predict_test:
         test_data_loader = MoleculeDataLoader(
             dataset=test_data,
             batch_size=args.batch_size,
@@ -746,6 +1075,14 @@ def run_training(args: TrainArgs,
 
     if training_class_balance:
         debug(f'With class_balance, effective train size = {train_data_loader.iter_size:,}')
+
+    # Loading an optional external test set can initialize feature generators
+    # which consume PyTorch randomness. In full-data mode the external set is
+    # evaluation-only, so restore the requested training seed after every
+    # dataset, scaler, and loader has been prepared and immediately before
+    # the ensemble is initialized.
+    if full_data_mode:
+        torch.manual_seed(args.pytorch_seed)
 
     # Train ensemble of models
     for model_idx in range(args.ensemble_size):
@@ -815,7 +1152,7 @@ def run_training(args: TrainArgs,
             )
             if not same_checkpoint:
                 shutil.copy2(source_checkpoint_path, model_checkpoint_path)
-        else:
+        elif not full_data_mode:
             save_checkpoint(model_checkpoint_path, model, scaler,
                             features_scaler, atom_descriptor_scaler, bond_descriptor_scaler,
                             atom_bond_scaler, args)
@@ -824,12 +1161,22 @@ def run_training(args: TrainArgs,
         optimizer = build_optimizer(model, args)
 
         # Learning rate schedulers
-        scheduler = build_lr_scheduler(optimizer, args)
+        scheduler = build_lr_scheduler(
+            optimizer,
+            args,
+            steps_per_epoch=(
+                len(train_data_loader)
+                if full_data_mode or training_class_balance
+                else None
+            ),
+        )
 
         # Run training
         best_score = float('inf') if args.minimize_score else -float('inf')
         best_epoch, n_iter = 0, 0
         early_stopping_count = 0
+        if full_data_mode:
+            args.full_data_completed_epochs = 0
         for epoch in trange(args.epochs):
             debug(f'Epoch {epoch}')
             n_iter = train(
@@ -846,6 +1193,13 @@ def run_training(args: TrainArgs,
             )
             if isinstance(scheduler, ExponentialLR):
                 scheduler.step()
+            if full_data_mode:
+                args.full_data_completed_epochs = epoch + 1
+                debug(
+                    f'Full-data epoch {epoch + 1}/{args.epochs} completed; '
+                    'validation evaluation skipped.'
+                )
+                continue
             val_scores = evaluate(
                 model=model,
                 data_loader=val_data_loader,
@@ -865,8 +1219,16 @@ def run_training(args: TrainArgs,
                     metric=metric,
                     ignore_nan_metrics=args.ignore_nan_metrics
                 )
-                debug(f'Validation {metric} = {mean_val_score:.6f}')
-                writer.add_scalar(f'validation_{metric}', mean_val_score, n_iter)
+                if np.isfinite(mean_val_score):
+                    debug(f'Validation {metric} = {mean_val_score:.6f}')
+                    writer.add_scalar(
+                        f'validation_{metric}', mean_val_score, n_iter,
+                    )
+                else:
+                    debug(
+                        f'Validation {metric}: not evaluated '
+                        '(aggregate metric is undefined).'
+                    )
 
                 if args.show_individual_scores:
                     if args.loss_function == "quantile_interval" and metric == "quantile":
@@ -878,8 +1240,18 @@ def run_training(args: TrainArgs,
                         task_names = args.task_names
                     # Individual validation scores
                     for task_name, val_score in zip(task_names, scores):
-                        debug(f'Validation {task_name} {metric} = {val_score:.6f}')
-                        writer.add_scalar(f'validation_{task_name}_{metric}', val_score, n_iter)
+                        if np.isfinite(val_score):
+                            debug(f'Validation {task_name} {metric} = {val_score:.6f}')
+                            writer.add_scalar(
+                                f'validation_{task_name}_{metric}',
+                                val_score,
+                                n_iter,
+                            )
+                        else:
+                            debug(
+                                f'Validation {task_name} {metric}: '
+                                'not evaluated (undefined).'
+                            )
 
             # Save model checkpoint if improved validation score
             mean_val_score = multitask_mean(
@@ -904,46 +1276,89 @@ def run_training(args: TrainArgs,
         # checkpoint. Accumulating validation predictions here makes the
         # returned validation payload independent of ensemble size and gives
         # extra metrics the same semantics as test metrics.
-        if test_mode:
-            info(f'Model {model_idx}: skipped optimization and retained the supplied checkpoint.')
-        else:
-            info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f} on epoch {best_epoch}')
+        if full_data_mode:
+            if args.full_data_completed_epochs != args.epochs:
+                raise RuntimeError(
+                    'Full-data training did not complete the requested number '
+                    f'of epochs ({args.full_data_completed_epochs}/{args.epochs}); '
+                    'no final checkpoint will be saved.'
+                )
+            save_checkpoint(
+                model_checkpoint_path,
+                model,
+                scaler,
+                features_scaler,
+                atom_descriptor_scaler,
+                bond_descriptor_scaler,
+                atom_bond_scaler,
+                args,
+            )
+            info(
+                f'Model {model_idx}: completed {args.full_data_completed_epochs}/'
+                f'{args.epochs} requested epochs and saved the last-epoch '
+                f'checkpoint to {model_checkpoint_path}.'
+            )
+            # Reload exactly what was written before any optional test
+            # evaluation, proving that downstream prediction sees the saved
+            # final-epoch state and scaler bundle.
             model = load_checkpoint(
                 model_checkpoint_path,
                 device=args.device,
                 logger=logger,
             )
-        val_preds = predict(
-            model=model,
-            data_loader=val_data_loader,
-            scaler=scaler,
-            atom_bond_scaler=atom_bond_scaler,
-        )
-        if args.is_atom_bond_targets:
-            sum_val_preds += np.array(val_preds, dtype=object)
+        elif test_mode:
+            info(f'Model {model_idx}: skipped optimization and retained the supplied checkpoint.')
         else:
-            sum_val_preds += np.array(val_preds)
+            if args.epochs == 0:
+                info(
+                    f'Model {model_idx}: zero epochs requested; optimization '
+                    'and validation checkpoint selection were not run, so the '
+                    'initialization checkpoint was retained.'
+                )
+            else:
+                info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f} on epoch {best_epoch}')
+            model = load_checkpoint(
+                model_checkpoint_path,
+                device=args.device,
+                logger=logger,
+            )
+        if not full_data_mode:
+            val_preds = predict(
+                model=model,
+                data_loader=val_data_loader,
+                scaler=scaler,
+                atom_bond_scaler=atom_bond_scaler,
+            )
+            if args.is_atom_bond_targets:
+                sum_val_preds += np.array(val_preds, dtype=object)
+            else:
+                sum_val_preds += np.array(val_preds)
 
         # Evaluate on the held-out set using the same best checkpoint.
-        if evaluate_test:
-            test_preds = predict(
-                model=model,
-                data_loader=test_data_loader,
-                scaler=scaler,
-                atom_bond_scaler=atom_bond_scaler
-            )
-            test_scores = evaluate_predictions(
-                preds=test_preds,
-                targets=test_targets,
-                num_tasks=args.num_tasks,
-                metrics=args.metrics,
-                dataset_type=args.dataset_type,
-                is_atom_bond_targets=args.is_atom_bond_targets,
-                gt_targets=test_data.gt_targets(),
-                lt_targets=test_data.lt_targets(),
-                quantiles=args.quantiles,
-                logger=logger
-            )
+        if predict_test:
+            with _preserve_training_rng_state(full_data_mode):
+                test_preds = predict(
+                    model=model,
+                    data_loader=test_data_loader,
+                    scaler=scaler,
+                    atom_bond_scaler=atom_bond_scaler
+                )
+                test_scores = (
+                    evaluate_predictions(
+                        preds=test_preds,
+                        targets=test_targets,
+                        num_tasks=args.num_tasks,
+                        metrics=args.metrics,
+                        dataset_type=args.dataset_type,
+                        is_atom_bond_targets=args.is_atom_bond_targets,
+                        gt_targets=test_data.gt_targets(),
+                        lt_targets=test_data.lt_targets(),
+                        quantiles=args.quantiles,
+                        logger=logger,
+                    )
+                    if evaluate_test
+                    else None
+                )
 
             if len(test_preds) != 0:
                 if args.is_atom_bond_targets:
@@ -951,50 +1366,93 @@ def run_training(args: TrainArgs,
                 else:
                     sum_test_preds += np.array(test_preds)
 
-            # Average test score
-            for metric, scores in test_scores.items():
-                avg_test_score = np.nanmean(scores)
-                info(f'Model {model_idx} test {metric} = {avg_test_score:.6f}')
-                writer.add_scalar(f'test_{metric}', avg_test_score, 0)
+            if evaluate_test:
+                # Average test score
+                for metric, scores in test_scores.items():
+                    avg_test_score = (
+                        _full_data_metric_mean(
+                            scores,
+                            metric,
+                            args.ignore_nan_metrics,
+                        )
+                        if full_data_mode
+                        else float(np.nanmean(scores))
+                    )
+                    if full_data_mode and avg_test_score is None:
+                        info(
+                            f'Model {model_idx} test {metric}: not evaluated '
+                            '(the metric is undefined for the supplied test labels).'
+                        )
+                    else:
+                        info(f'Model {model_idx} test {metric} = {avg_test_score:.6f}')
+                        writer.add_scalar(f'test_{metric}', avg_test_score, 0)
 
-                if args.show_individual_scores and args.dataset_type != 'spectra':
-                    # Individual test scores
-                    for task_name, test_score in zip(task_names, scores):
-                        info(f'Model {model_idx} test {task_name} {metric} = {test_score:.6f}')
-                        writer.add_scalar(f'test_{task_name}_{metric}', test_score, n_iter)
+                    if args.show_individual_scores and args.dataset_type != 'spectra':
+                        # Individual test scores
+                        for task_name, test_score in zip(task_names, scores):
+                            if full_data_mode and not np.isfinite(test_score):
+                                info(
+                                    f'Model {model_idx} test {task_name} {metric}: '
+                                    'not evaluated (undefined for the supplied labels).'
+                                )
+                            else:
+                                info(f'Model {model_idx} test {task_name} {metric} = {test_score:.6f}')
+                                writer.add_scalar(f'test_{task_name}_{metric}', test_score, n_iter)
+            else:
+                info(f'Model {model_idx} test metrics: not evaluated.')
         elif not skip_test_evaluation:
-            info(f'Model {model_idx} provided with no test set, no metric evaluation will be performed.')
+            info(f'Model {model_idx} test metrics: not evaluated.')
         writer.close()
 
     # Evaluate the final ensemble on validation data. The result is always a
     # complete ``args.metrics`` mapping whose values use the task axis (or the
     # single aggregate spectra axis), matching LightGBM and sklearn callbacks.
-    avg_val_preds = (sum_val_preds / args.ensemble_size).tolist()
-    ensemble_valid_scores = evaluate_predictions(
-        preds=avg_val_preds,
-        targets=val_targets,
-        num_tasks=args.num_tasks,
-        metrics=args.metrics,
-        dataset_type=args.dataset_type,
-        is_atom_bond_targets=args.is_atom_bond_targets,
-        gt_targets=val_data.gt_targets(),
-        lt_targets=val_data.lt_targets(),
-        quantiles=args.quantiles,
-        logger=logger,
+    if full_data_mode:
+        ensemble_valid_scores = {}
+        info('Ensemble validation metrics: not evaluated (validation disabled).')
+    else:
+        avg_val_preds = (sum_val_preds / args.ensemble_size).tolist()
+        ensemble_valid_scores = evaluate_predictions(
+            preds=avg_val_preds,
+            targets=val_targets,
+            num_tasks=args.num_tasks,
+            metrics=args.metrics,
+            dataset_type=args.dataset_type,
+            is_atom_bond_targets=args.is_atom_bond_targets,
+            gt_targets=val_data.gt_targets(),
+            lt_targets=val_data.lt_targets(),
+            quantiles=args.quantiles,
+            logger=logger,
+        )
+        for metric, scores in ensemble_valid_scores.items():
+            mean_ensemble_valid_score = multitask_mean(
+                scores=scores,
+                metric=metric,
+                ignore_nan_metrics=args.ignore_nan_metrics,
+            )
+            if np.isfinite(mean_ensemble_valid_score):
+                info(
+                    f'Ensemble validation {metric} = '
+                    f'{mean_ensemble_valid_score:.6f}'
+                )
+            else:
+                info(
+                    f'Ensemble validation {metric}: not evaluated '
+                    '(the aggregate metric is undefined for the validation '
+                    'labels).'
+                )
+
+    avg_test_preds = (
+        (sum_test_preds / args.ensemble_size).tolist()
+        if predict_test
+        else None
     )
-    for metric, scores in ensemble_valid_scores.items():
-        mean_ensemble_valid_score = multitask_mean(
-            scores=scores,
-            metric=metric,
-            ignore_nan_metrics=args.ignore_nan_metrics,
-        )
-        info(
-            f'Ensemble validation {metric} = '
-            f'{mean_ensemble_valid_score:.6f}'
-        )
 
     # Evaluate ensemble on test set
-    if skip_test_evaluation:
+    if full_data_mode and not evaluate_test:
+        ensemble_test_scores = {}
+        info('Ensemble test metrics: not evaluated.')
+    elif skip_test_evaluation:
         ensemble_test_scores = {}
     elif empty_test_set:
         score_width = 1 if args.dataset_type == 'spectra' else args.num_tasks
@@ -1002,8 +1460,6 @@ def run_training(args: TrainArgs,
             metric: [np.nan] * score_width for metric in args.metrics
         }
     else:
-        avg_test_preds = (sum_test_preds / args.ensemble_size).tolist()
-
         ensemble_test_scores = evaluate_predictions(
             preds=avg_test_preds,
             targets=test_targets,
@@ -1024,15 +1480,27 @@ def run_training(args: TrainArgs,
             metric=metric,
             ignore_nan_metrics=args.ignore_nan_metrics
         )
-        info(f'Ensemble test {metric} = {mean_ensemble_test_score:.6f}')
+        if full_data_mode and not np.isfinite(mean_ensemble_test_score):
+            info(
+                f'Ensemble test {metric}: not evaluated '
+                '(the metric is undefined for the supplied test labels).'
+            )
+        else:
+            info(f'Ensemble test {metric} = {mean_ensemble_test_score:.6f}')
 
         # Individual ensemble scores
         if args.show_individual_scores:
             for task_name, ensemble_score in zip(task_names, scores):
-                info(f'Ensemble test {task_name} {metric} = {ensemble_score:.6f}')
+                if full_data_mode and not np.isfinite(ensemble_score):
+                    info(
+                        f'Ensemble test {task_name} {metric}: not evaluated '
+                        '(undefined for the supplied labels).'
+                    )
+                else:
+                    info(f'Ensemble test {task_name} {metric} = {ensemble_score:.6f}')
 
     # Optionally save test preds
-    if args.save_preds and evaluate_test:
+    if args.save_preds and predict_test:
         test_preds_dataframe = pd.DataFrame(data={'smiles': test_data.smiles()})
 
         if args.is_atom_bond_targets:

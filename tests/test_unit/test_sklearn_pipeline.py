@@ -64,6 +64,16 @@ def test_sklearn_predict_validates_common_sizes(tmp_path):
         ])
 
 
+def test_sklearn_rejects_silent_class_balance_noop():
+    with pytest.raises(ValueError, match='use --class_weight balanced'):
+        SklearnTrainArgs().parse_args([
+            '--data_path', str(DATA_PATH),
+            '--dataset_type', 'classification',
+            '--model_type', 'random_forest',
+            '--class_balance',
+        ])
+
+
 def test_classification_estimators_return_positive_class_probabilities():
     features = np.asarray(
         [[-3.0], [-2.0], [-1.0], [-0.5], [0.5], [1.0], [2.0], [3.0]]
@@ -343,6 +353,10 @@ def test_run_sklearn_uses_separate_splits_and_checkpoint_task_order(
             "first": [50.0, 70.0],
         }
     ).to_csv(test_path, index=False)
+    weights_path = tmp_path / "training_weights.csv"
+    weights_path.write_text(
+        "weight\n1\n2\n3\n4\n5\n6\n", encoding="utf-8"
+    )
 
     save_dir = tmp_path / "separate_model"
     save_dir.mkdir()
@@ -358,6 +372,8 @@ def test_run_sklearn_uses_separate_splits_and_checkpoint_task_order(
             "regression",
             "--model_type",
             "random_forest",
+            "--data_weights_path",
+            str(weights_path),
             "--save_dir",
             str(save_dir),
             "--num_trees",
@@ -381,10 +397,12 @@ def test_run_sklearn_uses_separate_splits_and_checkpoint_task_order(
         unexpected_split,
     )
     observed_targets = []
+    observed_weights = []
     original_evaluate = sklearn_train_module._evaluate_multi_task_model
 
     def capture_evaluation(model, dataset, metrics, train_args, logger=None):
         observed_targets.append(dataset.targets())
+        observed_weights.append(dataset.data_weights())
         return original_evaluate(model, dataset, metrics, train_args, logger)
 
     monkeypatch.setattr(
@@ -397,6 +415,7 @@ def test_run_sklearn_uses_separate_splits_and_checkpoint_task_order(
         [[10.0, 20.0], [30.0, 40.0]],
         [[50.0, 60.0], [70.0, 80.0]],
     ]
+    assert observed_weights == [[1.0, 1.0], [1.0, 1.0]]
     assert np.all(np.isfinite(valid_scores["rmse"]))
     assert np.all(np.isfinite(test_scores["rmse"]))
     assert load_sklearn_checkpoint(str(save_dir / "model.pkl")).train_args[

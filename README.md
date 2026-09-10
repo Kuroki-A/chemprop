@@ -9,7 +9,7 @@
 Chemprop is a repository containing message passing neural networks for molecular property prediction.
 
 > [!IMPORTANT]
-> This repository is the Kuroki-maintained Chemprop v1 line (`1.7.1+kuroki.3`).
+> This repository is the Kuroki-maintained Chemprop v1 line (`1.7.1+kuroki.4`).
 > It intentionally retains the v1 command line and checkpoint interfaces while
 > carrying local correctness, LightGBM, security, dependency, and feature-generation
 > fixes. Install this fork from source; the `chemprop` package on PyPI is the
@@ -46,6 +46,7 @@ See [CHANGELOG.md](CHANGELOG.md) for fixes and checkpoint compatibility notes.
 - [Data](#data)
 - [Training](#training)
   * [Train/Validation/Test Splits](#trainvalidationtest-splits)
+  * [Full-data fixed-epoch final training](#full-data-fixed-epoch-final-training)
   * [Loss functions](#loss-functions)
   * [Metrics](#metrics)
   * [Cross validation and ensembling](#cross-validation-and-ensembling)
@@ -356,6 +357,39 @@ splits. Architecture flags need not be repeated, but dataset type, ordered
 targets, molecule/reaction semantics, features/descriptors, and spectra
 settings must match. Ensemble scaler state must agree, and
 `--checkpoint_frzn` cannot be combined with `--test`.
+
+### Full-data fixed-epoch final training
+
+After selecting hyperparameters and an epoch count with held-out validation,
+use `--train_on_full_data --epochs N` to fit the final FFN model. Every valid
+row in `--data_path` with at least one observed target is assigned to training.
+Both the standard D-MPNN representation and `--features_only` FFN models are
+supported.
+No validation split or validation loader is created; validation evaluation,
+best-epoch selection, and early stopping are disabled. Every ensemble member
+completes exactly `N` epochs, and `fold_0/model_<i>/model.pt` contains its
+last-epoch weights and scalers fitted only on the full training data.
+
+```bash
+chemprop_train --data_path data.csv --dataset_type regression \
+  --train_on_full_data --epochs 10 --save_dir final_model
+```
+
+`--separate_test_path` is optional and evaluation-only: it never contributes
+to optimization, scaler fitting, or checkpoint selection. Without labeled
+external test data, metrics are reported as `not evaluated`, not as a usable
+NaN score; `--save_preds` can still write predictions for a non-empty
+unlabeled external file. Undefined entries in `fold_0/test_scores.json` are
+standard JSON `null` values. A full-data run requires a fresh `fold_0` under `--save_dir`,
+preventing stale checkpoints or scores from an earlier run from being mistaken
+for current output. Separate validation, non-default split/index settings,
+cross-validation, Hyperopt, resume, `--test`, `--max_data_size`, and LightGBM
+are rejected. `--early_stopping` is ignored with a warning.
+
+The Noam scheduler uses `--epochs` as its total duration and the actual number
+of training-loader batches per epoch. This also applies to ordinary/HPO runs
+that use `--class_balance`, so the schedule is based on the same effective
+downsampled loader length when the final full-data fit uses that option.
 
 ### Loss functions
 
@@ -685,7 +719,41 @@ By default, each task in multitask training and each provided datapoint are weig
 
 Using the `--target_weights` argument followed by a list of numbers equal in length to the number of tasks in multitask training, different tasks can be given more weight in parameter updates during training. For instance, in a multitask training with two tasks, the argument `--target_weights 1 2` would give the second task twice as much weight in model parameter updates. Provided weights must be non-negative. Values are normalized to make the average weight equal 1. Target weights are not used with the validation set for the determination of early stopping or in evaluation of the test set.
 
-Using the `--data_weights_path` argument followed by a path to a data file containing weights will allow each individual datapoint in the training data to be given different weight in parameter updates. Formatting of this file is similar to provided features CSV files: they should contain only a single column with one header row and a numerical value in each row that corresponds to the order of datapoints provided with `--data_path`. Data weights should not be provided for validation or test sets if they are provided through the arguments `--separate_test_path` or `--separate_val_path`. Provided weights must be non-negative. Values are normalized to make the average weight equal 1. Data weights are not used with the validation set for the determination of early stopping or in evaluation of the test set.
+For FFN single-task binary classification, `--class_balance` and
+`--class_weight balanced` have different semantics. `--class_balance`
+downsamples the majority class, so not every observed training row is consumed
+in an epoch. `--class_weight balanced` keeps every training row in the loader
+and multiplies each observed BCE loss for class *c* by
+`w_c = N_observed / (2 * n_c)`, using only the post-split training labels.
+Missing labels are excluded from `N_observed` and `n_c`, so the mean weight over
+observed training rows is one. Validation/test losses and metrics remain
+unweighted. This option requires both classes and binary cross-entropy loss,
+and it cannot be combined with `--class_balance` or `--data_weights_path`.
+Resolved counts and weights are stored in each checkpoint.
+The option supports both standard D-MPNN and `--features_only` FFN models.
+For Chemprop v1 backward compatibility, multitask `--class_balance` remains
+available and treats a row as positive when any observed task is active;
+`--class_weight balanced` is intentionally restricted to single-task data.
+
+Using the `--data_weights_path` argument followed by a path to a data file
+containing weights allows each individual datapoint in the training data to be
+given a different weight in parameter updates. The file must contain one
+header and one numeric, non-negative weight per raw row in `--data_path`. The
+complete weights file is normalized once to mean one when loaded. After
+invalid/all-missing rows are filtered and the data are split, retained training
+weights are applied exactly as stored and are not normalized again; therefore,
+a particular training split is not guaranteed to have mean weight one.
+Each task must retain at least one observed training label with positive row
+weight after filtering and splitting; otherwise training stops with an error.
+Training weights never apply to separate validation/test files, prediction or
+fingerprint inputs, uncertainty calibration/evaluation data, or their metrics.
+
+The sklearn entry point retains sklearn estimator-specific
+`--class_weight balanced` semantics and rejects `--class_balance`, which is not
+a sklearn sampling option. `chemprop_train --model_type lgbm` does
+not accept the FFN `--class_weight` option; its existing `--class_balance`
+option applies backend-specific balanced training weights rather than FFN
+downsampling.
 
 ### Caching
 

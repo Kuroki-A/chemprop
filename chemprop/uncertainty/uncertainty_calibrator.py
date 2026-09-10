@@ -1437,6 +1437,20 @@ class ConformalRegressionCalibrator(UncertaintyCalibrator):
             ).T
             targets = np.asarray(self.calibration_data.targets(), dtype=float).T
             mask = np.asarray(self.calibration_data.mask(), dtype=bool)
+            shapes = {
+                uncal_preds.shape,
+                uncal_interval.shape,
+                targets.shape,
+                mask.shape,
+            }
+            if len(shapes) != 1:
+                raise ValueError(
+                    'Conformal regression calibration predictions, intervals, '
+                    'targets, and masks must have matching task-by-row shapes; '
+                    f'got predictions={uncal_preds.shape}, '
+                    f'intervals={uncal_interval.shape}, targets={targets.shape}, '
+                    f'mask={mask.shape}.'
+                )
         self.num_tasks = len(mask)
 
         self.qhats = []

@@ -22,7 +22,7 @@ class ChempropBuildPy(build_py):
         return modules
 
 
-VERSION = "1.7.1+kuroki.3"
+VERSION = "1.7.1+kuroki.4"
 
 # Keep Web assets explicit rather than relying on ``include_package_data`` to
 # interpret data-only directories as namespace packages. Newer Setuptools

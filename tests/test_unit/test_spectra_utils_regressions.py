@@ -51,6 +51,15 @@ def test_normalize_spectra_returns_finite_unit_sum_rows():
     assert sum(normalized[1]) == pytest.approx(1)
 
 
+def test_normalize_spectra_accepts_numpy_arrays():
+    spectra = np.asarray([[1.0, 3.0], [2.0, 2.0]])
+
+    normalized = normalize_spectra(spectra)
+
+    np.testing.assert_allclose(normalized, [[0.25, 0.75], [0.5, 0.5]])
+    assert normalize_spectra(np.empty((0, 2))) == []
+
+
 def test_roundrobin_sid_does_not_mutate_ensemble_predictions():
     spectra = np.asarray(
         [[[0.0, 0.5], [1.0, 0.5], [np.nan, np.nan]]],

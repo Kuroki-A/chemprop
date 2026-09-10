@@ -114,6 +114,25 @@ def test_conformal_regression_uses_observed_count_per_task():
     assert calibrator.qhats == pytest.approx([0.4, 0.5])
 
 
+def test_conformal_regression_rejects_misaligned_dense_shapes():
+    calibrator = ConformalRegressionCalibrator.__new__(
+        ConformalRegressionCalibrator
+    )
+    calibrator.conformal_alpha = 0.1
+    calibrator.calibration_predictor = _PredictionResult(
+        [[0.0], [1.0]],
+        [[0.0], [0.0]],
+    )
+    calibrator.calibration_data = SimpleNamespace(
+        is_atom_bond_targets=False,
+        targets=lambda: [[0.1, 0.1], [0.2, 0.2]],
+        mask=lambda: [[True, True], [True, True]],
+    )
+
+    with pytest.raises(ValueError, match='matching task-by-row shapes'):
+        calibrator.calibrate()
+
+
 def test_conformal_regression_calibrates_ragged_atom_bond_rows():
     calibrator = ConformalRegressionCalibrator.__new__(
         ConformalRegressionCalibrator

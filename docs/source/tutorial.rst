@@ -69,6 +69,42 @@ another split.
 
 Note: By default, both random and scaffold split the data into 80% train, 10% validation, and 10% test. This can be changed with :code:`--split_sizes <train_frac> <val_frac> <test_frac>`. For example, the default setting is :code:`--split_sizes 0.8 0.1 0.1`. Both also involve a random component and can be seeded with :code:`--seed <seed>`. The default setting is :code:`--seed 0`.
 
+Full-data fixed-epoch final training
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+After selecting hyperparameters and an epoch count with held-out validation,
+use :code:`--train_on_full_data --epochs N` for the final FFN fit. Every valid
+row in :code:`--data_path` with at least one observed target is assigned to
+training. Both the standard D-MPNN representation and :code:`--features_only`
+FFN models are supported. No validation split or validation loader is created; validation
+evaluation, best-epoch selection, and early stopping are disabled. Every
+ensemble member completes exactly :code:`N` epochs, and
+:code:`fold_0/model_<i>/model.pt` contains its last-epoch weights and scalers
+fitted only on the full training data.
+
+.. code-block:: bash
+
+   chemprop_train --data_path data.csv --dataset_type regression \
+      --train_on_full_data --epochs 10 --save_dir final_model
+
+:code:`--separate_test_path` is optional and evaluation-only. It never
+contributes to optimization, scaler fitting, or checkpoint selection. Without
+labeled external test data, metrics are reported as ``not evaluated`` rather
+than as a usable NaN score. :code:`--save_preds` can still write predictions
+for a non-empty unlabeled external file. Undefined entries in
+:code:`fold_0/test_scores.json` are standard JSON ``null`` values. A full-data
+run requires a fresh :code:`fold_0` below :code:`--save_dir`, preventing stale
+checkpoints or scores from an earlier run from being mistaken for current
+output. Separate validation, non-default split/index settings,
+cross-validation, Hyperopt, resume, :code:`--test`,
+:code:`--max_data_size`, and LightGBM are rejected. The
+:code:`--early_stopping` value is ignored with a warning.
+
+The Noam scheduler uses :code:`--epochs` as its total duration and the actual
+number of training-loader batches per epoch. Ordinary/HPO runs using
+:code:`--class_balance` use the same effective downsampled loader-length rule,
+so an equivalent final fit has consistent scheduler semantics.
+
 Cross validation
 ^^^^^^^^^^^^^^^^
 
@@ -303,6 +339,49 @@ Missing target values
 When training multitask models (models which predict more than one target simultaneously), sometimes not all target values are known for all molecules in the dataset. Chemprop automatically handles missing entries in the dataset by masking out the respective values in the loss function, so that partial data can be utilized, too. The loss function is rescaled according to all non-missing values, and missing values furthermore do not contribute to validation or test errors. Training on partial data is therefore possible and encouraged (versus taking out datapoints with missing target entries). No keyword is needed for this behavior, it is the default.
 
 In contrast, when using :code:`sklearn_train.py` (a utility script provided within Chemprop that trains standard models such as random forests on Morgan fingerprints via the python package scikit-learn), multi-task models cannot be trained on datasets with partially missing targets. However, one can instead train individual models for each task (via the argument :code:`--single_task`), where missing values are automatically removed from the dataset. Thus, the training still makes use of all non-missing values, but by training individual models for each task, instead of one model with multiple output values. This restriction only applies to sklearn models (via  :code:`sklearn_train` or :code:`python sklearn_train.py`), but NOT to default Chemprop models via :code:`chemprop_train` or :code:`python train.py`.
+
+Class imbalance and row weighting
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For FFN single-task binary classification, :code:`--class_balance` and
+:code:`--class_weight balanced` are intentionally different.
+:code:`--class_balance` downsamples the majority class, so not every observed
+training row is consumed in an epoch. :code:`--class_weight balanced` retains
+every training row and multiplies each observed binary-cross-entropy loss for
+class *c* by
+
+.. math::
+
+   w_c = \frac{N_{\mathrm{observed}}}{2 n_c}.
+
+The counts use only the post-split training labels; missing labels are excluded.
+The mean weight over observed training rows is therefore one. Validation and
+test losses/metrics are unweighted. Both binary classes must occur in the
+training split, and the option cannot be combined with
+:code:`--class_balance` or :code:`--data_weights_path`. Counts and resolved
+weights are saved in each checkpoint.
+Both standard D-MPNN and :code:`--features_only` FFN models are supported.
+For Chemprop v1 backward compatibility, multitask :code:`--class_balance`
+remains available and treats a row as positive when any observed task is
+active; :code:`--class_weight balanced` is intentionally restricted to
+single-task data.
+
+:code:`--data_weights_path` supplies one non-negative numeric weight per raw
+row in :code:`--data_path`. The complete file is normalized once to mean one
+when loaded. Filtering and splitting do not normalize the retained values
+again, so a training split need not have mean weight one. Every task must retain
+at least one observed training label with positive row weight after filtering
+and splitting; otherwise training stops with an error. The retained weights
+multiply the FFN loss exactly as stored and are never inherited by separate
+validation/test files, prediction/fingerprint inputs, or uncertainty
+calibration/evaluation data.
+
+The sklearn entry point retains sklearn estimator-specific
+:code:`--class_weight balanced` semantics and rejects :code:`--class_balance`,
+which is not a sklearn sampling option. The LightGBM backend rejects the
+FFN :code:`--class_weight` option; its existing :code:`--class_balance`
+performs backend-specific balanced training weighting rather than FFN
+downsampling.
 
 Caching
 ^^^^^^^

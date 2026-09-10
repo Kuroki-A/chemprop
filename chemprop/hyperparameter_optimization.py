@@ -42,6 +42,12 @@ def hyperopt(args: HyperoptArgs) -> None:
     :param args: A :class:`~chemprop.args.HyperoptArgs` object containing arguments for hyperparameter
                  optimization in addition to all arguments needed for training.
     """
+    if getattr(args, 'train_on_full_data', False):
+        raise ValueError(
+            '--train_on_full_data cannot be used for hyperparameter '
+            'optimization because it intentionally has no validation score.'
+        )
+
     # Create logger
     logger = create_logger(name=HYPEROPT_LOGGER_NAME, save_dir=args.log_dir, quiet=True)
 

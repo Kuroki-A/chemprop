@@ -1286,23 +1286,32 @@ class MoleculeSampler(Sampler):
             self.positive_indices = []
             self.negative_indices = []
             for index, datapoint in enumerate(dataset):
-                if datapoint.targets is None or len(datapoint.targets) != 1:
+                if datapoint.targets is None:
                     raise ValueError(
-                        'Class-balanced sampling supports only single-task '
-                        'binary targets.'
+                        'Class-balanced sampling requires binary targets.'
                     )
-                target = datapoint.targets[0]
-                if target is None:
-                    # Missing labels are neither negative nor positive and
-                    # must not influence the balancing ratio.
+                observed_targets = []
+                for target in datapoint.targets:
+                    if target is None:
+                        continue
+                    target_array = np.asarray(target)
+                    if (
+                        target_array.ndim != 0
+                        or target_array.item() not in (0, 1)
+                    ):
+                        raise ValueError(
+                            'Class-balanced sampling requires observed targets '
+                            'to be binary values 0 or 1.'
+                        )
+                    observed_targets.append(int(target_array.item()))
+
+                if not observed_targets:
+                    # An all-missing target row is neither negative nor
+                    # positive and must not influence the balancing ratio.
                     continue
-                target_array = np.asarray(target)
-                if target_array.ndim != 0 or target_array.item() not in (0, 1):
-                    raise ValueError(
-                        'Class-balanced sampling requires observed targets to '
-                        'be binary values 0 or 1.'
-                    )
-                if target_array.item() == 1:
+                # Preserve Chemprop v1's multitask class-balance contract: a
+                # row is positive when any observed task is active.
+                if any(target == 1 for target in observed_targets):
                     self.positive_indices.append(index)
                 else:
                     self.negative_indices.append(index)
@@ -1371,9 +1380,10 @@ class MoleculeDataLoader(DataLoader):
         :param batch_size: Batch size.
         :param num_workers: Number of workers used to build batches.
         :param class_balance: Whether to perform class balancing (i.e., use an equal number of positive
-                              and negative molecules). Class balance is only available for single task
-                              classification datasets. Set shuffle to True in order to get a random
-                              subset of the larger class.
+                              and negative molecules). For legacy multitask
+                              classification, a row is positive when any
+                              observed task is active. Set shuffle to True in
+                              order to get a random subset of the larger class.
         :param shuffle: Whether to shuffle the data.
         :param seed: Random seed. Only needed if shuffle is True.
         """

@@ -159,7 +159,9 @@ class CommonArgs(Tap):
     gpu: int = None
     """Which GPU to use."""
     early_stopping: int = 5
-    """Number of early stopping counts"""
+    """Number of early stopping counts. Ignored with
+    :code:`train_on_full_data`; that mode emits a warning and always completes
+    the requested number of epochs."""
     data_type: Literal['validation', 'test'] = 'test'
     """Output scores of cross_validate.py."""
     use_cache: bool = False
@@ -420,10 +422,23 @@ class TrainArgs(CommonArgs):
     """Path to separate val set, optional."""
     separate_test_path: str = None
     """Path to separate test set, optional."""
+    train_on_full_data: bool = False
+    """Train an FFN on every usable labeled row for exactly :code:`epochs`
+    epochs, without a validation split, validation-based checkpoint selection,
+    or early stopping. The final-epoch checkpoint is saved. An optional
+    :code:`separate_test_path` remains evaluation-only. Non-default split,
+    cross-validation, Hyperopt, and separate-validation settings are rejected.
+    The scheduler uses :code:`epochs` and the actual training-loader batch
+    count."""
     spectra_phase_mask_path: str = None
     """Path to a file containing a phase mask array, used for excluding particular regions in spectra predictions."""
     data_weights_path: str = None
-    """Path to weights for each molecule in the training data, affecting the relative weight of molecules in the loss function"""
+    """Path to weights for each molecule in the training data. The complete
+    file is normalized once to mean one when loaded; retained weights are then
+    applied exactly as stored and are not renormalized after invalid/unlabeled
+    filtering or train/validation/test splitting. After those operations,
+    every task with observed training labels must retain positive total row
+    weight."""
     target_weights: List[float] = None
     """Weights associated with each target, affecting the relative weight of targets in the loss function. Must match the number of target columns."""
     split_type: Literal['random', 'scaffold_balanced', 'predetermined', 'crossval', 'cv', 'cv-no-test', 'index_predetermined', 'random_with_repeated_smiles', 'molecular_weight'] = 'random'
@@ -639,7 +654,16 @@ class TrainArgs(CommonArgs):
     grad_clip: float = None
     """Maximum magnitude of gradient during training."""
     class_balance: bool = False
-    """Trains with an equal number of positives and negatives in each batch."""
+    """For FFN classification, downsample the majority row group so each
+    epoch contains equal positive/negative groups. In legacy multitask mode a
+    row is positive when any observed task is active. LightGBM retains its
+    backend-specific balanced training-weight behavior."""
+    class_weight: Literal['balanced'] = None
+    """For single-task binary FFN classification, use every training row and
+    weight each observed BCE loss by :math:`N/(2n_c)`, computed exclusively
+    from the post-split training labels. This is distinct from the downsampling
+    performed by :code:`class_balance` and cannot be combined with it or with
+    :code:`data_weights_path`."""
     spectra_activation: Literal['exp', 'softplus'] = 'exp'
     """Indicates which function to use in dataset_type spectra training to constrain outputs to be positive."""
     spectra_target_floor: float = 1e-8
@@ -1141,6 +1165,128 @@ class TrainArgs(CommonArgs):
         if self.class_balance and self.dataset_type != 'classification':
             raise ValueError('Class balance can only be applied if the dataset type is classification.')
 
+        # ``class_weight`` already existed on the sklearn training entry point.
+        # Apply the new FFN semantics only to chemprop_train, and reject rather
+        # than silently reinterpret it for LightGBM.
+        if self.class_weight is not None and self.model_type == 'FFN':
+            if self.dataset_type != 'classification':
+                raise ValueError(
+                    '--class_weight balanced is supported only for classification.'
+                )
+            if self.is_atom_bond_targets:
+                raise ValueError(
+                    '--class_weight balanced is supported only for molecule-level '
+                    'single-task binary classification.'
+                )
+            if self.loss_function != 'binary_cross_entropy':
+                raise ValueError(
+                    '--class_weight balanced requires '
+                    '--loss_function binary_cross_entropy.'
+                )
+            if self.class_balance:
+                raise ValueError(
+                    '--class_weight balanced cannot be combined with '
+                    '--class_balance; choose loss weighting or downsampling.'
+                )
+            if self.data_weights_path is not None:
+                raise ValueError(
+                    '--class_weight balanced cannot be combined with '
+                    '--data_weights_path.'
+                )
+        elif self.class_weight is not None and self.model_type == 'lgbm':
+            raise ValueError(
+                '--class_weight balanced on chemprop_train is an FFN-only '
+                'loss-weighting option. LightGBM retains the existing '
+                '--class_balance backend behavior.'
+            )
+
+        if self.train_on_full_data:
+            if self.model_type != 'FFN':
+                raise ValueError('--train_on_full_data currently supports only --model_type FFN.')
+            if self.test:
+                raise ValueError('--train_on_full_data cannot be combined with --test.')
+            if self.epochs <= 0:
+                raise ValueError('--train_on_full_data requires --epochs to be greater than 0.')
+            if self.separate_val_path is not None:
+                raise ValueError(
+                    '--train_on_full_data cannot be combined with --separate_val_path '
+                    'because validation is disabled.'
+                )
+            if any(
+                value is not None
+                for value in (
+                    self.separate_val_features_path,
+                    self.separate_val_phase_features_path,
+                    self.separate_val_atom_descriptors_path,
+                    self.separate_val_bond_descriptors_path,
+                    self.separate_val_constraints_path,
+                )
+            ):
+                raise ValueError(
+                    '--train_on_full_data cannot use separate-validation feature, '
+                    'descriptor, or constraint paths.'
+                )
+            if self.split_sizes is not None:
+                raise ValueError(
+                    '--train_on_full_data cannot be combined with --split_sizes; '
+                    'all usable labeled data are assigned to training.'
+                )
+            if self.split_type != 'random':
+                raise ValueError(
+                    '--train_on_full_data cannot be combined with a non-default '
+                    '--split_type because no split is generated.'
+                )
+            if self.split_key_molecule != 0:
+                raise ValueError(
+                    '--train_on_full_data cannot be combined with a non-default '
+                    '--split_key_molecule because no split is generated.'
+                )
+            if self.data_type != 'test':
+                raise ValueError(
+                    '--train_on_full_data cannot use --data_type validation '
+                    'because validation is disabled and no validation score exists.'
+                )
+            if self.num_folds != 1:
+                raise ValueError(
+                    '--train_on_full_data cannot be combined with cross-validation '
+                    'or --num_folds other than 1.'
+                )
+            split_artifacts = {
+                '--folds_file': self.folds_file,
+                '--val_fold_index': self.val_fold_index,
+                '--test_fold_index': self.test_fold_index,
+                '--crossval_index_dir': self.crossval_index_dir,
+                '--crossval_index_file': self.crossval_index_file,
+            }
+            supplied_split_artifacts = [
+                name for name, value in split_artifacts.items() if value is not None
+            ]
+            if supplied_split_artifacts:
+                raise ValueError(
+                    '--train_on_full_data cannot use validation-generating split '
+                    'arguments: ' + ', '.join(supplied_split_artifacts) + '.'
+                )
+            if self.resume_experiment:
+                raise ValueError(
+                    '--train_on_full_data cannot be combined with '
+                    '--resume_experiment because fold score artifacts do not exist.'
+                )
+            if self.skip_test_evaluation:
+                raise ValueError(
+                    '--train_on_full_data cannot be used as a validation-only or '
+                    'hyperparameter-optimization run.'
+                )
+            if self.max_data_size is not None:
+                raise ValueError(
+                    '--train_on_full_data cannot be combined with --max_data_size; '
+                    'the mode is defined to consume every usable labeled input row.'
+                )
+            warn(
+                '--train_on_full_data disables validation-based checkpoint '
+                'selection and early stopping; --early_stopping is ignored.',
+                UserWarning,
+            )
+
         # Validate features
         if self.features_only and not (self.features_generator or self.features_path):
             raise ValueError('When using features_only, a features_generator or features_path must be provided.')
@@ -1184,7 +1330,11 @@ class TrainArgs(CommonArgs):
                 raise ValueError('split_sizes must contain only finite values.')
             self.split_sizes = split_sizes.tolist()
 
-        if self.split_sizes is None:
+        if self.train_on_full_data:
+            # This records the resolved no-split policy in args/checkpoints. It
+            # is never passed to split_data in full-data mode.
+            self.split_sizes = [1., 0., 0.]
+        elif self.split_sizes is None:
             if self.separate_val_path is None and self.separate_test_path is None: # separate data paths are not provided
                 self.split_sizes = [0.8, 0.1, 0.1]
             elif self.separate_val_path is not None and self.separate_test_path is None: # separate val path only
@@ -1735,6 +1885,17 @@ class HyperoptArgs(TrainArgs):
     def process_args(self) -> None:
         super(HyperoptArgs, self).process_args()
 
+        if self.train_on_full_data:
+            raise ValueError(
+                '--train_on_full_data cannot be used with chemprop_hyperopt; '
+                'hyperparameter selection requires validation data.'
+            )
+        if self.epochs <= 0:
+            raise ValueError(
+                'chemprop_hyperopt requires --epochs to be greater than 0; '
+                'zero epochs would rank untrained initializations.'
+            )
+
         if self.model_type != 'FFN':
             raise NotImplementedError(
                 'chemprop_hyperopt currently supports only --model_type FFN. '
@@ -1823,8 +1984,13 @@ class SklearnTrainArgs(TrainArgs):
 
     model_type: Literal['random_forest', 'svm']
     """scikit-learn model to use."""
+    class_balance: bool = False
+    """Unsupported by sklearn training. Use :code:`class_weight balanced`
+    for estimator-native class weighting instead."""
     class_weight: Literal['balanced'] = None
-    """How to weight classes (None means no class balance)."""
+    """How sklearn estimators weight classes (None means no class weighting).
+    This retains sklearn's existing estimator-specific semantics and is distinct
+    from the FFN BCE weighting provided by :class:`TrainArgs`."""
     single_task: bool = False
     """Whether to run each task separately (needed when dataset has null entries)."""
     radius: int = 2
@@ -1859,6 +2025,12 @@ class SklearnTrainArgs(TrainArgs):
             raise NotImplementedError(
                 'Sklearn models do not support --target_weights. Use '
                 '--data_weights_path for row-wise sample weights instead.'
+            )
+        if self.class_balance:
+            raise ValueError(
+                'Sklearn models do not support --class_balance downsampling; '
+                'use --class_weight balanced for estimator-native class '
+                'weighting.'
             )
         if self.class_weight is not None and self.dataset_type != 'classification':
             raise ValueError('--class_weight is only supported for classification.')

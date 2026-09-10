@@ -1099,6 +1099,20 @@ def test_quantile_get_data_expands_explicit_target_columns(tmp_path):
     assert data.targets() == [[1.0, 1.0], [2.0, 2.0]]
 
 
+def test_quantile_get_data_can_preserve_observed_target_width(tmp_path):
+    data_path = tmp_path / 'quantile.csv'
+    data_path.write_text('smiles,target\nCC,1\nCCC,2\n')
+
+    data = get_data(
+        path=str(data_path),
+        target_columns=['target'],
+        loss_function='quantile_interval',
+        expand_quantile_targets=False,
+    )
+
+    assert data.targets() == [[1.0], [2.0]]
+
+
 @pytest.mark.parametrize('phase', [False, True])
 def test_external_features_require_exact_raw_csv_row_count(tmp_path, phase):
     data_path = tmp_path / 'data.csv'
