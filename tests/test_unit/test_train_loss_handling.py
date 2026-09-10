@@ -202,28 +202,16 @@ def test_training_split_rejects_a_completely_unlabeled_task():
         )
 
 
-def test_class_balance_rejects_multitask_or_single_class_training_splits():
-    with pytest.raises(ValueError, match="only for single-task"):
-        _validate_training_split(
-            SimpleNamespace(
-                num_tasks=2,
-                task_names=["a", "b"],
-                class_balance=True,
-            ),
-            _Split([[0, 1], [1, 0]]),
-            _Split([[0, 1]]),
-        )
-
-    with pytest.raises(ValueError, match="requires both binary classes"):
-        _validate_training_split(
-            SimpleNamespace(
-                num_tasks=1,
-                task_names=["active"],
-                class_balance=True,
-            ),
-            _Split([[1], [None]]),
-            _Split([[1]]),
-        )
+def test_training_split_allows_legacy_multitask_class_balance():
+    _validate_training_split(
+        SimpleNamespace(
+            num_tasks=2,
+            task_names=["a", "b"],
+            class_balance=True,
+        ),
+        _Split([[0, 1], [0, 0]]),
+        _Split([[0, 1]]),
+    )
 
 
 @pytest.mark.parametrize("score", [float("nan"), float("inf"), -float("inf")])

@@ -20,9 +20,14 @@ def test_class_balance_excludes_missing_labels_instead_of_treating_as_negative()
     assert len(sampler) == 2
 
 
-def test_class_balance_rejects_multitask_targets():
-    with pytest.raises(ValueError, match='single-task binary'):
-        MoleculeSampler(_dataset([[1, 0], [0, 1]]), class_balance=True)
+def test_class_balance_preserves_multitask_any_active_row_grouping():
+    sampler = MoleculeSampler(
+        _dataset([[1, 0], [0, 0], [0, 1], [0, None], [None, None]]),
+        class_balance=True,
+    )
+
+    assert list(sampler) == [0, 1, 2, 3]
+    assert len(sampler) == 4
 
 
 @pytest.mark.parametrize('target_rows', [[[1], [1], [None]], [[0], [None]]])

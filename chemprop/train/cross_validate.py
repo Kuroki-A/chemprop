@@ -10,7 +10,7 @@ import secrets
 import stat
 import sys
 import tempfile
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import subprocess
 
 import numpy as np
@@ -574,6 +574,10 @@ def _resume_input_manifest(args: TrainArgs) -> Dict[str, Any]:
 def _training_config_manifest(args: TrainArgs) -> Dict[str, Any]:
     """Returns stable training arguments, excluding runtime/resume state."""
     excluded_fields = {
+        'class_weight_metadata',
+        'class_weight_observed_count',
+        'resolved_class_counts',
+        'resolved_class_weights',
         'resume_experiment',
         'save_dir',
         'spectra_phase_mask',
@@ -694,6 +698,19 @@ def _atomic_json_dump(payload: Any, path: str) -> None:
             os.unlink(temporary_path)
 
 
+def _json_safe_full_data_scores(
+    scores: Dict[str, List[float]],
+) -> Dict[str, List[Optional[float]]]:
+    """Converts undefined full-data test metrics to standard JSON ``null``."""
+    return {
+        metric: [
+            float(score) if np.isfinite(float(score)) else None
+            for score in task_scores
+        ]
+        for metric, task_scores in scores.items()
+    }
+
+
 def _validate_score_payload(
     scores: Dict[str, List[float]], args: TrainArgs, allow_empty: bool = False
 ) -> None:
@@ -784,7 +801,7 @@ def cross_validate(args: TrainArgs,
                        [TrainArgs, MoleculeDataset, int, Logger],
                        Tuple[Dict[str, List[float]], Dict[str, List[float]]],
                    ]
-                   ) -> Tuple[float, float]:
+                   ) -> Tuple[Optional[float], Optional[float]]:
     """
     Runs k-fold cross-validation.
 
@@ -805,6 +822,18 @@ def cross_validate(args: TrainArgs,
     # Initialize relevant variables
     init_seed = args.seed
     save_dir = args.save_dir
+    if getattr(args, 'train_on_full_data', False):
+        full_data_fold_dir = os.path.join(save_dir, 'fold_0')
+        if os.path.exists(full_data_fold_dir) and (
+            not os.path.isdir(full_data_fold_dir)
+            or bool(os.listdir(full_data_fold_dir))
+        ):
+            raise ValueError(
+                '--train_on_full_data requires a fresh fold_0 output '
+                'directory so stale checkpoints or score artifacts cannot '
+                'be mistaken for this run. Choose a new --save_dir or move '
+                'the existing fold_0 directory.'
+            )
     skip_test_evaluation = bool(getattr(args, 'skip_test_evaluation', False))
     if skip_test_evaluation and args.data_type != 'validation':
         raise ValueError('skip_test_evaluation requires data_type="validation".')
@@ -927,6 +956,63 @@ def cross_validate(args: TrainArgs,
     if args.target_weights is not None and len(args.target_weights) != args.num_tasks:
         raise ValueError('The number of provided target weights must match the number and order of the prediction tasks')
 
+    # Final fixed-epoch fitting is deliberately not cross-validation. Keep the
+    # shared loading/feature-schema setup above, but bypass every fold-resume,
+    # validation-score, and model-selection artifact below.
+    if getattr(args, 'train_on_full_data', False):
+        if args.num_folds != 1:
+            raise ValueError(
+                '--train_on_full_data must run exactly once and cannot be used '
+                'with cross-validation.'
+            )
+        if skip_test_evaluation:
+            raise ValueError(
+                '--train_on_full_data cannot be used for a validation-only or '
+                'hyperparameter-optimization run.'
+            )
+
+        args.seed = init_seed
+        args.save_dir = os.path.join(save_dir, 'fold_0')
+        makedirs(args.save_dir)
+        data.reset_features_and_targets()
+        info(
+            'Running one full-data fixed-epoch fit; validation, early stopping, '
+            'and validation checkpoint selection are disabled.'
+        )
+        model_valid_scores, model_test_scores = train_func(
+            args, data, 0, logger,
+        )
+        if model_valid_scores != {}:
+            raise ValueError(
+                'Full-data training must return no validation scores because '
+                'validation is disabled.'
+            )
+        _validate_score_payload(model_test_scores, args, allow_empty=True)
+
+        info('Validation metrics: not evaluated (full-data mode).')
+        if model_test_scores:
+            _atomic_json_dump(
+                _json_safe_full_data_scores(model_test_scores),
+                os.path.join(args.save_dir, 'test_scores.json'),
+            )
+            for metric, scores in model_test_scores.items():
+                mean_score = multitask_mean(
+                    scores=scores,
+                    metric=metric,
+                    ignore_nan_metrics=args.ignore_nan_metrics,
+                )
+                if np.isfinite(mean_score):
+                    info(f'Full-data external test {metric} = {mean_score:.6f}')
+                else:
+                    info(
+                        f'Full-data external test {metric}: not evaluated '
+                        '(the metric is undefined for the supplied labels).'
+                    )
+        else:
+            info('Test metrics: not evaluated.')
+        info('Full-data fixed-epoch training completed; no CV score was produced.')
+        return None, None
+
     # Run training on different random seeds for each fold
     all_valid_scores = defaultdict(list)
     all_test_scores = defaultdict(list)
@@ -1042,7 +1128,13 @@ def cross_validate(args: TrainArgs,
             ignore_nan_metrics=args.ignore_nan_metrics
         )  # average score for each model across tasks
         mean_score, std_score = np.mean(avg_scores), np.std(avg_scores)
-        info(f'Overall valid {metric} = {mean_score:.6f} +/- {std_score:.6f}')
+        if np.isfinite(mean_score) and np.isfinite(std_score):
+            info(f'Overall valid {metric} = {mean_score:.6f} +/- {std_score:.6f}')
+        else:
+            info(
+                f'Overall valid {metric}: not evaluated '
+                '(the aggregate metric is undefined).'
+            )
 
         if args.show_individual_scores and args.dataset_type != 'spectra':
             for task_num, task_name in enumerate(args.task_names):

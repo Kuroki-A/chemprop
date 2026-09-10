@@ -15,6 +15,81 @@ from chemprop.models import MoleculeModel
 from chemprop.nn_utils import compute_gnorm, compute_pnorm, NoamLR
 
 
+def _balanced_class_weight_tensor(
+    targets: torch.Tensor,
+    args: TrainArgs,
+) -> torch.Tensor:
+    """Returns per-target weights resolved from the training split.
+
+    Resolution intentionally happens in ``run_training`` after splitting. This
+    helper only consumes saved values, so validation, test, prediction, and
+    direct ``train`` calls can never cause label leakage by recomputing them.
+    """
+    values = getattr(args, 'resolved_class_weights', None)
+    if values is None:
+        raise ValueError(
+            '--class_weight balanced was requested, but training-split class '
+            'weights were not resolved before optimization.'
+        )
+    values_array = np.asarray(values, dtype=float)
+    if (
+        values_array.shape != (2,)
+        or not np.all(np.isfinite(values_array))
+        or np.any(values_array <= 0)
+    ):
+        raise ValueError(
+            'Resolved class weights must contain two finite positive values '
+            'ordered as classes [0, 1].'
+        )
+    class_zero_weight, class_one_weight = (
+        targets.new_tensor(float(values_array[0])),
+        targets.new_tensor(float(values_array[1])),
+    )
+    return torch.where(targets == 1, class_one_weight, class_zero_weight)
+
+
+def _validate_balanced_class_weight_training(
+    model: MoleculeModel,
+    args: TrainArgs,
+) -> None:
+    """Validates the low-level ``train`` API contract for class weighting."""
+    mode = getattr(args, 'class_weight', None)
+    if mode is None:
+        return
+    if mode != 'balanced':
+        raise ValueError(
+            f'Unsupported FFN class weight mode {mode!r}; only "balanced" '
+            'is available.'
+        )
+    if getattr(args, 'model_type', 'FFN') != 'FFN':
+        raise ValueError('--class_weight balanced supports only the FFN backend.')
+    if getattr(args, 'class_balance', False):
+        raise ValueError(
+            '--class_weight balanced cannot be combined with --class_balance.'
+        )
+    if getattr(args, 'data_weights_path', None) is not None:
+        raise ValueError(
+            '--class_weight balanced cannot be combined with '
+            '--data_weights_path.'
+        )
+    if (
+        getattr(args, 'is_atom_bond_targets', False)
+        or getattr(model, 'is_atom_bond_targets', False)
+    ):
+        raise ValueError(
+            '--class_weight balanced supports molecule-level targets only.'
+        )
+    if (
+        getattr(args, 'dataset_type', None) != 'classification'
+        or getattr(args, 'loss_function', None) != 'binary_cross_entropy'
+        or getattr(args, 'num_tasks', 1) != 1
+    ):
+        raise ValueError(
+            '--class_weight balanced requires molecule-level, single-task '
+            'binary classification with binary_cross_entropy loss.'
+        )
+
+
 def train(
     model: MoleculeModel,
     data_loader: MoleculeDataLoader,
@@ -43,6 +118,8 @@ def train(
     :return: The total number of iterations (training examples) trained on so far.
     """
     debug = logger.debug if logger is not None else print
+
+    _validate_balanced_class_weight_training(model, args)
 
     model.train()
     loss_sum = 0.0
@@ -148,6 +225,30 @@ def train(
             targets = targets.to(torch_device)
             target_weights = target_weights.to(torch_device)
             data_weights = data_weights.to(torch_device)
+            if getattr(args, 'class_weight', None) == 'balanced':
+                if (
+                    getattr(args, 'dataset_type', None) != 'classification'
+                    or getattr(args, 'loss_function', None)
+                    != 'binary_cross_entropy'
+                    or targets.ndim != 2
+                    or targets.shape[1] != 1
+                ):
+                    raise ValueError(
+                        '--class_weight balanced requires molecule-level, '
+                        'single-task binary classification with '
+                        'binary_cross_entropy loss.'
+                    )
+                observed_targets = targets[masks]
+                if not torch.all(
+                    (observed_targets == 0) | (observed_targets == 1)
+                ):
+                    raise ValueError(
+                        '--class_weight balanced requires observed training '
+                        'targets to be binary values 0 or 1.'
+                    )
+                data_weights = data_weights * _balanced_class_weight_tensor(
+                    targets, args,
+                )
             if args.loss_function == "bounded_mse":
                 lt_target_batch = lt_target_batch.to(torch_device)
                 gt_target_batch = gt_target_batch.to(torch_device)

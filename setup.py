@@ -22,7 +22,7 @@ class ChempropBuildPy(build_py):
         return modules
 
 
-VERSION = "1.7.1+kuroki.3"
+VERSION = "1.7.1+kuroki.4"
 
 # Keep Web assets explicit rather than relying on ``include_package_data`` to
 # interpret data-only directories as namespace packages. Newer Setuptools
@@ -61,7 +61,6 @@ CORE_REQUIREMENTS = [
 
 FEATURE_REQUIREMENTS = [
     "datamol>=0.12.5,<0.13",
-    "map4>=1.1.3,<1.2",
     "mhfp>=1.9.6,<2",
     "molfeat>=0.11,<0.12",
     "mordredcommunity>=2.0.7,<2.1",

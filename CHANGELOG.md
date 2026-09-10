@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.7.1+kuroki.4 — 2026-09-10
+
+### Added
+
+- Added `chemprop_train --class_weight balanced` for single-task binary FFN
+  BCE training. Weights are resolved only from post-split training labels,
+  exclude missing labels from the counts, retain every row in the training
+  loader, and are stored with checkpoint metadata.
+- Added `--train_on_full_data` for validation-free, fixed-epoch final FFN fits.
+  It fits scalers on all eligible training rows, trains every ensemble member
+  for the requested schedule, saves last-epoch checkpoints, and can evaluate a
+  strictly held-out external test set without using it for model selection.
+
+### Changed
+
+- Removed the unavailable PyPI `map4==1.1.3` dependency. The `map4_v1_1`
+  generator now reproduces that release internally with the same length-based
+  shingle ordering and seed, while preserving existing checkpoint metadata.
+  GitHub Actions command blocks now fail immediately instead of allowing an
+  earlier dependency or strict-lint failure to be hidden by a later command.
+- Separate validation/test loading no longer inherits `--data_weights_path`.
+  Documented that the complete weights file is normalized before filtering and
+  splitting and that the retained training weights are not renormalized. A
+  retained training split is now rejected if any task's observed labels all
+  have zero row weight.
+- Prediction, uncertainty evaluation/calibration, and fingerprint inputs no
+  longer inherit a training-only `data_weights_path` stored in checkpoint
+  arguments. LightGBM and sklearn external validation/test sets follow the
+  same isolation rule, including public prediction-argument updates.
+- Sklearn training now rejects the previously ignored `--class_balance`
+  option and directs users to estimator-native `--class_weight balanced`.
+- Restored Chemprop v1 multitask `--class_balance` compatibility (a row is in
+  the positive sampling group when any observed task is active), while keeping
+  strict binary-target and non-empty-group validation.
+- Normal FFN training rejects validation data with no observed labels and
+  retains its fail-fast behavior when the primary validation metric is
+  undefined, so invalid validation data cannot select a checkpoint. Undefined
+  aggregate or per-task values are presented as `not evaluated` and are not
+  written to TensorBoard as numeric observations. Hyperopt also rejects
+  zero-epoch trials that would otherwise rank untrained initializations.
+- LightGBM retains the same fail-fast primary-validation contract; undefined
+  auxiliary aggregate values are presented as `not evaluated`, and HPO rejects
+  non-finite trial objectives.
+- Noam scheduling now uses the effective loader batch count for
+  class-balanced sampling, matching fixed-epoch final training while leaving
+  the default unbalanced training schedule unchanged.
+- Full-data external-test evaluation preserves Python, NumPy, and Torch RNG
+  state between ensemble members; undefined saved metrics use JSON `null`, and
+  full-data output requires a fresh `fold_0` to prevent stale artifacts. A
+  non-empty unlabeled external test file can still produce `--save_preds`
+  output without being treated as an evaluated test set.
+- Saved split-index files keep the positional `[train, validation, test]`
+  contract when validation is deliberately disabled.
+- Spectra normalization now accepts NumPy-array inputs used by prediction
+  evaluation without ambiguous truth-value errors.
+- Conformal quantile calibration and uncertainty evaluation now load each
+  observed CSV target once instead of duplicating lower/upper model output
+  names, preventing target/prediction shape mismatches.
+
 ## 1.7.1+kuroki.3 — 2026-09-09
 
 This production-readiness maintenance release follows a final repository-wide

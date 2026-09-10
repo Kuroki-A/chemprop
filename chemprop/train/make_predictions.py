@@ -403,6 +403,7 @@ def load_data(
             ignore_columns=[],
             skip_invalid_smiles=False,
             args=args,
+            use_args_data_weights=False,
             constraints_target_columns=(
                 list(train_args.atom_targets) + list(train_args.bond_targets)
                 if train_args is not None and train_args.is_atom_bond_targets
@@ -690,6 +691,8 @@ def predict_and_save(
             smiles_columns=args.smiles_columns,
             target_columns=task_names,
             args=args,
+            use_args_data_weights=False,
+            expand_quantile_targets=False,
             features_path=args.features_path,
             features_generator=args.features_generator,
             phase_features_path=args.phase_features_path,
@@ -1180,11 +1183,16 @@ def make_predictions(
 
     if calibrator is None and args.calibration_path is not None:
 
+        calibration_task_names = task_names
+        if args.loss_function == "quantile_interval":
+            calibration_task_names = task_names[:len(task_names) // 2]
         calibration_data = get_data(
             path=args.calibration_path,
             smiles_columns=args.smiles_columns,
-            target_columns=task_names,
+            target_columns=calibration_task_names,
             args=args,
+            use_args_data_weights=False,
+            expand_quantile_targets=False,
             features_path=args.calibration_features_path,
             features_generator=args.features_generator,
             phase_features_path=args.calibration_phase_features_path,
@@ -1213,12 +1221,14 @@ def make_predictions(
                 'Calibration data must contain at least one valid molecule.'
             )
         calibration_mask = calibration_data.mask()
-        if len(calibration_mask) != len(task_names):
+        if len(calibration_mask) != len(calibration_task_names):
             raise ValueError(
                 'Calibration target shape does not match the checkpoint task count.'
             )
         missing_tasks = [
-            task_names[index] if index < len(task_names) else str(index)
+            calibration_task_names[index]
+            if index < len(calibration_task_names)
+            else str(index)
             for index, task_mask in enumerate(calibration_mask)
             if not any(task_mask)
         ]

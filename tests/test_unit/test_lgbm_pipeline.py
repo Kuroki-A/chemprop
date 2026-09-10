@@ -25,6 +25,7 @@ from chemprop.train.make_predictions import (
 )
 from chemprop.features import get_features_generators_metadata
 from chemprop.train.run_training_lgbm import (
+    _load_split_data,
     _lightgbm_feval,
     _lightgbm_metric,
     build_frozen_lgbm_encoder,
@@ -119,6 +120,41 @@ def _molecule_dataset(smiles, targets) -> MoleculeDataset:
             for smile, row_targets in zip(smiles, targets)
         ]
     )
+
+
+def test_lgbm_external_splits_do_not_inherit_training_row_weights(
+    tmp_path: Path, monkeypatch,
+):
+    args = _training_args(tmp_path, "regression", ["target"])
+    validation_path = tmp_path / "validation.csv"
+    test_path = tmp_path / "test.csv"
+    validation_path.write_text(
+        "smiles,target\nCC,1\nCCC,2\n", encoding="utf-8"
+    )
+    test_path.write_text(
+        "smiles,target\nCO,3\nCCO,4\n", encoding="utf-8"
+    )
+    weights_path = tmp_path / "training_weights.csv"
+    weights_path.write_text(
+        "weight\n1\n2\n3\n", encoding="utf-8"
+    )
+    args.task_names = ["target"]
+    args.separate_val_path = str(validation_path)
+    args.separate_test_path = str(test_path)
+    args.data_weights_path = str(weights_path)
+    main_data = MoleculeDataset([])
+    monkeypatch.setattr(
+        "chemprop.train.run_training_lgbm.validate_features_source_metadata",
+        lambda *_args, **_kwargs: None,
+    )
+
+    train_data, validation_data, test_data = _load_split_data(
+        args, main_data, logger=None,
+    )
+
+    assert train_data is main_data
+    assert validation_data.data_weights() == [1.0, 1.0]
+    assert test_data.data_weights() == [1.0, 1.0]
 
 
 def test_lgbm_features_only_encoding_bypasses_graph_construction(
@@ -410,6 +446,7 @@ def test_lgbm_regression_bundle_fresh_process_round_trip_and_empty_input(
         env=environment,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
@@ -688,6 +725,44 @@ def test_lgbm_rank_metric_does_not_early_stop_on_single_class_validation(metric)
 
     assert booster.best_iteration == 0
     assert "validation" not in booster.best_score
+
+
+def test_lgbm_undefined_primary_validation_metric_fails_fast(
+    tmp_path: Path, monkeypatch,
+):
+    training_module = importlib.import_module("chemprop.train.run_training_lgbm")
+    args = _training_args(tmp_path, "classification", ["active"])
+    args.save_dir = str(tmp_path / "undefined_validation")
+    args.metric = "auc"
+    args.skip_test_evaluation = True
+    args.lgbm_num_boost_round = 4
+    args.lgbm_early_stopping_rounds = 0
+    train_data = _molecule_dataset(
+        SMILES[:16], [[index % 2] for index in range(16)],
+    )
+    validation_data = _molecule_dataset(
+        SMILES[16:20], [[0] for _ in range(4)],
+    )
+    monkeypatch.setattr(
+        training_module,
+        "_load_split_data",
+        lambda *_args, **_kwargs: (
+            train_data,
+            validation_data,
+            MoleculeDataset([]),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="cannot select a trained checkpoint"):
+        run_training_lgbm(
+            args=args,
+            data=MoleculeDataset([]),
+            fold_num=0,
+        )
+
+    assert (
+        Path(args.save_dir) / "model_0" / "model.pkl"
+    ).is_file()
 
 
 def test_lgbm_rejects_invalid_targets_features_and_data_weights():

@@ -21,7 +21,10 @@ def normalize_spectra(spectra: List[List[float]], phase_features: List[List[floa
         raise ValueError('Spectra normalization batch_size must be a positive integer.')
     if threshold is not None and (not np.isfinite(threshold) or threshold <= 0):
         raise ValueError('Spectra normalization threshold must be finite and positive.')
-    if not spectra:
+    # NumPy arrays do not define a scalar truth value when they contain more
+    # than one element, so do not use ``if not spectra`` here. Prediction
+    # evaluation passes a NumPy array to this public helper.
+    if spectra is None or len(spectra) == 0:
         return []
 
     spectrum_width = len(spectra[0])

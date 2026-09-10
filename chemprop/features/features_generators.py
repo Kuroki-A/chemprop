@@ -826,14 +826,15 @@ def _canonical_map4_mol(mol: Molecule) -> Chem.Mol:
 
 
 class _LegacyMap4CalculatorAdapter:
-    """Implements folded MAP4 v1.0 and Molfeat 0.11's expected API.
+    """Implements folded MAP4 v1.0/v1.1 and Molfeat 0.11's expected API.
 
     Molfeat 0.11 imports ``MAP4Calculator`` from map4, while map4 1.1
     exports only ``MAP4``.  The two implementations also order equal-radius
     atom environments differently, so merely aliasing the new class changes
     existing feature vectors.  This small, tmap-free implementation preserves
-    the folded v1.0 algorithm used by Molfeat while allowing map4 1.1 to remain
-    installed for the explicitly named ``map4_v1_1`` generator.
+    the folded v1.0 algorithm used by Molfeat.  The same implementation can use
+    v1.1's length-based ordering and seed, avoiding a runtime dependency on the
+    no-longer-published ``map4`` 1.1.3 distribution.
     """
 
     def __init__(
@@ -843,6 +844,8 @@ class _LegacyMap4CalculatorAdapter:
         is_counted: bool = False,
         is_folded: bool = True,
         return_strings: bool = False,
+        seed: int = 42,
+        atom_environment_order: str = "lexicographic",
         **kwargs,
     ):
         if kwargs:
@@ -864,10 +867,12 @@ class _LegacyMap4CalculatorAdapter:
         self.dimensions = dimensions
         self.radius = radius
         self.is_counted = is_counted
-        # MHFPEncoder's default seed (42) is part of the v1.0 definition.  It
-        # does not affect folded output, but retaining it avoids a subtle API
-        # difference if MHFP changes implementation details in the future.
-        self.encoder = MHFPEncoder(dimensions, seed=42)
+        if atom_environment_order not in {"lexicographic", "length"}:
+            raise ValueError(
+                "MAP4 atom-environment ordering must be lexicographic or length."
+            )
+        self.atom_environment_order = atom_environment_order
+        self.encoder = MHFPEncoder(dimensions, seed=seed)
 
     def calculate(self, mol: Chem.Mol) -> np.ndarray:
         canonical_mol = _canonical_map4_mol(mol)
@@ -928,11 +933,19 @@ class _LegacyMap4CalculatorAdapter:
         for first, second in itertools.combinations(range(mol.GetNumAtoms()), 2):
             distance = str(int(distance_matrix[first][second]))
             for radius_index in range(self.radius):
-                # Lexicographic ordering is the behavior that distinguishes
-                # v1.0 from the length-based ordering introduced in v1.1.
-                smaller, larger = sorted(
-                    [atom_envs[first][radius_index], atom_envs[second][radius_index]],
-                )
+                first_environment = atom_envs[first][radius_index]
+                second_environment = atom_envs[second][radius_index]
+                if self.atom_environment_order == "lexicographic":
+                    # This is the v1.0 behavior expected by Molfeat 0.11.
+                    smaller, larger = sorted(
+                        [first_environment, second_environment],
+                    )
+                elif len(first_environment) > len(second_environment):
+                    # MAP4 1.1 orders by string length and retains pair order
+                    # when the lengths are equal.
+                    smaller, larger = second_environment, first_environment
+                else:
+                    smaller, larger = first_environment, second_environment
                 shingle = f"{smaller}|{distance}|{larger}"
                 if self.is_counted:
                     shingle_counts[shingle] += 1
@@ -963,17 +976,13 @@ def _get_map4_calculator(
                     is_folded=True,
                 )
             else:
-                try:
-                    from map4 import MAP4
-                except (AttributeError, ImportError) as exc:
-                    raise ImportError(
-                        "The map4_v1_1 generator requires map4>=1.1."
-                    ) from exc
-                calculator = MAP4(
+                calculator = _LegacyMap4CalculatorAdapter(
                     dimensions=dimensions,
                     radius=radius,
-                    include_duplicated_shingles=include_duplicated_shingles,
+                    is_counted=include_duplicated_shingles,
+                    is_folded=True,
                     seed=75434278,
+                    atom_environment_order="length",
                 )
             _MAP4_CALCULATOR_CACHE[key] = calculator
     return calculator
@@ -1893,7 +1902,7 @@ def _features_dependency_versions(
     if "map4" in names:
         dependency_names.add("mhfp")
     if "map4_v1_1" in names:
-        dependency_names.update({"map4", "mhfp"})
+        dependency_names.add("mhfp")
     if "secfp" in names:
         dependency_names.add("mhfp")
     if names & hf_pretrained_names:
@@ -1907,7 +1916,7 @@ def _features_dependency_versions(
     if "pcqm4mv2_graphormer_base" in names:
         dependency_names.update({"torch", "graphormer-pretrained"})
 
-    return {
+    versions = {
         dependency: (
             getattr(rdBase, "rdkitVersion", None)
             if dependency == "rdkit"
@@ -1915,6 +1924,12 @@ def _features_dependency_versions(
         )
         for dependency in sorted(dependency_names)
     }
+    if "map4_v1_1" in names:
+        # Preserve checkpoint metadata produced with the former external
+        # dependency.  This now denotes the compatible algorithm revision,
+        # not an import-time package requirement.
+        versions["map4"] = "1.1.3"
+    return dict(sorted(versions.items()))
 
 
 def get_features_generators_metadata(

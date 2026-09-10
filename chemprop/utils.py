@@ -1557,7 +1557,10 @@ def build_optimizer(model: nn.Module, args: TrainArgs) -> Optimizer:
 
 
 def build_lr_scheduler(
-    optimizer: Optimizer, args: TrainArgs, total_epochs: List[int] = None
+    optimizer: Optimizer,
+    args: TrainArgs,
+    total_epochs: List[int] = None,
+    steps_per_epoch: int = None,
 ) -> _LRScheduler:
     """
     Builds a PyTorch learning rate scheduler.
@@ -1565,14 +1568,26 @@ def build_lr_scheduler(
     :param optimizer: The Optimizer whose learning rate will be scheduled.
     :param args: A :class:`~chemprop.args.TrainArgs` object containing learning rate arguments.
     :param total_epochs: The total number of epochs for which the model will be run.
+    :param steps_per_epoch: Optional exact number of optimizer/scheduler steps in
+                            one epoch. By default this is derived from the raw
+                            training-data size for backward compatibility.
     :return: An initialized learning rate scheduler.
     """
+    if steps_per_epoch is None:
+        steps_per_epoch = max(1, ceil(args.train_data_size / args.batch_size))
+    elif (
+        not isinstance(steps_per_epoch, (int, np.integer))
+        or isinstance(steps_per_epoch, (bool, np.bool_))
+        or steps_per_epoch < 1
+    ):
+        raise ValueError('steps_per_epoch must be a positive integer.')
+
     # Learning rate scheduler
     return NoamLR(
         optimizer=optimizer,
         warmup_epochs=[args.warmup_epochs],
         total_epochs=total_epochs or [args.epochs] * args.num_lrs,
-        steps_per_epoch=max(1, ceil(args.train_data_size / args.batch_size)),
+        steps_per_epoch=int(steps_per_epoch),
         init_lr=[args.init_lr],
         max_lr=[args.max_lr],
         final_lr=[args.final_lr],
@@ -1748,6 +1763,10 @@ def save_smiles_splits(
     all_split_indices = []
     for dataset, name in [(train_data, "train"), (val_data, "val"), (test_data, "test")]:
         if dataset is None:
+            # Preserve the positional [train, validation, test] contract even
+            # when a mode deliberately has no dataset for one split.
+            if save_split_indices:
+                all_split_indices.append([])
             continue
 
         with open(os.path.join(save_dir, f"{name}_smiles.csv"), "w", newline="") as f:
@@ -1857,8 +1876,16 @@ def update_prediction_args(
     :param validate_feature_sources: Indicates whether the feature sources (from path or generator) are checked for consistency between
         the training and prediction arguments. This is not necessary for fingerprint generation, where molecule features are not used.
     """
+    # Row weights belong exclusively to the training input. Propagating their
+    # checkpoint path into prediction args made generic library callers of
+    # ``get_data(..., args=predict_args)`` try to reopen and align a training
+    # file against unrelated prediction, calibration, or fingerprint rows.
+    prediction_excluded_train_fields = {'data_weights_path'}
     for key, value in vars(train_args).items():
-        if not hasattr(predict_args, key):
+        if (
+            key not in prediction_excluded_train_fields
+            and not hasattr(predict_args, key)
+        ):
             setattr(predict_args, key, value)
 
     if missing_to_defaults:
@@ -1874,7 +1901,10 @@ def update_prediction_args(
             ["--data_path", None, "--dataset_type", str(train_args.dataset_type)]
         )
         for key, value in vars(default_train_args).items():
-            if not hasattr(predict_args, key):
+            if (
+                key not in prediction_excluded_train_fields
+                and not hasattr(predict_args, key)
+            ):
                 setattr(predict_args, key, override_defaults.get(key, value))
 
     # Same number of molecules must be used in training as in making predictions

@@ -156,7 +156,7 @@ def molecule_fingerprint(args: FingerprintArgs,
         )
     else:
         full_data = get_data(path=args.test_path, smiles_columns=args.smiles_columns, target_columns=[], ignore_columns=[], skip_invalid_smiles=False,
-                             args=args, store_row=True)
+                             args=args, use_args_data_weights=False, store_row=True)
 
     print('Validating SMILES')
     full_to_valid_indices = {}

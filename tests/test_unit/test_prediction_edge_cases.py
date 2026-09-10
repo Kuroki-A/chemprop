@@ -278,6 +278,160 @@ def test_in_memory_smiles_reject_checkpoints_with_row_aligned_constraints(
         )
 
 
+def test_prediction_input_does_not_inherit_checkpoint_training_row_weights(
+    monkeypatch,
+):
+    class ExpectedStop(Exception):
+        pass
+
+    captured = {}
+
+    def capture_prediction_data(**kwargs):
+        captured.update(kwargs)
+        raise ExpectedStop
+
+    args = SimpleNamespace(
+        test_path='prediction.csv',
+        smiles_columns=['smiles'],
+        drop_extra_columns=False,
+        data_weights_path='training_weights.csv',
+    )
+    monkeypatch.setattr(
+        make_predictions_module, 'get_data', capture_prediction_data,
+    )
+
+    with pytest.raises(ExpectedStop):
+        make_predictions_module.load_data(args, smiles=None)
+
+    assert captured['args'] is args
+    assert captured['use_args_data_weights'] is False
+
+
+def test_quantile_calibration_loads_each_observed_target_once(monkeypatch):
+    class ExpectedStop(Exception):
+        pass
+
+    captured = {}
+
+    def capture_calibration_data(**kwargs):
+        captured.update(kwargs)
+        raise ExpectedStop
+
+    args = SimpleNamespace(
+        checkpoint_paths=['model.pt'],
+        uncertainty_method=None,
+        calibration_method='conformal_quantile_regression',
+        calibration_path='calibration.csv',
+        calibration_features_path=None,
+        calibration_phase_features_path=None,
+        calibration_atom_descriptors_path=None,
+        calibration_bond_descriptors_path=None,
+        calibration_constraints_path=None,
+        smiles_columns=['smiles'],
+        features_generator=None,
+        max_data_size=None,
+        dataset_type='regression',
+        loss_function='quantile_interval',
+        evaluation_methods=['conformal_coverage'],
+    )
+    train_args = SimpleNamespace(is_atom_bond_targets=False)
+    model_objects = (
+        args,
+        train_args,
+        [],
+        [],
+        4,
+        ['target_a', 'target_b', 'target_a', 'target_b'],
+    )
+
+    monkeypatch.setattr(make_predictions_module, 'set_features', lambda *_args: None)
+    monkeypatch.setattr(
+        make_predictions_module,
+        'load_data',
+        lambda *_args, **_kwargs: (None, None, None, {}),
+    )
+    monkeypatch.setattr(
+        make_predictions_module, 'get_data', capture_calibration_data,
+    )
+
+    with pytest.raises(ExpectedStop):
+        make_predictions(args, model_objects=model_objects)
+
+    assert captured['target_columns'] == ['target_a', 'target_b']
+    assert captured['expand_quantile_targets'] is False
+
+
+def test_uncertainty_evaluation_does_not_inherit_training_row_weights(
+    monkeypatch,
+):
+    class ExpectedStop(Exception):
+        pass
+
+    class DummyEstimator:
+        def __init__(self, **_kwargs):
+            pass
+
+        def calculate_uncertainty(self, calibrator=None):
+            return [[0.5]], [[0.1]]
+
+    captured = {}
+
+    def capture_evaluation_data(**kwargs):
+        captured.update(kwargs)
+        raise ExpectedStop
+
+    args = SimpleNamespace(
+        uncertainty_method='mve',
+        dataset_type='regression',
+        loss_function='mve',
+        uncertainty_dropout_p=0.0,
+        conformal_alpha=0.1,
+        dropout_sampling_size=2,
+        individual_ensemble_predictions=False,
+        is_atom_bond_targets=False,
+        calibration_method=None,
+        evaluation_methods=['nll'],
+        test_path='evaluation.csv',
+        smiles_columns=['smiles'],
+        features_path=None,
+        features_generator=None,
+        phase_features_path=None,
+        atom_descriptors_path=None,
+        bond_descriptors_path=None,
+        max_data_size=None,
+        data_weights_path='training_weights.csv',
+    )
+    data = MoleculeDataset([
+        MoleculeDatapoint(smiles=['CC'], targets=[1.0]),
+    ])
+    monkeypatch.setattr(
+        make_predictions_module, 'UncertaintyEstimator', DummyEstimator,
+    )
+    monkeypatch.setattr(
+        make_predictions_module, 'get_data', capture_evaluation_data,
+    )
+
+    with pytest.raises(ExpectedStop):
+        make_predictions_module.predict_and_save(
+            args=args,
+            train_args=SimpleNamespace(spectra_phase_mask=None),
+            test_data=data,
+            task_names=['target'],
+            num_tasks=1,
+            test_data_loader=object(),
+            full_data=data,
+            full_to_valid_indices={0: 0},
+            models=[],
+            scalers=[],
+            num_models=1,
+            save_results=False,
+        )
+
+    assert captured['args'] is args
+    assert captured['use_args_data_weights'] is False
+    assert captured['expand_quantile_targets'] is False
+
+
 def test_calibration_constraints_are_loaded_with_checkpoint_task_columns(monkeypatch):
     class ExpectedStop(Exception):
         pass
@@ -325,6 +479,7 @@ def test_calibration_constraints_are_loaded_with_checkpoint_task_columns(monkeyp
 
     assert captured['constraints_path'] == 'calibration_constraints.csv'
     assert captured['constraints_target_columns'] == ['atom_a', 'bond_b']
+    assert captured['use_args_data_weights'] is False
 
 
 @pytest.mark.parametrize(
